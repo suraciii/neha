@@ -4306,7 +4306,7 @@ async fn a_first_local_action_waits_for_approval() {
     // The list and the show name the pending approval for this Bot.
     let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
     let row = format!(
-        "{approval}  {run_id}  {}  shell  first_use_local  shell: printf 'x\\ty' >> proof.txt",
+        "{approval}  {run_id}  {}  shell  first_use_local  shell: printf 'x\\\\ty' >> proof.txt",
         computer.bot
     );
     assert!(listed.lines().any(|line| line == row), "{listed}");
@@ -4318,7 +4318,7 @@ async fn a_first_local_action_waits_for_approval() {
     assert!(shown.contains("  step "), "{shown}");
     assert!(shown.contains("  index 0"), "{shown}");
     assert!(shown.contains("  action "), "{shown}");
-    let arguments = "{\"command\":\"printf 'x\\ty' >> proof.txt\"}";
+    let arguments = "{\"command\":\"printf 'x\\\\ty' >> proof.txt\"}";
     assert!(
         shown.contains(&format!("  arguments {arguments}")),
         "the show names the full action:\n{shown}"
@@ -6016,4 +6016,217 @@ fn a_provider_refresh_that_retires_a_bots_model_is_refused() {
     assert!(!shown.contains("thinking:"), "{shown}");
 
     drop(server);
+}
+
+/// Writes a skill directory with one script and returns its path.
+fn write_skill(directory: &Path, script: &str) -> PathBuf {
+    let skill = directory.join("weekly-report");
+    std::fs::create_dir_all(skill.join("scripts")).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: weekly-report\ndescription: Write the weekly status report.\n---\nRun the script.",
+    )
+    .unwrap();
+    std::fs::write(skill.join("scripts").join("collect.sh"), script).unwrap();
+
+    skill
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skill_runs_its_script_after_one_answer() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    let (base, script, provider_task) = scripted_provider().await;
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+
+    // The skill is added from a directory and listed in the Space's library.
+    let skill_directory = write_skill(directory.path(), "printf 'collected %s' \"$1\"");
+    let added = run(
+        &home,
+        &credential,
+        &["skill", "add", skill_directory.to_str().unwrap()],
+    );
+    assert!(added.starts_with("Added skill "), "{added}");
+    let skill = first_word(&field(&added, "Added skill "));
+    let listed = run(&home, &credential, &["skill", "list"]);
+    assert!(
+        listed.contains("space  weekly-report  1 script(s)"),
+        "the Space's library lists the skill:\n{listed}"
+    );
+
+    let created = run(
+        &home,
+        &credential,
+        &["bot", "create", "Scout", "--computer", "hosted"],
+    );
+    let bot = first_word(&field(&created, "Created Bot "));
+    let chat = field(&created, "Chat:");
+    let enabled = run(
+        &home,
+        &credential,
+        &["bot", "skill", "enable", &bot, &skill],
+    );
+    assert!(enabled.contains("may use skill"), "{enabled}");
+    let for_bot = run(&home, &credential, &["skill", "list", "--bot", &bot]);
+    assert!(for_bot.contains("weekly-report"), "{for_bot}");
+
+    // The first run of the script asks, whatever Computer runs it.
+    script.call(
+        "run_skill_script",
+        serde_json::json!({
+            "skill": "weekly-report",
+            "script": "collect.sh",
+            "arguments": ["q4"],
+        }),
+    );
+    script.say("The report is ready.");
+    let sent = run(
+        &home,
+        &credential,
+        &["chat", "send", "--chat", &chat, "write the report"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let listed = run(&home, &credential, &["approval", "list"]);
+    let row = format!("{approval}  {run_id}  {bot}  run_skill_script  first_script_run  ");
+    assert!(
+        listed.lines().any(|line| line.starts_with(&row)),
+        "the approval names the skill's script run:\n{listed}"
+    );
+    let shown = run(&home, &credential, &["approval", "show", &approval]);
+    assert!(shown.contains("  arguments "), "{shown}");
+
+    // Always allow covers that script alone, and the run finishes.
+    let decided = run(
+        &home,
+        &credential,
+        &["approval", "allow", &approval, "--always"],
+    );
+    assert!(decided.contains("Allowed"), "{decided}");
+    let finished = wait_for_run_status(&home, &credential, &run_id, "succeeded");
+    assert!(
+        finished.contains("run_skill_script (succeeded)"),
+        "{finished}"
+    );
+    let read = run(&home, &credential, &["chat", "read", &chat]);
+    assert!(
+        read.lines()
+            .last()
+            .unwrap_or_default()
+            .ends_with("The report is ready."),
+        "{read}"
+    );
+
+    // The lasting rule answers the second run.
+    script.call(
+        "run_skill_script",
+        serde_json::json!({
+            "skill": "weekly-report",
+            "script": "collect.sh",
+            "arguments": ["q5"],
+        }),
+    );
+    script.say("The second report is ready.");
+    let second = run(
+        &home,
+        &credential,
+        &["chat", "send", "--chat", &chat, "write it again"],
+    );
+    assert!(
+        second.contains("The second report is ready."),
+        "a lasting rule answers the second run:\n{second}"
+    );
+
+    // The rule names the skill and the script, and only that pair.
+    let rules = run(&home, &credential, &["rule", "list", "--bot", &bot]);
+    assert!(rules.contains("run_skill_script"), "{rules}");
+
+    // The derived rule names the skill and the script it covers.
+    let rules = run(&home, &credential, &["rule", "list", "--bot", &bot]);
+    assert!(
+        rules.contains("run_skill_script  skill weekly-report  script collect.sh"),
+        "{rules}"
+    );
+
+    // An Ask rule for one skill's script names the pair it matches.
+    let asked = run(
+        &home,
+        &credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "run_skill_script",
+            "--skill",
+            "weekly-report",
+            "--script",
+            "collect.sh",
+        ],
+    );
+    assert!(
+        asked.contains("(skill \"weekly-report\", script \"collect.sh\")"),
+        "{asked}"
+    );
+    let removed_rule = first_word(&field(&asked, "Added rule "));
+    let listed = run(&home, &credential, &["rule", "list", "--bot", &bot]);
+    assert!(
+        listed.contains(&format!("{removed_rule}  {bot}  ask")),
+        "{listed}"
+    );
+    run(&home, &credential, &["rule", "remove", &removed_rule]);
+
+    // `rule add` asks for the pair: the tool alone names nothing to match.
+    let refused = cli(
+        &home,
+        &credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "run_skill_script",
+        ],
+    );
+    assert!(!refused.status.success(), "`rule add` asks for the pair");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("needs --skill"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // Removing the skill takes it away from the Bot and from the listing.
+    let removed = run(&home, &credential, &["skill", "remove", &skill]);
+    assert!(
+        removed.contains("Removed skill weekly-report."),
+        "{removed}"
+    );
+    let for_bot = run(&home, &credential, &["skill", "list", "--bot", &bot]);
+    assert!(
+        for_bot.trim().is_empty(),
+        "the Bot has no skills left:\n{for_bot}"
+    );
+
+    drop(server);
+    provider_task.abort();
 }

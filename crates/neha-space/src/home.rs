@@ -19,7 +19,7 @@ const DATABASE_FILE: &str = "neha.sqlite3";
 /// The database file an older build wrote, renamed when the home opens.
 const LEGACY_DATABASE_FILE: &str = "neha-1.sqlite3";
 
-const DIRECTORIES: [&str; 8] = [
+const DIRECTORIES: [&str; 10] = [
     "db",
     "secrets",
     "state",
@@ -28,6 +28,8 @@ const DIRECTORIES: [&str; 8] = [
     "logs",
     "workspaces",
     "blobs",
+    "plugins",
+    "plugin-data",
 ];
 
 /// One Space's home directory.
@@ -120,6 +122,18 @@ impl Home {
     #[must_use]
     pub fn blobs_dir(&self) -> PathBuf {
         self.root.join("blobs")
+    }
+
+    /// Returns the directory that holds installed packages.
+    #[must_use]
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.root.join("plugins")
+    }
+
+    /// Returns the directory that holds a package's data.
+    #[must_use]
+    pub fn plugin_data_dir(&self, name: &str) -> PathBuf {
+        self.root.join("plugin-data").join(name)
     }
 
     /// Returns the root of a Computer's Workspace.

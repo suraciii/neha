@@ -85,7 +85,7 @@ A Computer action: one thing a Bot does on its Computer. The record holds an act
 _Avoid_: call, command, tool call
 
 **Approval**:
-A request from a Bot's loop to the User it acts for, asking whether one Computer action may run. The User answers Allow, Always allow, or Deny.
+A request from a Bot's loop to the User it acts for, asking whether one action may run. The action runs on a Computer or calls an MCP server. The User answers Allow, Always allow, or Deny.
 _Avoid_: permission, consent, confirmation (as the term)
 
 **Rule**:
@@ -115,6 +115,10 @@ _Avoid_: vendor, backend, adapter, service
 **Model**:
 What a Bot thinks with, offered by a Provider. A Model states whether it reads images, whether it thinks, and its context limit.
 _Avoid_: LLM, engine, model name
+
+**MCP server**:
+A source of tools a Bot can call, reached over the Model Context Protocol. A Space or a User connects it with a credential the Bot never sees.
+_Avoid_: connector, integration, tool server
 
 **Chat**:
 The conversation between one User and one Bot. Each User allowed to use a Bot has one Chat with it; the owner's is created and removed with the Bot.
@@ -165,5 +169,5 @@ The fixed part of Neha that Plugins attach to: accounts and authority, the recor
 _Avoid_: core, platform, foundation, system
 
 **Plugin**:
-The unit of replaceability. Every part of Neha outside the Kernel — model, tools, Bot loop, Group — is a Plugin, and a Plugin replaces any of them or adds to it.
+The unit of replaceability and of distribution. Every part of Neha outside the Kernel — model, tools, Bot loop, Group — is a Plugin, and a Plugin replaces any of them or adds to it. A Plugin a User installs is a package of tools, skills, and cards.
 _Avoid_: extension, addon, integration, connector

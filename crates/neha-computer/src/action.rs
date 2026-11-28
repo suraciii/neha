@@ -31,6 +31,18 @@ pub enum Action {
         /// The path, relative to the workspace or absolute inside it.
         path: String,
     },
+    /// Runs a script the Space delivered.
+    ///
+    /// A fenced Computer mounts the exact bytes read-only inside its sandbox
+    /// and runs them; the script never lives in the Workspace.
+    RunScript {
+        /// The file name the script runs under: one path component.
+        name: String,
+        /// The script's bytes.
+        content: String,
+        /// The arguments passed after the script path.
+        arguments: Vec<String>,
+    },
 }
 
 /// How an action ended.

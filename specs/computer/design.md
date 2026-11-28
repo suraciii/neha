@@ -13,7 +13,7 @@ A Hosted Computer depends on [Space](../space/product.md) for the Workspace it k
 1. A Computer connects to the Space; the Space never connects to a Computer.
 2. A Computer offers only what its owner granted.
 3. A credential from the Vault reaches a Computer only when a Bot uses it.
-4. A tool a Bot uses runs on the Bot's Computer.
+4. A tool a Bot uses runs on the Bot's Computer, or the Space calls it on an MCP server.
 5. One actor controls a screen at a time.
 6. A Computer's control and its data share one outbound connection, and its screen never shares it.
 7. The end of the control stream to the Space ends every process the Computer started during it, except a process a Bot started in background mode.
@@ -139,7 +139,7 @@ A process-local Hosted Computer has no channel of its own and is online while th
 
 ## Tools
 
-A tool that runs as its own process runs on the Computer as well, with what the Computer was granted.
+A tool of an MCP server never runs on the Computer. A `streamable-http` server runs elsewhere and a `stdio` server on the Space's machine; either reaches a Computer only through a Bot's actions, under the Bot's grants and approvals. [Plugin](../plugin/design.md#where-server-code-runs) states where the process runs.
 
 ## The screen
 

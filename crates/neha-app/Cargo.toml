@@ -25,6 +25,7 @@ anyhow = "1"
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 futures-util.workspace = true
+libc = "0.2"
 neha = { path = "../neha" }
 neha-computer = { path = "../neha-computer" }
 neha-space = { path = "../neha-space" }

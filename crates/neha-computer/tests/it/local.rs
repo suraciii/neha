@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use neha::file::MAX_FILE_BYTES;
 use neha_computer::test_support::{
-    LocalRuntime, MAX_SCAN_DEPTH, RuntimeError, file_runtime, file_runtime_without_hidden,
-    find_bwrap, full_access_runtime, hidden, is_full_access, machine_mode_is_bwrap_less,
-    machine_with_bwrap, open_write_root, probe_hosted, read_file_bounded, sandbox_args,
-    validate_hosted_mounts, write_roots,
+    LocalRuntime, MAX_SCAN_DEPTH, MAX_SCRIPT_ARGUMENT_BYTES, MAX_SCRIPT_ARGUMENTS,
+    MAX_SCRIPT_NAME_BYTES, MAX_WRITE_BYTES, RuntimeError, file_runtime,
+    file_runtime_without_hidden, find_bwrap, full_access_runtime, hidden, is_full_access,
+    machine_mode_is_bwrap_less, machine_with_bwrap, open_write_root, probe_hosted,
+    read_file_bounded, sandbox_args, validate_hosted_mounts, write_roots,
 };
 use neha_computer::{Action, ActionStatus, ByteError, ComputerRuntime};
 
@@ -3161,4 +3162,367 @@ fn a_hosted_workspace_holding_a_link_is_refused() {
         .err()
         .expect("a hard link would share an inode with a host file");
     assert!(matches!(error, RuntimeError::UnsafeFolder(_)), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runs_a_skill_script_with_its_arguments() {
+    let (_dir, runtime) = runtime();
+    let result = runtime
+        .execute(Action::RunScript {
+            name: "echo-args.sh".to_owned(),
+            content: "#!/bin/sh\nprintf '[%s]' \"$@\"\n".to_owned(),
+            arguments: vec!["one".to_owned(), "two words".to_owned()],
+        })
+        .await;
+
+    assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+    assert!(
+        result.output.text.contains("[one][two words]"),
+        "{}",
+        result.output.text
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_skill_scripts_run_from_a_private_file_and_clean_up_after_each_run() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_dir, runtime) = runtime();
+    let project = tempfile::tempdir().unwrap();
+    let runtime = runtime
+        .with_working_dir(project.path().to_str().unwrap())
+        .unwrap();
+    let content = "#!/bin/sh\ncp -p \"$0\" \"$1/copy\" && printf '%s' \"$0\" > \"$1/path\" || exit 2\nexit \"$2\"\n# trailing bytes: é  ";
+    let mut previous = None;
+    for (exit, expected) in [("0", ActionStatus::Succeeded), ("1", ActionStatus::Failed)] {
+        let observation = tempfile::tempdir().unwrap();
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "é".repeat(MAX_SCRIPT_NAME_BYTES / 2),
+                content: content.to_owned(),
+                arguments: vec![
+                    observation.path().to_str().unwrap().to_owned(),
+                    exit.to_owned(),
+                ],
+            })
+            .await;
+        assert_eq!(result.status, expected, "{result:?}");
+        let copy = observation.path().join("copy");
+        assert_eq!(std::fs::read(&copy).unwrap(), content.as_bytes());
+        assert_eq!(
+            std::fs::metadata(copy).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        let path = std::path::PathBuf::from(
+            std::fs::read_to_string(observation.path().join("path")).unwrap(),
+        );
+        assert!(
+            !path.starts_with(runtime.workspace()),
+            "a script is never written inside the Workspace: {}",
+            path.display()
+        );
+        assert!(!path.exists(), "a finished run removes its private script");
+        assert_ne!(previous.as_ref(), Some(&path), "two runs share one path");
+        previous = Some(path);
+    }
+    assert!(!project.path().join(".neha").exists());
+    assert!(!runtime.workspace().join(".neha").exists());
+}
+
+/// A file another run of the same user left where the old staging wrote
+/// cannot replace the action's own bytes.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_workspace_shadow_cannot_replace_the_executed_script() {
+    let (_dir, runtime) = runtime();
+    let shadow_directory = runtime.workspace().join(".neha/skills");
+    std::fs::create_dir_all(&shadow_directory).unwrap();
+    let shadow = shadow_directory.join("marker.sh");
+    let shadow_content = "#!/bin/sh\nprintf shadow > result.txt\n";
+    std::fs::write(&shadow, shadow_content).unwrap();
+    let result = runtime
+        .execute(Action::RunScript {
+            name: "marker.sh".to_owned(),
+            content: "#!/bin/sh\nprintf action > result.txt\nls .neha/skills\n".to_owned(),
+            arguments: Vec::new(),
+        })
+        .await;
+
+    assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(runtime.workspace().join("result.txt")).unwrap(),
+        "action",
+        "the Workspace shadow's bytes ran instead of the action's"
+    );
+    // The script saw exactly the file the test planted: run_script neither
+    // used the old staging path nor cleaned up after it.
+    let stdout = result
+        .output
+        .text
+        .split_once("stdout:\n")
+        .map(|(_, stdout)| stdout.trim_end())
+        .unwrap_or_default();
+    assert_eq!(
+        stdout, "marker.sh",
+        "the run touched the old staging directory: {result:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&shadow).unwrap(), shadow_content);
+    assert_eq!(std::fs::read_dir(&shadow_directory).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cancelled_skill_script_leaves_no_file_behind() {
+    let (_dir, runtime) = runtime();
+    let runtime = std::sync::Arc::new(runtime.with_timeout(Duration::from_secs(30)));
+    let observation = tempfile::tempdir().unwrap();
+    let observed = observation.path().join("path");
+    let running = tokio::spawn({
+        let runtime = std::sync::Arc::clone(&runtime);
+        let observed = observed.clone();
+        async move {
+            runtime
+                .execute(Action::RunScript {
+                    name: "slow.sh".to_owned(),
+                    content: "#!/bin/sh\nprintf '%s' \"$0\" > \"$1\"\nsleep 30\n".to_owned(),
+                    arguments: vec![observed.to_str().unwrap().to_owned()],
+                })
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !observed.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the script did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        runtime.cancel_in_flight(),
+        "the running script is cancelled"
+    );
+    let result = running.await.unwrap();
+    assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+    let path = std::path::PathBuf::from(std::fs::read_to_string(&observed).unwrap());
+    assert!(!path.starts_with(runtime.workspace()));
+    assert!(
+        !path.exists(),
+        "a cancelled run left its private script behind: {}",
+        path.display()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hosted_skill_scripts_run_from_the_sandbox_tmp() {
+    let Some((_dir, runtime)) = hosted_runtime() else {
+        return;
+    };
+    // A file another run of the same user left where the old staging wrote
+    // must not replace the action's bytes, and the run must leave it alone.
+    let shadow_directory = runtime.workspace().join(".neha/skills");
+    std::fs::create_dir_all(&shadow_directory).unwrap();
+    let shadow = shadow_directory.join("where.sh");
+    let shadow_content = "#!/bin/sh\nprintf shadow > marker\n";
+    std::fs::write(&shadow, shadow_content).unwrap();
+    let result = runtime
+        .execute(Action::RunScript {
+            name: "where.sh".to_owned(),
+            content: "#!/bin/sh\nprintf ran > marker\npwd\nprintf '%s' \"$0\"\nls -l \"$0\""
+                .to_owned(),
+            arguments: Vec::new(),
+        })
+        .await;
+    assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(runtime.workspace().join("marker")).unwrap(),
+        "ran",
+        "the Workspace shadow's bytes ran instead of the action's"
+    );
+    assert!(
+        result.output.text.contains("/workspace\n"),
+        "the script starts in the mounted workspace: {result:?}"
+    );
+    assert!(
+        result.output.text.contains("/tmp/neha-script/where.sh."),
+        "the sandbox mounts the script, not a Workspace path: {result:?}"
+    );
+    assert!(
+        result.output.text.contains("-r-x------"),
+        "the mounted script is read-only and executable: {result:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&shadow).unwrap(), shadow_content);
+    assert_eq!(std::fs::read_dir(&shadow_directory).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn a_skill_script_name_that_names_another_place_is_refused() {
+    let (_dir, runtime) = runtime();
+    let long = "n".repeat(MAX_SCRIPT_NAME_BYTES + 1);
+    for name in [
+        "",
+        " ",
+        " x",
+        "x ",
+        ".",
+        "..",
+        "../escape",
+        "a/b",
+        "a\\b",
+        "x\ny",
+        long.as_str(),
+    ] {
+        let result = runtime
+            .execute(Action::RunScript {
+                name: name.to_owned(),
+                content: "#!/bin/sh\ntrue\n".to_owned(),
+                arguments: Vec::new(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Failed, "{name:?}");
+    }
+    assert!(
+        !runtime.workspace().join(".neha").exists(),
+        "a refused script writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_skill_script_larger_than_the_write_limit_is_refused() {
+    let (_dir, runtime) = runtime();
+    let result = runtime
+        .execute(Action::RunScript {
+            name: "big.sh".to_owned(),
+            content: "a".repeat(MAX_WRITE_BYTES + 1),
+            arguments: Vec::new(),
+        })
+        .await;
+
+    assert_eq!(result.status, ActionStatus::Failed);
+    assert!(!runtime.workspace().join(".neha").exists());
+}
+
+#[tokio::test]
+async fn a_skill_script_with_an_unusable_argument_is_refused() {
+    let (_dir, runtime) = runtime();
+    let long = "a".repeat(MAX_SCRIPT_ARGUMENT_BYTES + 1);
+    for arguments in [
+        vec![String::new()],
+        vec![long],
+        vec!["ok".to_owned(); MAX_SCRIPT_ARGUMENTS + 1],
+    ] {
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "args.sh".to_owned(),
+                content: "#!/bin/sh\ntrue\n".to_owned(),
+                arguments,
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Failed);
+    }
+    assert!(!runtime.workspace().join(".neha").exists());
+}
+
+#[tokio::test]
+async fn a_real_shell_runs_a_skill_script_from_the_sandbox() {
+    let Some((_dir, runtime)) = machine_runtime() else {
+        return;
+    };
+    let project = outside_tempdir();
+    let runtime = runtime
+        .with_machine_access(false, &[], project.path().to_str())
+        .unwrap();
+    let result = runtime
+        .execute(Action::RunScript {
+            name: "where.sh".to_owned(),
+            content: "#!/bin/sh\npwd\nprintf '%s' \"$0\"\n".to_owned(),
+            arguments: Vec::new(),
+        })
+        .await;
+
+    assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+    let expected = format!("{}\n/tmp/neha-script/where.sh.", project.path().display());
+    assert!(result.output.text.contains(&expected), "{result:?}");
+    assert!(!project.path().join(".neha").exists());
+    assert!(!runtime.workspace().join(".neha").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_bubblewrap_without_data_mounts_refuses_a_skill_script() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let bwrap = directory.path().join("bwrap");
+    // An older bubblewrap: it starts, but it does not know the option that
+    // mounts a descriptor as a file.
+    std::fs::write(
+        &bwrap,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    printf 'bubblewrap 0.4.0\n'
+    exit 0
+fi
+for argument in "$@"; do
+    if [ "$argument" = "--ro-bind-data" ]; then
+        printf 'bwrap: Unknown option --ro-bind-data\n' >&2
+        exit 1
+    fi
+done
+exit 0
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let folder = directory.path().join("bot");
+    let runtime = machine_with_bwrap(folder.clone(), Some(bwrap), Vec::new())
+        .expect("the old bubblewrap answers the constructor's probe");
+    let result = runtime
+        .execute(Action::RunScript {
+            name: "old.sh".to_owned(),
+            content: "#!/bin/sh\nprintf ran > marker\n".to_owned(),
+            arguments: Vec::new(),
+        })
+        .await;
+
+    assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+    assert!(
+        result
+            .output
+            .text
+            .contains("cannot mount a verified script"),
+        "the failure names the missing capability: {result:?}"
+    );
+    assert!(
+        !folder.join("marker").exists(),
+        "the script ran without its verified mount"
+    );
+    assert!(!folder.join(".neha").exists());
+}
+
+#[tokio::test]
+async fn a_skill_script_runs_under_the_sandbox() {
+    let Some((_dir, runtime)) = machine_runtime() else {
+        return;
+    };
+    let outside = outside_tempdir();
+    let sink = outside.path().join("pwned.txt");
+    let result = runtime
+        .execute(Action::RunScript {
+            name: "escape.sh".to_owned(),
+            content: format!("#!/bin/sh\nprintf hi > {}\n", sink.display()),
+            arguments: Vec::new(),
+        })
+        .await;
+
+    assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+    assert!(
+        !sink.exists(),
+        "the sandbox let a skill script write outside the folder"
+    );
 }

@@ -35,8 +35,9 @@ required-features = ["test-support"]
 
 # The workspace forbids unsafe code; this crate narrows that to the libc calls
 # a Computer needs: killing a shell's whole process group, writing through
-# directory file descriptors so no symlink or hard link is followed, and
-# keeping the verified Bot folder descriptor open across the sandbox exec so
-# bubblewrap binds that object instead of a path it can no longer trust.
+# directory file descriptors so no symlink or hard link is followed, creating
+# the anonymous file that holds a skill script's verified bytes, and keeping
+# the verified Bot folder descriptor open across the sandbox exec so bubblewrap
+# binds that object instead of a path it can no longer trust.
 [lints.rust]
 unsafe_code = "allow"

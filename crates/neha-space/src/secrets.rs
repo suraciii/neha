@@ -53,6 +53,73 @@ impl Secrets {
         let _ = fs::remove_file(self.directory.join(provider_file(provider)));
     }
 
+    /// Seals one MCP server's credential for the Space or one User.
+    ///
+    /// A server's credential is never in the record and never reaches a
+    /// Computer: only the Space reads it when it calls the server.
+    pub fn store_mcp_credential(
+        &self,
+        server: Id,
+        user: Option<Id>,
+        credential: &str,
+    ) -> Result<(), SecretsError> {
+        let directory = self.directory.join(mcp_directory(server));
+        if let Err(error) = fs::create_dir_all(&directory) {
+            return Err(SecretsError::Io(error));
+        }
+        let sealed = self.seal(credential.as_bytes())?;
+        write_private(&directory.join(mcp_file(user)), &sealed)
+    }
+
+    /// Removes every credential of one MCP server.
+    ///
+    /// A server that holds no credential is already clean, so a missing
+    /// directory is success. Any other failure is reported: the caller's
+    /// record may already say the server is gone, and hiding a credential it
+    /// could not delete would leave a secret behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretsError::Io`] when the server's directory exists but
+    /// cannot be removed.
+    pub fn discard_mcp_server(&self, server: Id) -> Result<(), SecretsError> {
+        match fs::remove_dir_all(self.directory.join(mcp_directory(server))) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(SecretsError::Io(error)),
+        }
+    }
+
+    /// Removes one MCP server's credential for the Space or one User.
+    pub fn discard_mcp_credential(&self, server: Id, user: Option<Id>) {
+        let _ = fs::remove_file(
+            self.directory
+                .join(mcp_directory(server))
+                .join(mcp_file(user)),
+        );
+    }
+
+    /// Opens one MCP server's credential, when one is stored.
+    pub fn mcp_credential(
+        &self,
+        server: Id,
+        user: Option<Id>,
+    ) -> Result<Option<String>, SecretsError> {
+        let path = self
+            .directory
+            .join(mcp_directory(server))
+            .join(mcp_file(user));
+        let sealed = match fs::read(&path) {
+            Ok(sealed) => sealed,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SecretsError::Io(error)),
+        };
+        let plain = self.open(&sealed)?;
+        String::from_utf8(plain)
+            .map(Some)
+            .map_err(|_| SecretsError::Corrupt)
+    }
+
     /// Opens a Provider's API key.
     pub fn provider_key(&self, provider: Id) -> Result<String, SecretsError> {
         let sealed = fs::read(self.directory.join(provider_file(provider)))?;
@@ -115,6 +182,22 @@ impl Secrets {
 
 fn provider_file(provider: Id) -> String {
     format!("provider-{provider}.key")
+}
+
+/// The directory that holds one MCP server's credentials.
+fn mcp_directory(server: Id) -> String {
+    format!("mcp-{server}")
+}
+
+/// The file that holds one credential of a server.
+///
+/// A User's credential and the Space's are separate files, so one never
+/// stands in for the other.
+fn mcp_file(user: Option<Id>) -> String {
+    match user {
+        Some(user) => format!("user-{user}.key"),
+        None => "space.key".to_owned(),
+    }
 }
 
 fn load_or_create_master_key(path: &PathBuf) -> Result<[u8; KEY_BYTES], SecretsError> {
@@ -261,5 +344,38 @@ mod tests {
         let error = Secrets::load(&second_home).unwrap().provider_key(provider);
 
         assert!(matches!(error, Err(SecretsError::Decrypt)));
+    }
+
+    #[test]
+    fn a_missing_credential_directory_is_already_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let secrets = Secrets::load(&home).unwrap();
+        let server = Id::new();
+
+        secrets.discard_mcp_server(server).unwrap();
+
+        secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+        secrets.discard_mcp_server(server).unwrap();
+        assert_eq!(secrets.mcp_credential(server, None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_credential_directory_that_cannot_be_removed_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let secrets = Secrets::load(&home).unwrap();
+        let server = Id::new();
+        // A plain file where the server's directory belongs: the removal fails,
+        // and a failure must not pass as a finished cleanup.
+        fs::write(
+            home.root().join("secrets").join(format!("mcp-{server}")),
+            "blocked",
+        )
+        .unwrap();
+
+        assert!(secrets.discard_mcp_server(server).is_err());
     }
 }

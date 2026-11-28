@@ -107,6 +107,45 @@ pub enum EventKind {
     /// A lasting rule was removed.
     #[serde(rename = "neha.rule.removed")]
     RuleRemoved,
+    /// A skill entered a library.
+    #[serde(rename = "neha.skill.added")]
+    SkillAdded,
+    /// A skill left its library.
+    #[serde(rename = "neha.skill.removed")]
+    SkillRemoved,
+    /// A Bot may use a skill.
+    #[serde(rename = "neha.bot.skill.enabled")]
+    BotSkillEnabled,
+    /// A Bot no longer uses a skill.
+    #[serde(rename = "neha.bot.skill.disabled")]
+    BotSkillDisabled,
+    /// An MCP server was connected.
+    #[serde(rename = "neha.mcp.server.added")]
+    McpServerAdded,
+    /// An MCP server's address or credential changed.
+    #[serde(rename = "neha.mcp.server.updated")]
+    McpServerUpdated,
+    /// An MCP server was disconnected.
+    #[serde(rename = "neha.mcp.server.removed")]
+    McpServerRemoved,
+    /// A Bot may call an MCP server's tools.
+    #[serde(rename = "neha.bot.mcp.enabled")]
+    BotMcpEnabled,
+    /// A Bot may no longer call an MCP server's tools.
+    #[serde(rename = "neha.bot.mcp.disabled")]
+    BotMcpDisabled,
+    /// A package was installed.
+    #[serde(rename = "neha.plugin.installed")]
+    PluginInstalled,
+    /// A package was removed.
+    #[serde(rename = "neha.plugin.removed")]
+    PluginRemoved,
+    /// The Space offers a package.
+    #[serde(rename = "neha.plugin.enabled")]
+    PluginEnabled,
+    /// The Space no longer offers a package.
+    #[serde(rename = "neha.plugin.disabled")]
+    PluginDisabled,
     /// A Bot learned a memory entry.
     #[serde(rename = "neha.memory.added")]
     MemoryAdded,
@@ -148,6 +187,19 @@ impl EventKind {
             Self::ApprovalDecided => "neha.approval.decided",
             Self::RuleAdded => "neha.rule.added",
             Self::RuleRemoved => "neha.rule.removed",
+            Self::SkillAdded => "neha.skill.added",
+            Self::SkillRemoved => "neha.skill.removed",
+            Self::BotSkillEnabled => "neha.bot.skill.enabled",
+            Self::BotSkillDisabled => "neha.bot.skill.disabled",
+            Self::McpServerAdded => "neha.mcp.server.added",
+            Self::McpServerUpdated => "neha.mcp.server.updated",
+            Self::McpServerRemoved => "neha.mcp.server.removed",
+            Self::BotMcpEnabled => "neha.bot.mcp.enabled",
+            Self::BotMcpDisabled => "neha.bot.mcp.disabled",
+            Self::PluginInstalled => "neha.plugin.installed",
+            Self::PluginRemoved => "neha.plugin.removed",
+            Self::PluginEnabled => "neha.plugin.enabled",
+            Self::PluginDisabled => "neha.plugin.disabled",
             Self::MemoryAdded => "neha.memory.added",
             Self::MemoryRemoved => "neha.memory.removed",
             Self::MemoryAnswered => "neha.memory.answered",
@@ -182,7 +234,20 @@ impl EventKind {
             | Self::ApprovalRequested
             | Self::ApprovalDecided
             | Self::RuleAdded
-            | Self::RuleRemoved => EventClass::Authority,
+            | Self::RuleRemoved
+            | Self::SkillAdded
+            | Self::SkillRemoved
+            | Self::BotSkillEnabled
+            | Self::BotSkillDisabled
+            | Self::McpServerAdded
+            | Self::McpServerUpdated
+            | Self::McpServerRemoved
+            | Self::BotMcpEnabled
+            | Self::BotMcpDisabled
+            | Self::PluginInstalled
+            | Self::PluginRemoved
+            | Self::PluginEnabled
+            | Self::PluginDisabled => EventClass::Authority,
             Self::UserJoined
             | Self::ProviderAdded
             | Self::ProviderModelsUpdated
@@ -226,6 +291,19 @@ impl FromStr for EventKind {
             "neha.approval.decided" => Ok(Self::ApprovalDecided),
             "neha.rule.added" => Ok(Self::RuleAdded),
             "neha.rule.removed" => Ok(Self::RuleRemoved),
+            "neha.skill.added" => Ok(Self::SkillAdded),
+            "neha.skill.removed" => Ok(Self::SkillRemoved),
+            "neha.bot.skill.enabled" => Ok(Self::BotSkillEnabled),
+            "neha.bot.skill.disabled" => Ok(Self::BotSkillDisabled),
+            "neha.mcp.server.added" => Ok(Self::McpServerAdded),
+            "neha.mcp.server.updated" => Ok(Self::McpServerUpdated),
+            "neha.mcp.server.removed" => Ok(Self::McpServerRemoved),
+            "neha.bot.mcp.enabled" => Ok(Self::BotMcpEnabled),
+            "neha.bot.mcp.disabled" => Ok(Self::BotMcpDisabled),
+            "neha.plugin.installed" => Ok(Self::PluginInstalled),
+            "neha.plugin.removed" => Ok(Self::PluginRemoved),
+            "neha.plugin.enabled" => Ok(Self::PluginEnabled),
+            "neha.plugin.disabled" => Ok(Self::PluginDisabled),
             "neha.memory.added" => Ok(Self::MemoryAdded),
             "neha.memory.removed" => Ok(Self::MemoryRemoved),
             "neha.memory.answered" => Ok(Self::MemoryAnswered),
@@ -303,14 +381,401 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::{
-        Author, BotMoved, BotRenamed, BotUpdated, ComputerKind, ComputerSharing, ComputerUpdated,
-        EventData, EventDataError, EventDraft, EventKind, FileAdded, FileError, MemoryAdded,
-        MemoryAnswered, MemoryRemoved, RunAccess, RunQueued,
+        APP_CARD_KIND, Author, BotMoved, BotRenamed, BotUpdated, CardData, ComputerKind,
+        ComputerSharing, ComputerUpdated, EventData, EventDataError, EventDraft, EventKind,
+        FileAdded, FileError, MAX_CARD_CSP_BYTES, MAX_CARD_VALUE_BYTES, MAX_MCP_ARG_BYTES,
+        MAX_MCP_ARGS, MAX_MCP_ARGS_BYTES, MAX_MCP_COMMAND_BYTES, MAX_MCP_ENV,
+        MAX_MCP_ENV_VALUE_BYTES, McpScope, McpServerAdded, McpTransport, MemoryAdded,
+        MemoryAnswered, MemoryRemoved, RunAccess, RunQueued, SkillAdded, SkillLibrary, SkillScript,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
     use crate::id::Id;
     use crate::memory::{MemoryKind, MemoryScope, MemorySourceKind};
+
+    #[test]
+    fn a_credential_holds_only_what_a_bearer_token_takes() {
+        for token in [
+            "a",
+            "abc",
+            "token-1",
+            "a.b_c~d+e/f==",
+            "A1",
+            "x=",
+            "x==",
+            "x===",
+        ] {
+            assert!(McpServerAdded::valid_credential(token), "{token}");
+        }
+        // The token alphabet comes first; padding only ends a token.
+        for token in [
+            "",
+            "=",
+            "==",
+            "===",
+            "a=b",
+            "two words",
+            "quote\"inside",
+            "back\\slash",
+            "line\nbreak",
+            "###",
+        ] {
+            assert!(!McpServerAdded::valid_credential(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn a_server_url_names_an_address_this_space_may_call() {
+        for url in [
+            "https://example.com/mcp",
+            "https://example.com/mcp?key=1",
+            "https://mcp.example.com:8443",
+            "https://[2001:db8::1]/mcp",
+            "http://localhost:8080/mcp",
+            "http://127.0.0.1/mcp",
+            "http://[::1]:9000/mcp",
+            "https://single",
+        ] {
+            assert!(McpServerAdded::valid_url(url), "{url}");
+        }
+        for url in [
+            "",
+            "ftp://example.com/mcp",
+            "https://",
+            "https://user:token@example.com/mcp",
+            "https://example.com/mcp#fragment",
+            "https://example.com/mcp\\path",
+            "http://example.com/mcp",
+            "http://localhost:0/mcp",
+            "http://localhost:port/mcp",
+            "https://exa mple.com/mcp",
+            "https://-example.com/mcp",
+            "https://example..com/mcp",
+        ] {
+            assert!(!McpServerAdded::valid_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_stdio_server_round_trips_and_an_http_record_still_decodes() {
+        let server = Id::new();
+        let by = Id::new();
+        let stdio = McpServerAdded {
+            server,
+            name: "docs".to_owned(),
+            url: None,
+            command: Some("./bin/server".to_owned()),
+            args: vec!["--data".to_owned(), "${PLUGIN_DATA}/docs".to_owned()],
+            env: [("CONFIG".to_owned(), "${PLUGIN_ROOT}/config.json".to_owned())]
+                .into_iter()
+                .collect(),
+            cwd: Some("work".to_owned()),
+            data_cwd: true,
+            scope: McpScope::Space,
+            user: None,
+            by,
+            plugin: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        stdio.validate().unwrap();
+        assert_eq!(stdio.transport().unwrap(), McpTransport::Stdio);
+        // A view names the transport the way `mcp_list` answers it.
+        assert_eq!(
+            serde_json::to_value(McpTransport::Stdio).unwrap(),
+            serde_json::json!("stdio")
+        );
+        assert_eq!(
+            serde_json::to_value(McpTransport::StreamableHttp).unwrap(),
+            serde_json::json!("streamable-http")
+        );
+        assert_eq!(stdio.stdio().unwrap().cwd.as_deref(), Some("work"));
+        assert!(stdio.stdio().unwrap().data_cwd);
+
+        let value = serde_json::to_value(&stdio).unwrap();
+        assert!(value.get("url").is_none(), "a stdio server carries no url");
+        assert_eq!(value["command"], serde_json::json!("./bin/server"));
+        assert_eq!(value["data_cwd"], serde_json::json!(true));
+        assert_eq!(
+            EventKind::McpServerAdded.decode(&value).unwrap(),
+            EventData::McpServerAdded(stdio.clone())
+        );
+
+        // A record written before stdio servers were supported still decodes
+        // and validates: its `url` is the one transport.
+        let old = serde_json::json!({
+            "server": server,
+            "name": "docs",
+            "url": "https://example.com/mcp",
+            "scope": "space",
+            "by": by,
+        });
+        let EventData::McpServerAdded(old) = EventKind::McpServerAdded.decode(&old).unwrap() else {
+            panic!("the data is a server addition");
+        };
+        assert_eq!(old.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(old.command, None);
+        assert!(old.args.is_empty());
+        assert!(old.env.is_empty());
+        assert_eq!(old.cwd, None);
+        assert!(!old.data_cwd);
+        assert_eq!(old.transport().unwrap(), McpTransport::StreamableHttp);
+
+        // A record that names no working directory works in the plugin root.
+        let root = serde_json::json!({
+            "server": Id::new(),
+            "name": "docs",
+            "command": "npx",
+            "scope": "space",
+            "by": by,
+        });
+        let EventData::McpServerAdded(root) = EventKind::McpServerAdded.decode(&root).unwrap()
+        else {
+            panic!("the data is a server addition");
+        };
+        let stdio = root.stdio().unwrap();
+        assert_eq!(stdio.cwd, None);
+        assert!(!stdio.data_cwd);
+    }
+
+    #[test]
+    fn a_server_names_exactly_one_transport() {
+        let server = Id::new();
+        let by = Id::new();
+        for fields in [
+            // Neither a `url` nor a `command`.
+            serde_json::json!({}),
+            // Both at once.
+            serde_json::json!({"url": "https://example.com/mcp", "command": "npx"}),
+            // The fields of the other transport.
+            serde_json::json!({"url": "https://example.com/mcp", "args": ["--data"]}),
+            serde_json::json!({"url": "https://example.com/mcp", "env": {"A": "b"}}),
+            serde_json::json!({"url": "https://example.com/mcp", "cwd": "work"}),
+            serde_json::json!({"url": "https://example.com/mcp", "data_cwd": true}),
+            serde_json::json!({"command": "npx", "headers": {"X-Tenant": "public"}}),
+        ] {
+            let mut value = serde_json::json!({
+                "server": server,
+                "name": "docs",
+                "scope": "space",
+                "by": by,
+            });
+            for (field, configured) in fields.as_object().unwrap() {
+                value[field] = configured.clone();
+            }
+            assert!(
+                EventKind::McpServerAdded.decode(&value).is_err(),
+                "{fields} must name one transport"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symbolic_working_directory_may_keep_placeholders_and_parents() {
+        let by = Id::new();
+        let server = |cwd: &str, data_cwd: bool| McpServerAdded {
+            server: Id::new(),
+            name: "docs".to_owned(),
+            url: None,
+            command: Some("npx".to_owned()),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: Some(cwd.to_owned()),
+            data_cwd,
+            scope: McpScope::Space,
+            user: None,
+            by,
+            plugin: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+
+        // The record keeps the package's symbolic expression: an install and a
+        // launch expand the two placeholders against the real roots, and only
+        // that expansion says what a `..` removes. A `..` after a placeholder
+        // may remove a component of the root the placeholder stands for, whose
+        // component count the text does not carry, so it stays for the install
+        // and the launch to judge.
+        for cwd in [
+            "work",
+            "a/../b",
+            "a/${PLUGIN_ROOT}/../b",
+            "cache${PLUGIN_DATA}",
+            "${PLUGIN_ROOT}/../../work",
+            "${PLUGIN_DATA}/a/${PLUGIN_ROOT}/../../..",
+            "./work",
+            "a/./b",
+            "a/..",
+        ] {
+            server(cwd, true)
+                .validate()
+                .unwrap_or_else(|error| panic!("`{cwd}` is a symbolic working directory: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_stdio_command_is_one_executable_token() {
+        let by = Id::new();
+        let server = |command: &str| McpServerAdded {
+            server: Id::new(),
+            name: "docs".to_owned(),
+            url: None,
+            command: Some(command.to_owned()),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            data_cwd: false,
+            scope: McpScope::Space,
+            user: None,
+            by,
+            plugin: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        for command in [
+            "npx",
+            "python3.12",
+            "my-tool",
+            "tool_x",
+            "./bin/server",
+            "./server",
+        ] {
+            server(command)
+                .validate()
+                .unwrap_or_else(|error| panic!("`{command}` is a command token: {error}"));
+        }
+        for command in [
+            "",
+            "bin/server",
+            "/bin/server",
+            "./",
+            "./bin//server",
+            "./bin/../server",
+            "./../server",
+            ".hidden",
+            "..",
+            "a b",
+            "npx;rm -rf /",
+            "npx&&cat",
+            "npx|cat",
+            "$SHELL",
+            "a\\b",
+        ] {
+            assert!(
+                server(command).validate().is_err(),
+                "`{command}` must not name a command"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stdio_server_is_bounded() {
+        let by = Id::new();
+        let stdio = || McpServerAdded {
+            server: Id::new(),
+            name: "docs".to_owned(),
+            url: None,
+            command: Some("npx".to_owned()),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            data_cwd: false,
+            scope: McpScope::Space,
+            user: None,
+            by,
+            plugin: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        let mut edge = stdio();
+        edge.command = Some("a".repeat(MAX_MCP_COMMAND_BYTES));
+        edge.args = vec!["a".repeat(MAX_MCP_ARG_BYTES); MAX_MCP_ARGS_BYTES / MAX_MCP_ARG_BYTES];
+        edge.validate().unwrap();
+
+        let cases = [
+            ("a command above its bound", {
+                let mut server = stdio();
+                server.command = Some("a".repeat(MAX_MCP_COMMAND_BYTES + 1));
+                server
+            }),
+            ("arguments above their count", {
+                let mut server = stdio();
+                server.args = vec!["a".to_owned(); MAX_MCP_ARGS + 1];
+                server
+            }),
+            ("an argument above its bound", {
+                let mut server = stdio();
+                server.args = vec!["a".repeat(MAX_MCP_ARG_BYTES + 1)];
+                server
+            }),
+            ("arguments above their total", {
+                let mut server = stdio();
+                server.args =
+                    vec!["a".repeat(MAX_MCP_ARG_BYTES); MAX_MCP_ARGS_BYTES / MAX_MCP_ARG_BYTES + 1];
+                server
+            }),
+            ("an environment above its count", {
+                let mut server = stdio();
+                for index in 0..=MAX_MCP_ENV {
+                    server.env.insert(format!("A{index}"), "b".to_owned());
+                }
+                server
+            }),
+            ("an environment value above its bound", {
+                let mut server = stdio();
+                server
+                    .env
+                    .insert("A".to_owned(), "a".repeat(MAX_MCP_ENV_VALUE_BYTES + 1));
+                server
+            }),
+            ("an environment above its total", {
+                let mut server = stdio();
+                for index in 0..MAX_MCP_ENV {
+                    server
+                        .env
+                        .insert(format!("A{index}"), "a".repeat(MAX_MCP_ENV_VALUE_BYTES));
+                }
+                server
+            }),
+            ("an environment name that is not one", {
+                let mut server = stdio();
+                server.env.insert("A-B".to_owned(), "b".to_owned());
+                server
+            }),
+            ("a working directory that leaves its root", {
+                let mut server = stdio();
+                server.cwd = Some("../work".to_owned());
+                server
+            }),
+            ("a working directory that pops above its root", {
+                let mut server = stdio();
+                server.cwd = Some("a/../../b".to_owned());
+                server
+            }),
+            ("a working directory that is not relative", {
+                let mut server = stdio();
+                server.cwd = Some("/work".to_owned());
+                server
+            }),
+            ("a working directory with a path separator", {
+                let mut server = stdio();
+                server.cwd = Some("a\\b".to_owned());
+                server
+            }),
+            ("a working directory with a control character", {
+                let mut server = stdio();
+                server.cwd = Some("a\u{0}b".to_owned());
+                server
+            }),
+            (
+                "a working directory with a separator after a placeholder",
+                {
+                    let mut server = stdio();
+                    server.cwd = Some("${PLUGIN_ROOT}/after:bad".to_owned());
+                    server
+                },
+            ),
+        ];
+        for (reason, server) in cases {
+            assert!(server.validate().is_err(), "{reason} is refused");
+        }
+    }
 
     #[test]
     fn wire_names_round_trip() {
@@ -339,6 +804,19 @@ mod tests {
             EventKind::ApprovalDecided,
             EventKind::RuleAdded,
             EventKind::RuleRemoved,
+            EventKind::SkillAdded,
+            EventKind::SkillRemoved,
+            EventKind::BotSkillEnabled,
+            EventKind::BotSkillDisabled,
+            EventKind::McpServerAdded,
+            EventKind::McpServerUpdated,
+            EventKind::McpServerRemoved,
+            EventKind::BotMcpEnabled,
+            EventKind::BotMcpDisabled,
+            EventKind::PluginInstalled,
+            EventKind::PluginRemoved,
+            EventKind::PluginEnabled,
+            EventKind::PluginDisabled,
             EventKind::MemoryAdded,
             EventKind::MemoryRemoved,
             EventKind::MemoryAnswered,
@@ -369,9 +847,125 @@ mod tests {
         assert_eq!(EventKind::ApprovalDecided.class(), EventClass::Authority);
         assert_eq!(EventKind::RuleAdded.class(), EventClass::Authority);
         assert_eq!(EventKind::RuleRemoved.class(), EventClass::Authority);
+        assert_eq!(EventKind::SkillAdded.class(), EventClass::Authority);
+        assert_eq!(EventKind::SkillRemoved.class(), EventClass::Authority);
+        assert_eq!(EventKind::BotSkillEnabled.class(), EventClass::Authority);
+        assert_eq!(EventKind::BotSkillDisabled.class(), EventClass::Authority);
         assert_eq!(EventKind::MemoryAdded.class(), EventClass::Presentation);
         assert_eq!(EventKind::MemoryRemoved.class(), EventClass::Presentation);
         assert_eq!(EventKind::MemoryAnswered.class(), EventClass::Presentation);
+    }
+    #[test]
+    fn a_skill_round_trips_and_rejects_what_it_cannot_hold() {
+        let data = SkillAdded {
+            skill: Id::new(),
+            library: SkillLibrary::Space,
+            bot: None,
+            name: "weekly-report".to_owned(),
+            description: "Write the weekly status report.".to_owned(),
+            body: "1. Collect the docs.\n2. Summarize.".to_owned(),
+            scripts: vec![SkillScript {
+                name: "collect.sh".to_owned(),
+                sha256: "a".repeat(64),
+            }],
+            plugin: None,
+        };
+        let value = serde_json::to_value(&data).unwrap();
+        assert_eq!(
+            EventKind::SkillAdded.decode(&value).unwrap(),
+            EventData::SkillAdded(data.clone())
+        );
+        let mut space_with_bot = value.clone();
+        space_with_bot["bot"] = serde_json::json!(Id::new());
+        assert!(EventKind::SkillAdded.decode(&space_with_bot).is_err());
+        let mut bad_name = value.clone();
+        bad_name["name"] = serde_json::json!("Weekly Report");
+        assert!(EventKind::SkillAdded.decode(&bad_name).is_err());
+        let mut bad_script = value.clone();
+        bad_script["scripts"] = serde_json::json!([{"name": "../x.sh", "sha256": "a".repeat(64)}]);
+        assert!(EventKind::SkillAdded.decode(&bad_script).is_err());
+        let mut old_rule = serde_json::json!({
+            "rule": Id::new(), "bot": Id::new(), "user": Id::new(),
+            "effect": "allow", "tool": "shell", "command_prefix": "ls"
+        });
+        let EventData::RuleAdded(rule) = EventKind::RuleAdded.decode(&old_rule).unwrap() else {
+            unreachable!("the data is a rule");
+        };
+        assert_eq!((rule.skill, rule.script), (None, None));
+        old_rule["skill"] = serde_json::json!(Id::new());
+        old_rule["script"] = serde_json::json!("collect.sh");
+        let EventData::RuleAdded(rule) = EventKind::RuleAdded.decode(&old_rule).unwrap() else {
+            unreachable!("the data is a rule");
+        };
+        assert!(rule.skill.is_some());
+        assert_eq!(rule.script.as_deref(), Some("collect.sh"));
+    }
+
+    #[test]
+    fn a_shared_change_carries_its_scope_and_an_old_one_still_decodes() {
+        let server = Id::new();
+        let by = Id::new();
+        // A record written before the scope field has none: it still decodes,
+        // and the stream keeps it the author's.
+        let old = serde_json::json!({
+            "server": server,
+            "url": null,
+            "credential": true,
+            "by": by,
+        });
+        let EventData::McpServerUpdated(updated) =
+            EventKind::McpServerUpdated.decode(&old).unwrap()
+        else {
+            panic!("the data is a server update");
+        };
+        assert_eq!(updated.scope, None);
+        for (scope, expected) in [("space", McpScope::Space), ("user", McpScope::User)] {
+            let mut value = old.clone();
+            value["scope"] = serde_json::json!(scope);
+            let EventData::McpServerUpdated(updated) =
+                EventKind::McpServerUpdated.decode(&value).unwrap()
+            else {
+                panic!("the data is a server update");
+            };
+            assert_eq!(updated.scope, Some(expected));
+        }
+        let mut unknown = old.clone();
+        unknown["scope"] = serde_json::json!("somewhere");
+        assert!(EventKind::McpServerUpdated.decode(&unknown).is_err());
+
+        let removed = serde_json::json!({"server": server});
+        let EventData::McpServerRemoved(removal) =
+            EventKind::McpServerRemoved.decode(&removed).unwrap()
+        else {
+            panic!("the data is a server removal");
+        };
+        assert_eq!(removal.scope, None);
+        let mut shared = removed.clone();
+        shared["scope"] = serde_json::json!("space");
+        let EventData::McpServerRemoved(removal) =
+            EventKind::McpServerRemoved.decode(&shared).unwrap()
+        else {
+            panic!("the data is a server removal");
+        };
+        assert_eq!(removal.scope, Some(McpScope::Space));
+
+        let skill = Id::new();
+        let old_removal = serde_json::json!({"skill": skill});
+        let EventData::SkillRemoved(removal) =
+            EventKind::SkillRemoved.decode(&old_removal).unwrap()
+        else {
+            panic!("the data is a skill removal");
+        };
+        assert_eq!(removal.library, None);
+        for (library, expected) in [("space", SkillLibrary::Space), ("bot", SkillLibrary::Bot)] {
+            let mut value = old_removal.clone();
+            value["library"] = serde_json::json!(library);
+            let EventData::SkillRemoved(removal) = EventKind::SkillRemoved.decode(&value).unwrap()
+            else {
+                panic!("the data is a skill removal");
+            };
+            assert_eq!(removal.library, Some(expected));
+        }
     }
 
     #[test]
@@ -737,12 +1331,184 @@ mod tests {
         };
         assert_eq!(data.file, Some(file));
 
+        // A record written before a Message could carry a Card still decodes.
         let plain = serde_json::json!({"message": Id::new(), "chat": chat, "text": "hi"});
         let EventData::MessageAdded(data) = EventKind::MessageAdded.decode(&plain).unwrap() else {
             panic!("expected a Message");
         };
         assert_eq!(data.file, None);
+        assert_eq!(data.card, None);
     }
+
+    fn app_card(file: Id) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "app",
+            "file": file,
+            "input": {"query": "hi"},
+            "result": {"content": [{"type": "text", "text": "the answer"}]},
+            "csp": "default-src 'none'; connect-src https://example.com",
+        })
+    }
+
+    #[test]
+    fn a_message_may_carry_an_app_card() {
+        let chat = Id::new();
+        let file = Id::new();
+        let value = serde_json::json!({
+            "message": Id::new(),
+            "chat": chat,
+            "text": "",
+            "card": app_card(file),
+        });
+
+        let EventData::MessageAdded(data) = EventKind::MessageAdded.decode(&value).unwrap() else {
+            panic!("expected a Message");
+        };
+        let card = data.card.as_ref().expect("the Message carries its Card");
+        assert_eq!(card.kind, APP_CARD_KIND);
+        assert_eq!(card.file, Some(file));
+        assert_eq!(card.input, Some(serde_json::json!({"query": "hi"})));
+        assert_eq!(
+            card.result,
+            Some(serde_json::json!({"content": [{"type": "text", "text": "the answer"}]}))
+        );
+        assert!(card.csp.is_some());
+        // A Card of a kind this build does not know still decodes with its
+        // fields, so a newer Space's Card replays instead of corrupting the
+        // record; a client shows a placeholder.
+        let unknown = serde_json::json!({
+            "message": Id::new(),
+            "chat": chat,
+            "text": "",
+            "card": {
+                "kind": "future",
+                "file": Id::new(),
+                "input": {"query": "hi"},
+                "result": [1, 2],
+                "csp": "default-src 'none'",
+            },
+        });
+        let EventData::MessageAdded(data) = EventKind::MessageAdded.decode(&unknown).unwrap()
+        else {
+            panic!("expected a Message");
+        };
+        let card = data.card.as_ref().expect("the Message carries its Card");
+        assert_eq!(card.kind, "future");
+        assert_eq!(card.input, Some(serde_json::json!({"query": "hi"})));
+    }
+
+    #[test]
+    fn a_card_keeps_the_bounds_a_space_accepts() {
+        let file = Id::new();
+        let decoded = |card: serde_json::Value| {
+            EventKind::MessageAdded.decode(&serde_json::json!({
+                "message": Id::new(),
+                "chat": Id::new(),
+                "text": "",
+                "card": card,
+            }))
+        };
+
+        let fit = CardData {
+            kind: APP_CARD_KIND.to_owned(),
+            file: Some(file),
+            input: Some(serde_json::json!([1, 2])),
+            result: Some(serde_json::Value::Null),
+            csp: Some("default-src 'none'".to_owned()),
+        };
+        assert!(fit.validate().is_ok());
+
+        // An app Card names the File that holds its HTML.
+        let mut no_file = fit.clone();
+        no_file.file = None;
+        assert!(no_file.validate().is_err());
+
+        // A kind this build does not know keeps its fields as bounded opaque
+        // data, so a newer Space's Card replays instead of a reader reporting
+        // the record corrupt. The same bounds apply to those fields.
+        let future = serde_json::json!({
+            "kind": "future",
+            "file": file,
+            "input": {"query": "hi"},
+            "result": [1, 2],
+            "csp": "default-src 'none'",
+        });
+        let EventData::MessageAdded(data) = decoded(future).unwrap() else {
+            panic!("expected a Message");
+        };
+        let card = data.card.as_ref().expect("the Message carries its Card");
+        assert_eq!(card.kind, "future");
+        assert_eq!(card.file, Some(file));
+        assert_eq!(card.csp.as_deref(), Some("default-src 'none'"));
+        assert!(
+            decoded(serde_json::json!({"kind": "future", "input": "text"})).is_err(),
+            "a Card's input is an object, an array, or null whatever its kind"
+        );
+        assert!(
+            decoded(serde_json::json!({
+                "kind": "future",
+                "result": {"padding": "a".repeat(MAX_CARD_VALUE_BYTES)},
+            }))
+            .is_err(),
+            "an unknown kind's payload is bounded"
+        );
+        assert!(
+            decoded(serde_json::json!({
+                "kind": "future",
+                "csp": "a".repeat(MAX_CARD_CSP_BYTES + 1),
+            }))
+            .is_err(),
+            "an unknown kind's policy is bounded"
+        );
+
+        // An input or result is an object, an array, or null.
+        for value in [
+            serde_json::json!("text"),
+            serde_json::json!(1),
+            serde_json::json!(true),
+        ] {
+            let mut card = fit.clone();
+            card.input = Some(value.clone());
+            assert!(card.validate().is_err(), "{value}");
+            let mut card = fit.clone();
+            card.result = Some(value);
+            assert!(card.validate().is_err());
+        }
+
+        // A value over the bound is refused.
+        let large = serde_json::json!({"padding": "a".repeat(MAX_CARD_VALUE_BYTES)});
+        let mut card = fit.clone();
+        card.result = Some(large.clone());
+        assert!(card.validate().is_err());
+        assert!(
+            decoded(serde_json::json!({
+                "kind": "app",
+                "file": file,
+                "result": large,
+            }))
+            .is_err()
+        );
+
+        // A policy is printable ASCII within the bound.
+        for csp in [
+            "a\nb".to_owned(),
+            "é".to_owned(),
+            "a".repeat(MAX_CARD_CSP_BYTES + 1),
+        ] {
+            let mut card = fit.clone();
+            card.csp = Some(csp.clone());
+            assert!(card.validate().is_err(), "{csp:?}");
+        }
+        let mut edge = fit.clone();
+        edge.csp = Some("a".repeat(MAX_CARD_CSP_BYTES));
+        assert!(edge.validate().is_ok());
+
+        // An unknown field on the card itself is refused.
+        let mut extra = app_card(file);
+        extra["text"] = serde_json::json!("no");
+        assert!(decoded(extra).is_err());
+    }
+
     fn computer_created_data(kind: &str) -> serde_json::Value {
         serde_json::json!({
             "computer": Id::new(),
@@ -995,6 +1761,22 @@ mod tests {
             assert!(kind.validate_author(user, Some(owner)).is_ok());
             assert!(kind.validate_author(user, None).is_err());
             assert!(kind.validate_author(bot, Some(owner)).is_err());
+        }
+    }
+
+    #[test]
+    fn a_skill_takes_a_user_author_who_acts_for_nobody() {
+        let user = Author::User(Id::new());
+        let bot = Author::Bot(Id::new());
+        for kind in [
+            EventKind::SkillAdded,
+            EventKind::SkillRemoved,
+            EventKind::BotSkillEnabled,
+            EventKind::BotSkillDisabled,
+        ] {
+            assert!(kind.validate_author(user, None).is_ok());
+            assert!(kind.validate_author(user, Some(Id::new())).is_err());
+            assert!(kind.validate_author(bot, None).is_err());
         }
     }
 
@@ -1273,6 +2055,28 @@ pub enum EventData {
     RuleAdded(RuleAdded),
     /// A lasting rule was removed.
     RuleRemoved(RuleRemoved),
+    SkillAdded(SkillAdded),
+    SkillRemoved(SkillRemoved),
+    BotSkillEnabled(BotSkillEnabled),
+    BotSkillDisabled(BotSkillDisabled),
+    /// An MCP server was connected.
+    McpServerAdded(McpServerAdded),
+    /// An MCP server changed.
+    McpServerUpdated(McpServerUpdated),
+    /// An MCP server was disconnected.
+    McpServerRemoved(McpServerRemoved),
+    /// A Bot may use an MCP server.
+    BotMcpEnabled(BotMcpEnabled),
+    /// A Bot may no longer use an MCP server.
+    BotMcpDisabled(BotMcpDisabled),
+    /// A package was installed, with what it brought.
+    PluginInstalled(PluginInstalled),
+    /// A package was removed.
+    PluginRemoved(PluginRemoved),
+    /// The Space offers a package.
+    PluginEnabled(PluginEnabled),
+    /// The Space no longer offers a package.
+    PluginDisabled(PluginDisabled),
     /// A memory entry was added.
     MemoryAdded(MemoryAdded),
     /// A memory entry was removed.
@@ -1311,7 +2115,11 @@ impl EventKind {
             Self::ComputerCreated => EventData::ComputerCreated(decode(data)?),
             Self::ComputerUpdated => EventData::ComputerUpdated(decode(data)?),
             Self::ChatCreated => EventData::ChatCreated(decode(data)?),
-            Self::MessageAdded => EventData::MessageAdded(decode(data)?),
+            Self::MessageAdded => {
+                let data: MessageAdded = decode(data)?;
+                data.validate()?;
+                EventData::MessageAdded(data)
+            }
             Self::FileAdded => {
                 let data: FileAdded = decode(data)?;
                 data.validate()?;
@@ -1342,6 +2150,31 @@ impl EventKind {
             Self::ApprovalDecided => EventData::ApprovalDecided(decode(data)?),
             Self::RuleAdded => EventData::RuleAdded(decode(data)?),
             Self::RuleRemoved => EventData::RuleRemoved(decode(data)?),
+            Self::SkillAdded => {
+                let data: SkillAdded = decode(data)?;
+                data.validate()?;
+                EventData::SkillAdded(data)
+            }
+            Self::SkillRemoved => EventData::SkillRemoved(decode(data)?),
+            Self::BotSkillEnabled => EventData::BotSkillEnabled(decode(data)?),
+            Self::BotSkillDisabled => EventData::BotSkillDisabled(decode(data)?),
+            Self::McpServerAdded => {
+                let data: McpServerAdded = decode(data)?;
+                data.validate()?;
+                EventData::McpServerAdded(data)
+            }
+            Self::McpServerUpdated => EventData::McpServerUpdated(decode(data)?),
+            Self::McpServerRemoved => EventData::McpServerRemoved(decode(data)?),
+            Self::BotMcpEnabled => EventData::BotMcpEnabled(decode(data)?),
+            Self::BotMcpDisabled => EventData::BotMcpDisabled(decode(data)?),
+            Self::PluginInstalled => {
+                let data: PluginInstalled = decode(data)?;
+                data.validate()?;
+                EventData::PluginInstalled(data)
+            }
+            Self::PluginRemoved => EventData::PluginRemoved(decode(data)?),
+            Self::PluginEnabled => EventData::PluginEnabled(decode(data)?),
+            Self::PluginDisabled => EventData::PluginDisabled(decode(data)?),
             Self::MemoryAdded => {
                 let data: MemoryAdded = decode(data)?;
                 data.validate()?;
@@ -1372,7 +2205,20 @@ impl EventKind {
             | Self::BotRenamed
             | Self::ComputerCreated
             | Self::ComputerUpdated
-            | Self::ChatCreated => {
+            | Self::ChatCreated
+            | Self::SkillAdded
+            | Self::SkillRemoved
+            | Self::BotSkillEnabled
+            | Self::BotSkillDisabled
+            | Self::McpServerAdded
+            | Self::McpServerUpdated
+            | Self::McpServerRemoved
+            | Self::BotMcpEnabled
+            | Self::BotMcpDisabled
+            | Self::PluginInstalled
+            | Self::PluginRemoved
+            | Self::PluginEnabled
+            | Self::PluginDisabled => {
                 if !matches!(author, Author::User(_)) || acting.is_some() {
                     return Err(EventDataError::Author);
                 }
@@ -1751,10 +2597,113 @@ pub struct MessageAdded {
     /// The run it belongs to.
     #[serde(default)]
     pub run: Option<Id>,
+    /// The Card it carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardData>,
+}
+
+impl MessageAdded {
+    /// Checks the Card a Message carries fits what a Space accepts.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if let Some(card) = &self.card {
+            card.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+/// The kind of Card an MCP tool's app makes.
+pub const APP_CARD_KIND: &str = "app";
+
+/// The largest JSON a Card carries for its input or its result.
+pub const MAX_CARD_VALUE_BYTES: usize = 64 * 1024;
+
+/// The largest Content Security Policy a Card carries.
+pub const MAX_CARD_CSP_BYTES: usize = 2 * 1024;
+
+/// A Card a Message shows after its text.
+///
+/// A Card's kind picks the fields it takes: an `app` Card names the File that
+/// holds its HTML and carries the tool's input and result, while a kind this
+/// build does not know keeps its fields as bounded opaque data, so a client
+/// shows a placeholder and a reader still replays the record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct CardData {
+    /// The Card's kind.
+    pub kind: String,
+    /// The File that holds an `app` Card's HTML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Id>,
+    /// The tool arguments an `app` Card shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown")]
+    pub input: Option<serde_json::Value>,
+    /// The tool result an `app` Card shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown")]
+    pub result: Option<serde_json::Value>,
+    /// The Content Security Policy a client applies to an `app` Card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csp: Option<String>,
+}
+
+impl CardData {
+    /// Checks the fields a Card's kind takes before the record holds them.
+    ///
+    /// An `app` Card must name the File that holds its HTML. A kind this build
+    /// does not know is kept as opaque bounded data, so a reader replays a Card
+    /// a newer Space wrote instead of reporting the whole record corrupt.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if self.kind == APP_CARD_KIND && self.file.is_none() {
+            return Err(EventDataError::Data(
+                "an app Card must carry the File that holds its HTML".to_owned(),
+            ));
+        }
+        for (what, value) in [("input", &self.input), ("result", &self.result)] {
+            let Some(value) = value else {
+                continue;
+            };
+            if !matches!(
+                value,
+                serde_json::Value::Object(_)
+                    | serde_json::Value::Array(_)
+                    | serde_json::Value::Null
+            ) {
+                return Err(EventDataError::Data(format!(
+                    "a Card's {what} must be an object, an array, or null"
+                )));
+            }
+            let length = serde_json::to_vec(value)
+                .map_err(|error| EventDataError::Data(error.to_string()))?
+                .len();
+            if length > MAX_CARD_VALUE_BYTES {
+                return Err(EventDataError::Data(format!(
+                    "a Card's {what} must be at most {} KiB",
+                    MAX_CARD_VALUE_BYTES / 1024
+                )));
+            }
+        }
+        if let Some(csp) = &self.csp
+            && (csp.len() > MAX_CARD_CSP_BYTES
+                || !csp
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() || byte == b' '))
+        {
+            return Err(EventDataError::Data(format!(
+                "a Card's policy must be at most {} KiB of printable ASCII",
+                MAX_CARD_CSP_BYTES / 1024
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 /// The largest name a File carries.
-const MAX_FILE_NAME_BYTES: usize = 255;
+pub const MAX_FILE_NAME_BYTES: usize = 255;
 /// The largest media type a File carries.
 const MAX_MEDIA_TYPE_BYTES: usize = 127;
 
@@ -1927,6 +2876,22 @@ pub struct ActionStarted {
     #[serde(default)]
     #[ts(type = "unknown")]
     pub arguments: serde_json::Value,
+    /// The MCP server the action called, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
+    /// The skill the action runs, when it is a `run_skill_script` action.
+    ///
+    /// This is the identity the Space dispatched, resolved before the action
+    /// started: it is absent for a call that never runs, and a record written
+    /// before it existed has none either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<Id>,
+    /// The script's file name within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// The digest of the script's bytes the action ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_sha256: Option<String>,
 }
 
 /// The data of `neha.action.finished`.
@@ -1940,8 +2905,11 @@ pub struct ActionFinished {
     pub step: u32,
     /// The action.
     pub action: Id,
-    /// The tool's name.
+    /// The tool's name: the server's original name when it belongs to one.
     pub tool: String,
+    /// The MCP server the action called, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
     /// How it ended.
     pub status: ActionStatus,
     /// The text the Model reads.
@@ -2027,8 +2995,20 @@ pub struct RunFinished {
 pub struct RecordedCall {
     /// The tool-call identifier the provider expects in the result.
     pub call: String,
-    /// The tool's name.
+    /// The tool's name: the server's original name when it belongs to one.
     pub tool: String,
+    /// The MCP server the call names, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
+    /// The name the Model used for this call, when the record names the tool
+    /// by its server and original name.
+    ///
+    /// The loop's history and a replay read the name the Model saw, so a
+    /// record whose server no longer offers the tool still resumes with the
+    /// same conversation. An older record has none, and the Space forms the
+    /// name it would have offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
     /// The arguments the tool runs with; a refused call keeps them malformed.
     #[ts(type = "unknown")]
     pub arguments: serde_json::Value,
@@ -2067,6 +3047,10 @@ pub enum ApprovalReason {
     Rule,
     /// The action writes outside the folders the owner granted.
     Grant,
+    /// The first run of a skill's script by this Bot for this User.
+    FirstScriptRun,
+    /// The first call of an MCP server's tool by this Bot for this User.
+    FirstMcpCall,
 }
 
 /// Whether the User can undo an action after allowing it.
@@ -2135,6 +3119,18 @@ pub struct ApprovalRequested {
     /// What an "Always allow" would allow, in words the User reads.
     #[serde(default)]
     pub lasting_scope: Option<String>,
+    /// The MCP server the action calls, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
+    /// The skill the action runs when its tool is `run_skill_script`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<Id>,
+    /// The script's file name within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// The digest of the skill's script the card was made for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_sha256: Option<String>,
     /// The folder a grant answer covers, when the reason is a grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_folder: Option<String>,
@@ -2183,6 +3179,15 @@ pub struct RuleAdded {
     /// The path prefix a matching file action's path starts with.
     #[serde(default)]
     pub path_prefix: Option<String>,
+    /// The MCP server whose tool a matching call names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
+    /// The skill whose script a matching `run_skill_script` action runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<Id>,
+    /// The script a matching `run_skill_script` action runs, within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
 }
 
 /// The data of `neha.rule.removed`.
@@ -2197,6 +3202,874 @@ pub struct RuleRemoved {
     /// The User who removed it; the Bot's owner may remove another User's
     /// rule, so this is not necessarily the rule's maker.
     pub user: Id,
+}
+
+/// The largest body a skill's `SKILL.md` carries, without its frontmatter.
+pub const MAX_SKILL_BODY_BYTES: usize = 64 * 1024;
+
+/// The libraries that hold skills.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(rename_all = "snake_case")]
+pub enum SkillLibrary {
+    /// The Space's library, which every Bot's owner may enable for their Bot.
+    Space,
+    /// One Bot's own library.
+    Bot,
+}
+
+/// A script a skill carries, stored in the File store by digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct SkillScript {
+    /// The script's file name within the skill, one path component.
+    pub name: String,
+    /// The digest of its bytes in the File store.
+    pub sha256: String,
+}
+
+/// The data of `neha.skill.added`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct SkillAdded {
+    /// The skill.
+    pub skill: Id,
+    /// The library that holds it.
+    pub library: SkillLibrary,
+    /// The Bot whose library holds it, when it is a Bot's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<Id>,
+    /// Its name, as the Agent Skills frontmatter spells it.
+    pub name: String,
+    /// What it does and when to use it.
+    pub description: String,
+    /// The body of its `SKILL.md`, without the frontmatter.
+    pub body: String,
+    /// The scripts it carries.
+    #[serde(default)]
+    pub scripts: Vec<SkillScript>,
+    /// The package that brought it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Id>,
+}
+
+impl SkillAdded {
+    /// Whether the name is one the Agent Skills frontmatter allows.
+    #[must_use]
+    pub fn valid_name(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        (1..=64).contains(&bytes.len())
+            && bytes[0] != b'-'
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    }
+
+    /// Checks the data against what a skill may hold.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        match self.library {
+            SkillLibrary::Space if self.bot.is_some() => {
+                return Err(EventDataError::Data(
+                    "a skill in the Space's library belongs to no Bot".to_owned(),
+                ));
+            }
+            SkillLibrary::Bot if self.bot.is_none() => {
+                return Err(EventDataError::Data(
+                    "a skill in a Bot's library names its Bot".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        if !Self::valid_name(&self.name) {
+            return Err(EventDataError::Data(
+                "a skill name is 1 to 64 lowercase letters, digits, or hyphens, and does not \
+                 begin or end with a hyphen"
+                    .to_owned(),
+            ));
+        }
+        if self.description.trim().is_empty() || self.description.chars().count() > 1024 {
+            return Err(EventDataError::Data(
+                "a skill description has 1 to 1024 characters".to_owned(),
+            ));
+        }
+        if self.body.len() > MAX_SKILL_BODY_BYTES {
+            return Err(EventDataError::Data(format!(
+                "a skill body is at most {MAX_SKILL_BODY_BYTES} bytes"
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for script in &self.scripts {
+            if !valid_script_name(&script.name) {
+                return Err(EventDataError::Data(
+                    "a script name is one path component of letters, digits, dots, or hyphens"
+                        .to_owned(),
+                ));
+            }
+            if !is_sha256(&script.sha256) {
+                return Err(EventDataError::Data(
+                    "a script is named by the digest of its bytes".to_owned(),
+                ));
+            }
+            if !seen.insert(&script.name) {
+                return Err(EventDataError::Data(
+                    "a skill carries one script under each name".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether a script's file name is one a Computer writes safely.
+#[must_use]
+pub fn valid_script_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains(['/', '\\'])
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_')
+}
+
+/// The data of `neha.skill.removed`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct SkillRemoved {
+    /// The skill.
+    pub skill: Id,
+    /// The library the skill left, when the writer knew it.
+    ///
+    /// The payload names no person, so the event stream uses this to decide
+    /// whether every member may see the removal: only a Space skill's
+    /// removal is every member's. A record written before this field has
+    /// none and stays its author's.
+    #[serde(default)]
+    pub library: Option<SkillLibrary>,
+}
+
+/// Where an MCP server's credential and tools belong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(rename_all = "snake_case")]
+pub enum McpScope {
+    /// The Admin connected it for the whole Space.
+    Space,
+    /// A User connected it with their own credential.
+    User,
+}
+
+/// The longest name an MCP server may take.
+///
+/// A tool's model-facing name is `mcp__<server>__<tool>`, and the Model's tool
+/// names are at most 64 characters.
+pub const MAX_MCP_NAME_BYTES: usize = 32;
+
+/// The most bytes a stdio server's `command` token may take.
+pub const MAX_MCP_COMMAND_BYTES: usize = 1024;
+/// The most arguments a stdio server may name.
+pub const MAX_MCP_ARGS: usize = 128;
+/// The most bytes one argument of a stdio server may take.
+pub const MAX_MCP_ARG_BYTES: usize = 4096;
+/// The most bytes all arguments of a stdio server together may take.
+pub const MAX_MCP_ARGS_BYTES: usize = 16 * 1024;
+/// The most environment variables a stdio server may configure.
+pub const MAX_MCP_ENV: usize = 64;
+/// The most bytes one environment variable's name may take.
+pub const MAX_MCP_ENV_NAME_BYTES: usize = 128;
+/// The most bytes one environment variable's value may take.
+pub const MAX_MCP_ENV_VALUE_BYTES: usize = 4096;
+/// The most bytes all environment variables of a stdio server together may take.
+pub const MAX_MCP_ENV_BYTES: usize = 64 * 1024;
+/// The most bytes a stdio server's working directory may take.
+pub const MAX_MCP_CWD_BYTES: usize = 4096;
+
+/// How a Space reaches an MCP server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(rename_all = "kebab-case")]
+pub enum McpTransport {
+    /// MCP Streamable HTTP: a server that runs elsewhere and is reached over
+    /// the network.
+    StreamableHttp,
+    /// MCP over stdio: a subprocess the Space launches on its own machine.
+    Stdio,
+}
+
+/// A stdio MCP server's launch configuration, as the record holds it.
+///
+/// The record keeps the package's symbolic form: `${PLUGIN_ROOT}` and
+/// `${PLUGIN_DATA}` in `args`, `env`, and `cwd` stand for the plugin root and
+/// its data directory when the Space launches the process. `command` and `cwd`
+/// are relative to a root the package chose, so they stay meaningful when the
+/// home moves; a `cwd` keeps every `..` its expression needs, because only an
+/// install or a launch knows the real roots and can decide what a `..` removes.
+/// Nothing is launched from this type alone: the install resolves the directory
+/// against the roots it publishes, and a launch resolves the two roots again and
+/// checks the resolved directory against the root it names.
+#[derive(Clone, Debug, PartialEq, Eq, TS)]
+#[ts(export_to = "record.ts")]
+pub struct StdioServer {
+    /// The executable: a bare name the platform resolves, or a path beginning
+    /// with `./` under the plugin root.
+    pub command: String,
+    /// The arguments, as the package wrote them.
+    pub args: Vec<String>,
+    /// The environment variables the package configures, as it wrote them.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// The symbolic working directory under its root, `/`-separated; it may
+    /// hold the two recognized placeholders and `..` components, and `None`
+    /// names the root itself.
+    pub cwd: Option<String>,
+    /// Whether the working directory hangs from the plugin data directory
+    /// rather than the plugin root.
+    pub data_cwd: bool,
+}
+
+impl StdioServer {
+    /// Checks the launch configuration against what the record holds, and
+    /// answers the reason it cannot hold it.
+    pub fn validate(&self) -> Result<(), String> {
+        if normalize_stdio_command(&self.command).as_deref() != Some(self.command.as_str()) {
+            return Err(format!(
+                "a stdio server's command is a bare executable name, or a `./` path that stays \
+                 in the plugin root, at most {MAX_MCP_COMMAND_BYTES} bytes"
+            ));
+        }
+        if self.args.len() > MAX_MCP_ARGS {
+            return Err(format!(
+                "a stdio server takes at most {MAX_MCP_ARGS} arguments"
+            ));
+        }
+        let mut args_bytes = 0;
+        for argument in &self.args {
+            if argument.contains('\0') || argument.len() > MAX_MCP_ARG_BYTES {
+                return Err(format!(
+                    "a stdio server's argument is text without a NUL, at most \
+                     {MAX_MCP_ARG_BYTES} bytes"
+                ));
+            }
+            args_bytes += argument.len();
+        }
+        if args_bytes > MAX_MCP_ARGS_BYTES {
+            return Err(format!(
+                "a stdio server's arguments take at most {MAX_MCP_ARGS_BYTES} bytes"
+            ));
+        }
+        if self.env.len() > MAX_MCP_ENV {
+            return Err(format!(
+                "a stdio server configures at most {MAX_MCP_ENV} environment variables"
+            ));
+        }
+        let mut env_bytes = 0;
+        for (name, value) in &self.env {
+            if !valid_mcp_env_name(name) || name.len() > MAX_MCP_ENV_NAME_BYTES {
+                return Err(format!(
+                    "a stdio server's environment variable name is \
+                     `[A-Za-z_][A-Za-z0-9_]*`, at most {MAX_MCP_ENV_NAME_BYTES} bytes"
+                ));
+            }
+            if value.contains('\0') || value.len() > MAX_MCP_ENV_VALUE_BYTES {
+                return Err(format!(
+                    "a stdio server's environment variable value is text without a NUL, at most \
+                     {MAX_MCP_ENV_VALUE_BYTES} bytes"
+                ));
+            }
+            env_bytes += name.len() + value.len();
+        }
+        if env_bytes > MAX_MCP_ENV_BYTES {
+            return Err(format!(
+                "a stdio server's environment takes at most {MAX_MCP_ENV_BYTES} bytes"
+            ));
+        }
+        if let Some(cwd) = &self.cwd
+            && !symbolic_working_directory_stays_inside(cwd)
+        {
+            return Err(format!(
+                "a stdio server's working directory is a `/`-separated relative path that \
+                 stays in the root its `data_cwd` bit names, at most {MAX_MCP_CWD_BYTES} bytes"
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// The placeholders a launch expands in a symbolic working directory.
+const SYMBOLIC_ROOT_PLACEHOLDERS: [&str; 2] = ["${PLUGIN_ROOT}", "${PLUGIN_DATA}"];
+
+/// Whether a symbolic working directory is text the record can hold.
+///
+/// The record and the package loader keep the package's expression, not an
+/// expanded result: it may hold the two recognized `${...}` placeholders and
+/// `..` components, and only an expansion against the real plugin root and
+/// plugin data directory says where it lands. The install expands it with the
+/// roots it publishes and skips a directory that leaves the root its `data_cwd`
+/// bit names; the launch expands it again with the roots it finds and refuses
+/// the same escape. So this check is textual and conservative, and it is not the
+/// containment decision. The path is `/`-separated and not absolute, its
+/// components are plain text — no backslash, control character, or drive/stream
+/// separator, because none is a path component on every platform the record may
+/// reach — and a `..` that appears before any placeholder may not remove the
+/// root itself: it names the root's parent wherever the root is. A `..` after a
+/// placeholder may remove a component of the root the placeholder stands for,
+/// and the text does not carry how many, so it stays for the install and the
+/// launch to judge.
+#[must_use]
+pub fn symbolic_working_directory_stays_inside(cwd: &str) -> bool {
+    if cwd.is_empty() || cwd.len() > MAX_MCP_CWD_BYTES || cwd.starts_with('/') {
+        return false;
+    }
+    if cwd.chars().any(char::is_control) || cwd.contains('\\') {
+        return false;
+    }
+    let mut depth = 0_usize;
+    // Once a component holds a placeholder the record cannot know how many
+    // components its expansion contributes, so a later `..` is left for the
+    // install and the launch; the text checks still run over every component.
+    let mut undecidable = false;
+    for component in cwd.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if undecidable {
+                    continue;
+                }
+                let Some(remaining) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = remaining;
+            }
+            component => {
+                // A drive or stream separator is not one path component on
+                // every platform the record may reach: check it on the whole
+                // expression, including the part after a placeholder.
+                if component.contains(':') {
+                    return false;
+                }
+                if SYMBOLIC_ROOT_PLACEHOLDERS
+                    .iter()
+                    .any(|placeholder| component.contains(placeholder))
+                {
+                    undecidable = true;
+                }
+                depth += 1;
+            }
+        }
+    }
+
+    true
+}
+
+/// Normalizes a `/`-separated path relative to one root.
+///
+/// Answers the path's components with `.` components dropped and `..`
+/// components applied, or `None` when the path is not plain text or a `..`
+/// would leave the root. The empty answer names the root itself. A stored
+/// command is one this function answers unchanged; a working directory keeps
+/// its symbolic form, so it may hold placeholders and `..` components and is
+/// checked by [`StdioServer::validate`] instead.
+#[must_use]
+pub fn normalize_relative(path: &str) -> Option<String> {
+    if path.chars().any(char::is_control) || path.contains('\\') {
+        return None;
+    }
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            // A drive or stream separator is not one path component: joining
+            // it would name another root on some platform.
+            component if component.contains(':') => return None,
+            component => components.push(component),
+        }
+    }
+
+    Some(components.join("/"))
+}
+
+/// Whether an environment variable may take this name: `[A-Za-z_][A-Za-z0-9_]*`.
+#[must_use]
+pub fn valid_mcp_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == b'_' => {}
+        _ => return false,
+    }
+
+    bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Normalizes a stdio server's command token: a bare executable name, or a
+/// path beginning with `./` that stays in the plugin root.
+///
+/// Answers the token in the one form the record holds, or `None` when it names
+/// no executable token: a shell command line, a path without `./`, an escape
+/// from the plugin root, or text that is not plain.
+///
+/// The package loader reads a command into this form, and the record accepts
+/// only the form this function answers unchanged.
+#[must_use]
+pub fn normalize_stdio_command(command: &str) -> Option<String> {
+    if command.is_empty()
+        || command.len() > MAX_MCP_COMMAND_BYTES
+        || command.chars().any(char::is_control)
+    {
+        return None;
+    }
+    if let Some(relative) = command.strip_prefix("./") {
+        let relative = normalize_relative(relative)?;
+
+        return (!relative.is_empty()).then(|| format!("./{relative}"));
+    }
+    // A bare executable name is one token the platform's search resolves. Any
+    // other character is shell syntax or another path.
+    let bare = command
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'));
+
+    (bare && !command.starts_with('.')).then(|| command.to_owned())
+}
+
+/// The data of `neha.mcp.server.added`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct McpServerAdded {
+    /// The server.
+    pub server: Id,
+    /// Its name, unique in the Space.
+    pub name: String,
+    /// The address it speaks Streamable HTTP at, when it is an HTTP server.
+    ///
+    /// A record written before stdio servers were supported always carries
+    /// one; a stdio server carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The executable a stdio server launches, when it is a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// A stdio server's arguments, with `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`
+    /// left for the launch to expand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// A stdio server's environment, with the placeholders left for the launch
+    /// to expand.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// A stdio server's working directory under its root, `/`-separated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Whether a stdio server's working directory hangs from the plugin data
+    /// directory rather than the plugin root.
+    #[serde(default)]
+    pub data_cwd: bool,
+    /// Where its credential belongs.
+    pub scope: McpScope,
+    /// The User it belongs to, when its scope is one User's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<Id>,
+    /// The account that connected it.
+    pub by: Id,
+    /// The package that brought it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Id>,
+    /// The fixed headers the package configures, which are visible data.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+impl McpServerAdded {
+    /// Whether a token is one this Space stores as an MCP credential.
+    ///
+    /// The alphabet is the one a bearer token takes (RFC 6750 `b64token`), so
+    /// a token cannot hide from a text search through JSON string escaping.
+    #[must_use]
+    pub fn valid_credential(token: &str) -> bool {
+        let bytes = token.as_bytes();
+        if bytes.is_empty() || bytes.len() > 8192 {
+            return false;
+        }
+        // RFC 6750: one or more token-alphabet characters, then zero or more
+        // trailing `=` padding characters.
+        let body: &[u8] = match bytes.iter().rposition(|byte| *byte != b'=') {
+            Some(last) => &bytes[..=last],
+            None => return false,
+        };
+        body.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+    }
+
+    /// Whether the name follows the Plugin naming rule.
+    #[must_use]
+    pub fn valid_name(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        (1..=MAX_MCP_NAME_BYTES).contains(&bytes.len())
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    }
+
+    /// Whether the address is one a Space calls.
+    ///
+    /// A server runs elsewhere and is reached over HTTPS, or over HTTP only
+    /// when the caller is the Space's own loopback.
+    #[must_use]
+    pub fn valid_url(url: &str) -> bool {
+        if url.len() > 2048
+            || url
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+            || url.contains('\\')
+            || url.contains('#')
+        {
+            return false;
+        }
+        let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+            ("https", rest)
+        } else if let Some(rest) = url.strip_prefix("http://") {
+            ("http", rest)
+        } else {
+            return false;
+        };
+        // The authority ends where the path or the query begins.
+        let authority = rest.split(['/', '?']).next().unwrap_or_default();
+        // Userinfo would put a credential in the record.
+        if authority.is_empty() || authority.contains('@') {
+            return false;
+        }
+        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+            // A bracketed IPv6 host names its port after the closing bracket.
+            let Some((host, rest)) = bracketed.split_once(']') else {
+                return false;
+            };
+            let port = if rest.is_empty() {
+                None
+            } else if let Some(port) = rest.strip_prefix(':') {
+                Some(port)
+            } else {
+                return false;
+            };
+            (format!("[{host}]"), port)
+        } else if let Some((host, port)) = authority.rsplit_once(':') {
+            (host.to_owned(), Some(port))
+        } else {
+            (authority.to_owned(), None)
+        };
+        if let Some(port) = port
+            && (port.is_empty()
+                || port.len() > 5
+                || !port.bytes().all(|byte| byte.is_ascii_digit())
+                || port.parse::<u16>().is_err()
+                || port.parse::<u16>() == Ok(0))
+        {
+            return false;
+        }
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        let host = host.as_str();
+        if host.is_empty() {
+            return false;
+        }
+        let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+        if scheme == "http" && !loopback {
+            return false;
+        }
+        if host.contains(':') {
+            return host.parse::<std::net::Ipv6Addr>().is_ok();
+        }
+        let labels: Vec<&str> = host.split('.').collect();
+        labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+    }
+
+    /// Returns how this Space reaches the server, or why its data names no one
+    /// transport.
+    ///
+    /// A server is reached one way: a `url` over Streamable HTTP, or a
+    /// `command` launched as a subprocess. The fields of the other transport
+    /// stay empty.
+    pub fn transport(&self) -> Result<McpTransport, EventDataError> {
+        match (self.url.is_some(), self.command.is_some()) {
+            (true, false) => {
+                if !self.args.is_empty()
+                    || !self.env.is_empty()
+                    || self.cwd.is_some()
+                    || self.data_cwd
+                {
+                    return Err(EventDataError::Data(
+                        "an HTTP MCP server names one transport".to_owned(),
+                    ));
+                }
+                Ok(McpTransport::StreamableHttp)
+            }
+            (false, true) => {
+                if !self.headers.is_empty() {
+                    return Err(EventDataError::Data(
+                        "a stdio MCP server configures no HTTP headers".to_owned(),
+                    ));
+                }
+                Ok(McpTransport::Stdio)
+            }
+            _ => Err(EventDataError::Data(
+                "an MCP server names one transport: a `url`, or a `command`".to_owned(),
+            )),
+        }
+    }
+
+    /// The launch configuration, when this server is a stdio server.
+    #[must_use]
+    pub fn stdio(&self) -> Option<StdioServer> {
+        self.command.as_ref().map(|command| StdioServer {
+            command: command.clone(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+            cwd: self.cwd.clone(),
+            data_cwd: self.data_cwd,
+        })
+    }
+
+    /// Checks the data against what a server may hold.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if !Self::valid_name(&self.name) {
+            return Err(EventDataError::Data(format!(
+                "an MCP server name is 1 to {MAX_MCP_NAME_BYTES} letters, digits, or hyphens"
+            )));
+        }
+        match self.transport()? {
+            McpTransport::StreamableHttp => {
+                if !self.url.as_deref().is_some_and(Self::valid_url) {
+                    return Err(EventDataError::Data(
+                        "an MCP server's address is https, or http on the Space's own loopback"
+                            .to_owned(),
+                    ));
+                }
+            }
+            McpTransport::Stdio => match self.stdio() {
+                Some(stdio) => stdio.validate().map_err(EventDataError::Data)?,
+                None => {
+                    return Err(EventDataError::Data(
+                        "a stdio MCP server names its command".to_owned(),
+                    ));
+                }
+            },
+        }
+        match self.scope {
+            McpScope::Space if self.user.is_some() => {
+                return Err(EventDataError::Data(
+                    "a server the Space connected belongs to no User".to_owned(),
+                ));
+            }
+            McpScope::User if self.user.is_none() => {
+                return Err(EventDataError::Data(
+                    "a server a User connected names its User".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
+/// The data of `neha.mcp.server.updated`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct McpServerUpdated {
+    /// The server.
+    pub server: Id,
+    /// Its new address, when the address changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Whether the update replaced its credential.
+    pub credential: bool,
+    /// The account that changed it.
+    pub by: Id,
+    /// Where the credential the update names belongs, when the writer knew it.
+    ///
+    /// The payload names no person, so the event stream uses this to decide
+    /// whether every member may see the change: only a Space credential's
+    /// change is every member's. A personal credential attached to a Space
+    /// server records [`McpScope::User`], so the stream never broadcasts who
+    /// attached it. The projection ignores this field: it describes the
+    /// credential change, not the server's own scope. A record written before
+    /// this field has none and stays its author's.
+    #[serde(default)]
+    pub scope: Option<McpScope>,
+}
+
+/// The data of `neha.mcp.server.removed`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct McpServerRemoved {
+    /// The server.
+    pub server: Id,
+    /// Where the server's credential belonged, when the writer knew it.
+    ///
+    /// The payload names no person, so the event stream uses this to decide
+    /// whether every member may see the removal: only a Space-wide server's
+    /// removal is every member's. A record written before this field has none
+    /// and stays its author's.
+    #[serde(default)]
+    pub scope: Option<McpScope>,
+}
+
+/// The data of `neha.bot.mcp.enabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct BotMcpEnabled {
+    /// The Bot.
+    pub bot: Id,
+    /// The server whose tools it may call.
+    pub server: Id,
+}
+
+/// The data of `neha.bot.mcp.disabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct BotMcpDisabled {
+    /// The Bot.
+    pub bot: Id,
+    /// The server it may no longer call.
+    pub server: Id,
+}
+
+/// The data of `neha.bot.skill.enabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct BotSkillEnabled {
+    /// The Bot.
+    pub bot: Id,
+    /// The skill it may use.
+    pub skill: Id,
+}
+
+/// The data of `neha.bot.skill.disabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct BotSkillDisabled {
+    /// The Bot.
+    pub bot: Id,
+    /// The skill it no longer uses.
+    pub skill: Id,
+}
+
+/// The most bytes a package's name, version, and source may carry.
+pub const MAX_PLUGIN_SOURCE_BYTES: usize = 4096;
+
+/// The data of `neha.plugin.installed`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct PluginInstalled {
+    /// The package.
+    pub plugin: Id,
+    /// Its name from `plugin.json`.
+    pub name: String,
+    /// Its version from `plugin.json`, when it names one.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The digest of the package's bytes.
+    pub digest: String,
+    /// The commit the package was fetched at, when it came from a repository.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// The source it came from.
+    pub source: String,
+    /// The MCP servers it brought.
+    #[serde(default)]
+    pub servers: Vec<Id>,
+    /// The skills it brought into the Space's library.
+    #[serde(default)]
+    pub skills: Vec<Id>,
+}
+
+impl PluginInstalled {
+    /// Checks the fields a record reader relies on.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        let valid = |text: &str, limit: usize| {
+            !text.is_empty() && text.len() <= limit && !text.chars().any(char::is_control)
+        };
+
+        if !valid(&self.name, 64) {
+            return Err(EventDataError::Data("a package names a name".to_owned()));
+        }
+        if self.digest.len() != 64 || !self.digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(EventDataError::Data(
+                "a package digest is a sha256 hex string".to_owned(),
+            ));
+        }
+        if self.version.as_ref().is_some_and(|text| !valid(text, 128)) {
+            return Err(EventDataError::Data(
+                "a package version is short text".to_owned(),
+            ));
+        }
+        if self.commit.as_ref().is_some_and(|text| !valid(text, 128)) {
+            return Err(EventDataError::Data(
+                "a package commit is short text".to_owned(),
+            ));
+        }
+        if !valid(&self.source, MAX_PLUGIN_SOURCE_BYTES) {
+            return Err(EventDataError::Data(
+                "a package names its source".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// The data of `neha.plugin.removed`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct PluginRemoved {
+    /// The package.
+    pub plugin: Id,
+}
+
+/// The data of `neha.plugin.enabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct PluginEnabled {
+    /// The package.
+    pub plugin: Id,
+}
+
+/// The data of `neha.plugin.disabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct PluginDisabled {
+    /// The package.
+    pub plugin: Id,
 }
 
 /// The data of `neha.memory.added`.

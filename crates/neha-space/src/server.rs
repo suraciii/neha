@@ -19,10 +19,11 @@ use axum::extract::rejection::{BytesRejection, FailedToBufferBody, QueryRejectio
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Query, Request, State};
 use axum::http::header::{
-    AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, ORIGIN,
+    SET_COOKIE,
 };
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -33,7 +34,7 @@ use futures_util::{SinkExt, StreamExt};
 use neha::error::ErrorCode;
 use neha::file::MAX_FILE_BYTES;
 use neha::id::Id;
-use neha::record::{Author, EventDraft, EventKind};
+use neha::record::{Author, EventDraft, EventKind, McpScope};
 use neha::surface::{ClientFrame, CommandCall, MAX_FRAME_BYTES, PROTOCOL_VERSION, ServerFrame};
 use neha_computer::channel::{CHANNEL_VERSION, DeviceFrame, HostFrame, MAX_CHANNEL_FRAME_BYTES};
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,84 @@ const COMPUTER_PING: Duration = Duration::from_secs(15);
 /// How long a Computer may stay silent before the channel is dropped.
 const COMPUTER_IDLE: Duration = Duration::from_secs(60);
 
+/// How long a browser sign-in stays usable, in seconds.
+///
+/// The browser flow is a person's walk through an authorization server; ten
+/// minutes covers it without leaving a state token acceptable for long.
+pub(crate) const SIGN_IN_TTL: Duration = Duration::from_secs(600);
+
+/// The fixed explanation a sign-in the person cancelled or the authority
+/// refused reports.
+pub(crate) const SIGN_IN_CANCELLED: &str = "the sign-in was cancelled or refused";
+
+/// The fixed explanation a sign-in whose exchange did not finish reports.
+pub(crate) const SIGN_IN_INCOMPLETE: &str = "the sign-in could not be completed";
+
+/// The fixed explanation an unknown or expired sign-in reports.
+pub(crate) const SIGN_IN_EXPIRED: &str = "the sign-in expired or is unknown";
+
+/// The fixed explanation a browser sign-in a newer one replaced reports.
+///
+/// The Space keeps one pending browser flow per account: a second start
+/// supersedes the first, whose callback then finds its state refused and whose
+/// poll reads this sentence.
+pub(crate) const SIGN_IN_REPLACED: &str = "a newer sign-in replaced this one";
+
+/// The prefix of the cookie that binds a browser flow to its browser.
+///
+/// The sign-in's id is appended to the name (see [`sign_in_cookie_name`]), so
+/// one flow's binding is only ever written or cleared by that flow's own
+/// steps.
+const SIGN_IN_COOKIE_PREFIX: &str = "neha_signin";
+
+/// The most browser sign-ins one Space keeps at once.
+pub(crate) const MAX_PENDING_SIGN_INS: usize = 64;
+
+/// A browser sign-in the Space is waiting on.
+pub(crate) struct PendingSignIn {
+    /// The account that started it, and the only account that may read it.
+    pub account: Id,
+    /// An existing server it attaches a credential to; `None` registers a new
+    /// one when it finishes.
+    pub server: Option<Id>,
+    /// The name a new server takes.
+    pub name: Option<String>,
+    /// The address the sign-in speaks to.
+    pub url: String,
+    /// Where the credential belongs.
+    pub scope: McpScope,
+    /// The browser flow the OAuth client planned.
+    pub plan: crate::oauth::SignInPlan,
+    /// The random value the initiating browser's cookie must return.
+    pub nonce: String,
+    /// Whether a command line owns the redirect instead of the browser
+    /// callback.
+    pub cli: bool,
+    /// When the client asked for the sign-in.
+    pub created_at: Instant,
+    /// What the client polls.
+    pub status: SignInStatus,
+}
+
+/// What became of a browser sign-in.
+pub(crate) enum SignInStatus {
+    /// The browser has not answered yet.
+    Pending,
+    /// A callback or command line finish admitted the flow and is exchanging
+    /// its code; the sign-ins lock is not held while the token endpoint runs.
+    Executing,
+    /// The credential is in the Vault and the record holds the server.
+    Finished {
+        /// The connected server.
+        server: Id,
+    },
+    /// The sign-in did not finish.
+    Failed {
+        /// A fixed explanation the client may show.
+        reason: String,
+    },
+}
+
 /// A Space ready to answer clients.
 pub struct SpaceServer {
     pub(crate) home: Home,
@@ -117,6 +196,12 @@ pub struct SpaceServer {
     /// Serializes Provider writes, so a refresh and a default change cannot
     /// each build their Model list from a read the other replaced.
     pub(crate) provider_writes: tokio::sync::Mutex<()>,
+    /// Serializes changes to the skills of both libraries.
+    pub(crate) library: tokio::sync::Mutex<()>,
+    /// Whether this Space treats skills as instructions only.
+    pub(crate) instructions_only: bool,
+    /// Where this Space may install a package from.
+    pub(crate) plugins: crate::config::PluginsConfig,
     /// Local-ticket pair attempts, counted per source address.
     pub(crate) pairs: Mutex<PairLimiter>,
     /// The ticket file this start wrote for its Admin, with its digest.
@@ -136,6 +221,20 @@ pub struct SpaceServer {
     public_url: Option<String>,
     /// The installed browser clients' push subscriptions.
     pub(crate) push: std::sync::Arc<crate::push::Push>,
+    /// The browser sign-ins the Space is waiting on, by sign-in.
+    ///
+    /// Lock order: a sign-in's token request runs outside every lock, but its
+    /// commit holds this mutex across the admission re-check and the Vault and
+    /// record writes, taking the library lock inside it. `mcp_sign_in_start`
+    /// holds [`signin_start`](Self::signin_start) and then this mutex and never
+    /// the library, and no path takes the library before this mutex.
+    pub(crate) signins: tokio::sync::Mutex<HashMap<Id, PendingSignIn>>,
+    /// Serializes the start of one sign-in: a redelivered command waits for
+    /// the delivery already planning, then reads the recorded answer instead
+    /// of planning a second flow and a second external registration.
+    pub(crate) signin_start: tokio::sync::Mutex<()>,
+    /// The OAuth client that plans and finishes a browser sign-in.
+    pub(crate) oauth: crate::oauth::OAuthClient,
 }
 
 /// Moves a Hosted Workspace written before one root per Computer into the
@@ -275,6 +374,8 @@ impl SpaceServer {
             .unwrap_or_else(|| browser_host(home.root()));
         let config = Config::load(&home)?;
         let storage = config.storage.clone();
+        let instructions_only = config.skills.instructions_only;
+        let plugins = config.plugins.clone();
         let catalog = std::sync::Arc::new(CatalogStore::open(&home, &config.catalog));
         let store = Store::open(&home).await?;
         let identity = Identity::open(&home).await?;
@@ -330,6 +431,9 @@ impl SpaceServer {
             approvals: tokio::sync::Mutex::new(()),
             computer_assignments: tokio::sync::Mutex::new(()),
             provider_writes: tokio::sync::Mutex::new(()),
+            library: tokio::sync::Mutex::new(()),
+            instructions_only,
+            plugins,
             pairs: Mutex::new(PairLimiter::default()),
             start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -342,7 +446,33 @@ impl SpaceServer {
             browser_authority: Mutex::new(None),
             public_url,
             push,
+            signins: tokio::sync::Mutex::new(HashMap::new()),
+            signin_start: tokio::sync::Mutex::new(()),
+            oauth: crate::oauth::OAuthClient::new(),
         })
+    }
+
+    /// Returns the origin the browser client uses for this Space.
+    ///
+    /// A trusted TLS proxy's origin when configured, otherwise the Space's
+    /// stable browser hostname on the loopback port it bound. An authorization
+    /// server sends the browser to exactly this origin, so it must be the one
+    /// the Host guard and the session cookie name.
+    pub(crate) fn browser_origin(&self) -> String {
+        if let Some(public_url) = &self.public_url {
+            return public_url.clone();
+        }
+        let port = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.url.clone())
+            .and_then(|url| reqwest::Url::parse(&url).ok())
+            .and_then(|url| url.port());
+        match port {
+            Some(port) => format!("http://{}:{port}", self.browser_host),
+            None => format!("http://{}", self.browser_host),
+        }
     }
 
     /// Returns the lock that serializes uploads in one Chat.
@@ -405,6 +535,9 @@ impl SpaceServer {
                 post(bot_file_upload).layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize)),
             )
             .route("/api/bot/files/{id}", get(bot_file_download))
+            .route("/api/mcp/signin/bind", get(mcp_sign_in_bind))
+            .route("/api/mcp/signin/{key}/callback", get(mcp_sign_in_callback))
+            .route("/api/mcp/card/sandbox", get(mcp_card_sandbox))
             .route("/api", any(api_not_found))
             .route("/api/", any(api_not_found))
             .route("/api/{*rest}", any(api_not_found));
@@ -793,8 +926,16 @@ fn add_security_headers(response: &mut Response, server: &SpaceServer, host: &st
         HeaderValue::from_static("nosniff"),
     );
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    if let Ok(value) = HeaderValue::from_str(&content_security_policy(server, host)) {
+    // A route that answers documents of its own states the frame policy it
+    // needs; the Space-wide DENY stays for everything else.
+    if !headers.contains_key("x-frame-options") {
+        headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    }
+    // A route may bring its own policy (the Card sandbox proxy does); it is
+    // the narrower one, so it wins over the Space-wide policy.
+    if !headers.contains_key("content-security-policy")
+        && let Ok(value) = HeaderValue::from_str(&content_security_policy(server, host))
+    {
         headers.insert("content-security-policy", value);
     }
     if server.public_url.is_some() {
@@ -1119,6 +1260,713 @@ async fn api_not_found() -> Response {
     ApiError::not_found("no such API route").into_response()
 }
 
+/// The query the bind route carries.
+#[derive(Deserialize)]
+struct SignInBindQuery {
+    /// The sign-in the start answered with.
+    sign_in: Id,
+}
+
+/// The query an authorization server returns the browser with.
+#[derive(Deserialize)]
+struct SignInCallbackQuery {
+    /// The authorization code, when the person approved.
+    #[serde(default)]
+    code: Option<String>,
+    /// The state token the plan named.
+    #[serde(default)]
+    state: Option<String>,
+    /// The authorization server's error, when it refused or failed. It is
+    /// never rendered or polled.
+    #[serde(default)]
+    error: Option<String>,
+    /// The issuer the authorization server named, when it names one here
+    /// (RFC 9207): the plan's issuer checked byte for byte.
+    #[serde(default)]
+    iss: Option<String>,
+}
+
+/// The page a finished sign-in shows.
+///
+/// The pages are fixed: the browser's history must not keep the state token,
+/// the code, or a token endpoint's error, so none of them is ever rendered.
+const SIGN_IN_FINISHED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>MCP sign-in finished</title></head><body><h1>MCP sign-in finished</h1>\
+<p>The Space stored the credential. You can close this window and return to Neha.</p></body></html>";
+
+/// The page a sign-in that did not finish shows.
+const SIGN_IN_FAILED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>MCP sign-in failed</title></head><body><h1>MCP sign-in failed</h1>\
+<p>The sign-in did not finish. You can close this window and try again from Neha.</p></body></html>";
+
+fn sign_in_page(status: StatusCode, page: &'static str) -> Response {
+    (
+        status,
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (CACHE_CONTROL, "no-store"),
+        ],
+        page,
+    )
+        .into_response()
+}
+
+/// The fixed page one Card's sandbox is mounted in.
+///
+/// The page is same-origin with the Space but shows nothing of it: its one job
+/// is to put the untrusted app document in a frame that shares no origin with
+/// the Space and to relay messages between that frame and the page that
+/// mounted it. The app's bytes never pass through this page's markup, so the
+/// host parses no remote HTML; a `mount` message hands them to a frame's
+/// `srcdoc` behind the app's own Content Security Policy.
+///
+/// The relay is bound to the mounted document, not to the frame's window: a
+/// WindowProxy survives the untrusted document navigating itself, so a
+/// replacement document would otherwise inherit the relay. The page injects a
+/// trusted script ahead of the app's markup; that script opens one
+/// `MessageChannel`, keeps one half in the app's realm, and transfers the
+/// other half to this page. From then on app→host data crosses only through
+/// the port, and a document that replaces the mounted one never held it, so it
+/// can neither receive host data nor speak as the app. The injected script
+/// stands an `EventTarget` in for the app's replaceable `parent` property, so
+/// the app's ordinary `window.parent.postMessage` calls leave over the port and
+/// the source of a message it receives compares equal to `window.parent`. The
+/// load watch still reports a navigation, so the host revokes the relay even
+/// when the frame leaves the document the host mounted.
+///
+/// The page fills the frame that the host allocates: a zero-margin document
+/// with no scrolling, and the app's frame absolutely positioned over it, so
+/// the app's viewport is the space the host gave the sandbox rather than the
+/// default body box.
+const CARD_SANDBOX_PAGE: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Neha app sandbox</title>
+<style>
+html,body{margin:0;padding:0;height:100%;overflow:hidden}
+</style>
+</head>
+<body>
+<template id="neha-card-frame"><iframe sandbox="allow-scripts" style="position:absolute;inset:0;width:100%;height:100%;border:0"></iframe></template>
+<script>
+(function () {
+  "use strict";
+  var parentWindow = window.parent;
+  var inner = null;
+  var mounted = false;
+  var inert = false;
+  var port = null;
+
+  function post(message) {
+    try {
+      parentWindow.postMessage(message, "*");
+    } catch (_) {
+      // A relay never throws into the page.
+    }
+  }
+
+  function escapeAttribute(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  // The trusted script the page injects into the app's document ahead of the
+  // app's markup. It runs in the app's realm, so it can stand between the app
+  // and the one host window that realm may speak to. It carries no secret: the
+  // channel it opens is the only line either direction.
+  function appRelay() {
+    "use strict";
+    var hostWindow = window.parent;
+    // Capture the one window message path the app's realm has before the app's
+    // own `parent` is replaced: the channel's other half leaves through it.
+    var sendToHost = hostWindow.postMessage.bind(hostWindow);
+    var channel = new MessageChannel();
+    var appPort = channel.port1;
+    var hostPort = channel.port2;
+    // The object the app sees as `window.parent`. An app says
+    // `window.parent.postMessage(message)`; the stand-in sends it over the
+    // app's half of the channel, whose other half only this page holds. It is
+    // an `EventTarget`, so a listener can compare a received message's source
+    // with `window.parent` and find the parent it trusts.
+    class Bridge extends EventTarget {
+      postMessage(message, _targetOrigin, transfer) {
+        appPort.postMessage(message, Array.isArray(transfer) ? transfer : []);
+      }
+    }
+    var appParent = new Bridge();
+    // Host payloads arrive on the same channel and leave as ordinary window
+    // messages from the app's own parent, which is where an app's listener
+    // expects them. The port is the only way in: a document that replaces this
+    // one never held it. A browser admits only a Window or a MessagePort as a
+    // message event's source, so the event is created with the channel's port
+    // as the source and then names the visible parent as its source: what the
+    // app reads is `window.parent`, just as if the host window had sent it.
+    appPort.onmessage = function (event) {
+      var message = new MessageEvent("message", {
+        data: event.data,
+        source: appPort,
+      });
+      Object.defineProperty(message, "source", { value: appParent });
+      window.dispatchEvent(message);
+    };
+    // `parent` is a replaceable property of the app's own window: the relay
+    // stands in for it, so every message the app sends leaves over the
+    // channel. A document that replaces this one never ran the relay, so it
+    // has no channel at all.
+    try {
+      Object.defineProperty(window, "parent", {
+        value: appParent,
+        configurable: true,
+      });
+    } catch (_) {
+      window.parent = appParent;
+    }
+    // Hand the other half of the channel to the page that mounted this
+    // document. The transfer is one-time, and the page keeps only the first
+    // one it receives.
+    sendToHost({ __nehaPort: true }, "*", [hostPort]);
+  }
+
+  function closePort() {
+    if (!port) return;
+    try {
+      port.close();
+    } catch (_) {}
+    port = null;
+  }
+
+  function navigated() {
+    if (inert) return;
+    inert = true;
+    closePort();
+    post({ neha: "sandbox-navigation" });
+    if (inner) {
+      // Blank the navigated document: the frame is inert from here, and the
+      // blank page loads once more under the guard above.
+      try {
+        inner.setAttribute("srcdoc", "");
+      } catch (_) {}
+    }
+  }
+
+  function mount(data) {
+    if (mounted) return;
+    if (typeof data.html !== "string" || typeof data.csp !== "string") return;
+    mounted = true;
+    var template = document.getElementById("neha-card-frame");
+    var frame = template.content.firstElementChild.cloneNode(true);
+    // The app's policy is the first thing in the document, so the browser
+    // applies it before it parses the app's own bytes, which are never parsed
+    // here.
+    // The relay script follows the policy, before the app's markup, and it
+    // takes no argument: nothing secret is ever written into the app document.
+    frame.srcdoc =
+      '<meta http-equiv="Content-Security-Policy" content="' +
+      escapeAttribute(data.csp) +
+      '">' +
+      "<scr" +
+      "ipt>(" +
+      appRelay.toString() +
+      ")();</scr" +
+      "ipt>" +
+      data.html;
+    var firstLoad = true;
+    frame.addEventListener("load", function () {
+      // The mount's own load is the app document; a later one means the
+      // untrusted document navigated itself.
+      if (firstLoad) {
+        firstLoad = false;
+        return;
+      }
+      navigated();
+    });
+    inner = frame;
+    document.body.appendChild(frame);
+  }
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (event.source === parentWindow) {
+      if (!data || typeof data !== "object") return;
+      if (data.neha === "mount") {
+        mount(data);
+        return;
+      }
+      if (inert) return;
+      if (data.neha === "sandbox-post" && port) {
+        try {
+          port.postMessage(data.payload);
+        } catch (_) {
+          // A payload the frame cannot take is dropped, not thrown.
+        }
+      }
+      return;
+    }
+    if (!inner || event.source !== inner.contentWindow) return;
+    if (inert) return;
+    // The mounted document hands over one half of its channel exactly once,
+    // during its bootstrap. That window message is the only one this page ever
+    // takes from the frame: app data arrives over the port, and a document
+    // that replaces the mounted one holds no port, so its window messages are
+    // dropped.
+    if (data && typeof data === "object" && data.__nehaPort === true && !port) {
+      if (!event.ports || event.ports.length !== 1) return;
+      port = event.ports[0];
+      port.onmessage = function (message) {
+        if (inert) return;
+        post({ neha: "sandbox-message", payload: message.data });
+      };
+    }
+  });
+
+  post({ neha: "sandbox-ready" });
+})();
+</script>
+</body>
+</html>
+"##;
+
+/// The policy the page that mounts a Card's sandbox runs under.
+///
+/// The page needs its own inline relay script and the one frame it builds; it
+/// needs no image, style, connection, or object. The app's frame is a
+/// `srcdoc` document, which inherits this policy: creating it is not a fetch,
+/// so `frame-src` does not gate the initial mount, but it does gate every
+/// navigation the app's frame starts afterwards.
+// The proxy only runs its own inline relay script and the untrusted app
+// document carries its own policy. A `srcdoc` frame inherits its embedder's
+// policy, so this header must not block a resource the card's policy names:
+// it allows the categories an app may use (HTTPS or the loopback origins a
+// card's policy can name) and the card's meta policy narrows the intersection.
+// `base-uri` is one of those categories: a card's `baseUriDomains` are stored
+// as origins the proxy's own policy must also admit, so it names the same
+// origins rather than locking the base down. It names no default-src and no
+// frame-src: the route appends exactly one frame-src, built from the Card's
+// policy ([`card_sandbox_policy`]), because the first occurrence of a
+// directive is the one a browser applies.
+const CARD_SANDBOX_CSP: &str = "script-src 'unsafe-inline' https: http://127.0.0.1:* http://localhost:*; style-src 'unsafe-inline' https: http://127.0.0.1:* http://localhost:*; img-src data: https: http://127.0.0.1:* http://localhost:*; font-src data: https: http://127.0.0.1:* http://localhost:*; media-src data: https: http://127.0.0.1:* http://localhost:*; connect-src https: http://127.0.0.1:* http://localhost:*; base-uri https: http://127.0.0.1:* http://localhost:*; object-src 'none'";
+
+/// The query the sandbox proxy page carries.
+#[derive(Deserialize)]
+struct CardSandboxQuery {
+    /// The Card's effective policy, percent-encoded by the page that mounts
+    /// it. Only its `frame-src` source list is read.
+    #[serde(default)]
+    csp: Option<String>,
+}
+
+/// The policy the fixed sandbox page is served under, with the Card's frame
+/// sources appended.
+///
+/// The inherited categories are [`CARD_SANDBOX_CSP`] unchanged; `frame-src` is
+/// the one directive the mounting page decides, because it governs where the
+/// app's frame itself may navigate. The sources are validated origins (see
+/// [`crate::mcp::sandbox_frame_sources`]), so no attacker text can reach the
+/// header, and a Card that names none gets `'none'`: a fallback only ever
+/// narrows the navigation this header admits.
+fn card_sandbox_policy(frame_sources: &[String]) -> String {
+    let frame = if frame_sources.is_empty() {
+        "'none'".to_owned()
+    } else {
+        frame_sources.join(" ")
+    };
+    let inherited = CARD_SANDBOX_CSP;
+    format!("{inherited}; frame-src {frame}")
+}
+
+/// Answers the fixed page one Card's sandbox is mounted in.
+///
+/// The route needs no session: the page carries no record data and no
+/// credential, and the only app it hosts is a frame the client mounts from a
+/// Card the Space already gave it. It is served under its own policy, so a
+/// page that loads it cannot use it to reach anything the Space offers. The
+/// Card's policy arrives as a query parameter, because only the page that
+/// embeds the sandbox knows which Card it mounts; its `frame-src` list is what
+/// stops the app's frame navigating to an origin the Card did not declare.
+async fn mcp_card_sandbox(query: Result<Query<CardSandboxQuery>, QueryRejection>) -> Response {
+    let policy = query.ok().and_then(|Query(query)| query.csp);
+    let header = card_sandbox_policy(&crate::mcp::sandbox_frame_sources(policy.as_deref()));
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
+            (CACHE_CONTROL, "no-store".to_owned()),
+            (HeaderName::from_static("content-security-policy"), header),
+            // The client mounts this page in a frame of its own origin; the
+            // Space-wide `DENY` would take the sandbox away from it.
+            (
+                HeaderName::from_static("x-frame-options"),
+                "SAMEORIGIN".to_owned(),
+            ),
+        ],
+        CARD_SANDBOX_PAGE,
+    )
+        .into_response()
+}
+
+/// The name of the cookie that binds one browser flow to its browser.
+///
+/// The sign-in's id is part of the name, and a UUID's text is letters, digits,
+/// and hyphens, which a cookie name admits. The distinct name is what keeps two
+/// flows of one account apart: an older flow's bind answer that reaches the
+/// browser after a newer flow bound it writes its own name, so the browser
+/// keeps the newer flow's binding instead of overwriting it.
+fn sign_in_cookie_name(sign_in: Id) -> String {
+    format!("{SIGN_IN_COOKIE_PREFIX}_{sign_in}")
+}
+
+/// The cookie that binds one browser flow to the browser that started it.
+///
+/// The cookie is first-party: the bind route runs on the Space's own origin,
+/// so the authorization server's redirect carries it back. It is scoped to the
+/// sign-in paths, script cannot read it, and it lasts no longer than the flow.
+fn sign_in_cookie(sign_in: Id, nonce: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{}={nonce}; Path=/api/mcp/signin; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
+        sign_in_cookie_name(sign_in),
+        SIGN_IN_TTL.as_secs()
+    )
+}
+
+/// The header that clears one flow's binding once the callback consumed it.
+fn sign_in_cookie_cleared(sign_in: Id, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{}=; Path=/api/mcp/signin; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
+        sign_in_cookie_name(sign_in)
+    )
+}
+
+/// Answers one browser step with a page that also clears the flow's binding
+/// cookie.
+fn sign_in_response(
+    server: &SpaceServer,
+    sign_in: Id,
+    status: StatusCode,
+    page: &'static str,
+) -> Response {
+    let mut response = sign_in_page(status, page);
+    if let Ok(value) = HeaderValue::from_str(&sign_in_cookie_cleared(
+        sign_in,
+        server.public_url.is_some(),
+    )) {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    response
+}
+
+/// Binds one browser flow to the browser that started it.
+///
+/// The route is same-origin and first-party. A page of this Space opens it
+/// with `window.open` on the Space's own origin; that is a same-site
+/// top-level navigation, so the browser sends the initiating account's
+/// `SameSite=Strict` session cookie. A browser flow requires that session and
+/// checks it is the account that started the sign-in before it sets the nonce
+/// cookie: a URL forwarded to another browser gets a generic failure page that
+/// names neither the sign-in nor the account, and nothing is set.
+///
+/// A command line flow is different: the authenticated command line is the
+/// initiator, and its finish is an authenticated command, so the browser that
+/// opens the bind URL need not be signed in to this Space (a fresh browser
+/// profile has no session at all). Such a flow binds without a session and
+/// redirects to the provider, but sets no nonce cookie: the loopback receiver
+/// and the authenticated finish are what bind the second hop, and a command
+/// line flow owns no browser binding.
+///
+/// Only a pending flow may bind. A finished, failed, replaced, or exchanging
+/// one already has or had its browser, so binding it again reads the same
+/// failure page and sets nothing: a terminal flow's bind must not displace the
+/// binding of the flow that replaced it.
+///
+/// The initiating browser's session is authenticated before the flow's record
+/// is checked, and the check and the answer are one critical section under the
+/// sign-ins lock: a flow a second start replaced while this request was
+/// authenticating is refused instead of being answered from a snapshot taken
+/// before the wait. Each flow's cookie carries its own name (see
+/// [`sign_in_cookie_name`]), so a bind answer decided just before a
+/// replacement writes only the older flow's name and cannot disturb the newer
+/// flow's binding even when the browser receives it later.
+///
+/// The authorization server's redirect back is cross-site and the callback
+/// route therefore never asks for the session cookie; the nonce cookie binds
+/// the second hop to the browser the first hop ran in.
+async fn mcp_sign_in_bind(
+    State(server): State<Arc<SpaceServer>>,
+    headers: HeaderMap,
+    Query(query): Query<SignInBindQuery>,
+) -> Response {
+    // A command line flow's browser needs no Space session, so first read which
+    // kind of flow the URL names. Only that immutable flag is read here; the
+    // whole record is read again under the lock below, after the identity
+    // lookup, so a replacement meanwhile is still seen.
+    let cli = {
+        let signins = server.signins.lock().await;
+        signins
+            .get(&query.sign_in)
+            .is_some_and(|pending| pending.cli)
+    };
+    // Authenticate the initiating browser before the flow's record is read: the
+    // identity lookup may wait, and a flow a second start replaces while it does
+    // must be refused by the check under the lock, not answered from a snapshot
+    // taken before the wait.
+    let session = if cli {
+        None
+    } else {
+        match browser_session(&server, &headers).await {
+            Some(session) => Some(session),
+            None => return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE),
+        }
+    };
+    // Decide and build the whole answer under the lock, and await nothing after
+    // releasing it: a second start cannot replace the flow between the checks
+    // and the Set-Cookie the browser receives.
+    let mut signins = server.signins.lock().await;
+    commands::sweep_sign_ins(&mut signins);
+    // An unknown or expired sign-in and a foreign browser all read the same
+    // page: it names neither the sign-in nor the account.
+    let Some(pending) = signins.get(&query.sign_in) else {
+        return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+    };
+    // Only a flow still waiting for its browser may bind. A flow that is
+    // exchanging, finished, failed, or replaced has already been spent (or was
+    // replaced by one whose binding this browser holds), so its bind sets no
+    // cookie.
+    if !matches!(pending.status, SignInStatus::Pending) {
+        return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+    }
+    if pending.created_at.elapsed() >= SIGN_IN_TTL {
+        return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+    }
+    // Only the account that started a browser flow lets its browser bind the
+    // flow. Another account learns nothing: the failure names neither the
+    // sign-in nor the account it belongs to. A command line flow's bind is
+    // authenticated by the command that started it, not by this browser.
+    if !pending.cli {
+        let Some(session) = session.as_ref() else {
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        };
+        if pending.account != session.id {
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        }
+    }
+    let mut response = StatusCode::FOUND.into_response();
+    let response_headers = response.headers_mut();
+    // The nonce cookie is the browser flow's binding, and its name carries this
+    // flow's sign-in, so no other flow writes it. A command line flow sets
+    // none: it owns no browser binding.
+    if !pending.cli
+        && let Ok(cookie) = HeaderValue::from_str(&sign_in_cookie(
+            query.sign_in,
+            &pending.nonce,
+            server.public_url.is_some(),
+        ))
+    {
+        response_headers.insert(SET_COOKIE, cookie);
+    }
+    if let Ok(location) = HeaderValue::from_str(pending.plan.authorize_url.as_str()) {
+        response_headers.insert(axum::http::header::LOCATION, location);
+    }
+    if let Ok(value) = HeaderValue::from_str("no-store") {
+        response_headers.insert(CACHE_CONTROL, value);
+    }
+    response
+}
+
+/// Finishes a browser sign-in.
+///
+/// The route needs no session cookie: a browser navigation arrives from the
+/// authorization server without one. It is authenticated by the state token,
+/// by the nonce cookie the bind route set for that flow (its name carries the
+/// sign-in id, so another flow's cookie never matches), and by the issuer key
+/// in its path, so a callback forwarded to, or replayed by, another browser or
+/// addressed to another issuer's callback is refused. The state is single use
+/// and cleared before the token exchange, so a replayed callback finds nothing.
+async fn mcp_sign_in_callback(
+    State(server): State<Arc<SpaceServer>>,
+    PathParams(key): PathParams<String>,
+    headers: HeaderMap,
+    Query(query): Query<SignInCallbackQuery>,
+) -> Response {
+    let Some(state) = query.state.as_deref().filter(|state| !state.is_empty()) else {
+        return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+    };
+    // Claim the flow under the lock and copy what the exchange needs: the
+    // token endpoint wait must not hold the sign-ins.
+    let pending = {
+        let mut signins = server.signins.lock().await;
+        commands::sweep_sign_ins(&mut signins);
+        let Some(sign_in) = signins
+            .iter()
+            .find(|(_, pending)| {
+                !pending.cli && !pending.plan.state.is_empty() && pending.plan.state == state
+            })
+            .map(|(sign_in, _)| *sign_in)
+        else {
+            // An unknown or spent state names no flow. This answer may arrive
+            // in the browser a newer flow has since bound, so it must set and
+            // clear no cookie: its page must leave that binding alone.
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        };
+        // The binding cookie is read only once the flow is matched: its name is
+        // the flow's own (see [`sign_in_cookie_name`]), so one flow's cookie
+        // cannot satisfy another, and this answer clears only this flow's.
+        let cookie = cookie_token(&headers, &sign_in_cookie_name(sign_in));
+        let pending = signins
+            .get_mut(&sign_in)
+            .expect("the sign-in was just found");
+        // The redirect URI the authorization server returned to carries the
+        // issuer key the plan was discovered from. A callback under another
+        // issuer's key is a mix-up (or a wrong path): it is refused before the
+        // cookie is compared and before any code is exchanged, the flow is not
+        // spent by it, and nothing is set.
+        if key != crate::oauth::issuer_key(&pending.plan.issuer) {
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        }
+        // Only the browser the bind route gave the nonce to completes the
+        // flow; the state token alone confirms nothing about who is here. A
+        // foreign browser's request sets and clears nothing.
+        if cookie != Some(pending.nonce.as_str()) {
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        }
+        // An expired flow is spent without being exchanged. It may have been
+        // abandoned before a newer flow was bound, so it clears no cookie
+        // either; only a flow this request claims may clear the binding.
+        if pending.created_at.elapsed() >= SIGN_IN_TTL {
+            pending.plan.state.clear();
+            pending.status = SignInStatus::Failed {
+                reason: SIGN_IN_EXPIRED.to_owned(),
+            };
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        }
+        // RFC 9207's `iss` names the authorization server that answered. An
+        // answer that names another one would hand this flow's code to the
+        // wrong issuer, and a server whose metadata advertised the parameter
+        // always names its issuer. The request matched the state and the
+        // nonce, so its failure clears the binding cookie it consumed.
+        if !commands::accepts_response_issuer(&pending.plan, query.iss.as_deref()) {
+            pending.plan.state.clear();
+            pending.status = SignInStatus::Failed {
+                reason: SIGN_IN_INCOMPLETE.to_owned(),
+            };
+            return sign_in_response(
+                &server,
+                sign_in,
+                StatusCode::BAD_REQUEST,
+                SIGN_IN_FAILED_PAGE,
+            );
+        }
+        if query.error.is_some() {
+            // The authority's own words never reach the browser or a client.
+            pending.plan.state.clear();
+            pending.status = SignInStatus::Failed {
+                reason: SIGN_IN_CANCELLED.to_owned(),
+            };
+            return sign_in_response(
+                &server,
+                sign_in,
+                StatusCode::BAD_REQUEST,
+                SIGN_IN_FAILED_PAGE,
+            );
+        }
+        if query.code.as_deref().is_none_or(|code| code.is_empty()) {
+            pending.plan.state.clear();
+            pending.status = SignInStatus::Failed {
+                reason: SIGN_IN_CANCELLED.to_owned(),
+            };
+            return sign_in_response(
+                &server,
+                sign_in,
+                StatusCode::BAD_REQUEST,
+                SIGN_IN_FAILED_PAGE,
+            );
+        }
+        // Admit the exchange: spending the state and marking the flow
+        // executing are one step under the lock, so a replayed callback finds
+        // nothing and a newer sign-in can still replace the flow while the
+        // token request runs outside the lock.
+        pending.plan.state.clear();
+        pending.status = SignInStatus::Executing;
+        commands::PendingExchange {
+            sign_in,
+            account: pending.account,
+            server: pending.server,
+            name: pending.name.clone(),
+            url: pending.url.clone(),
+            scope: pending.scope,
+            plan: pending.plan.clone(),
+        }
+    };
+    let code = query.code.as_deref().unwrap_or_default();
+    let token = match server.oauth.finish(&pending.plan, code).await {
+        Ok(token) => token,
+        Err(_) => {
+            // The token endpoint's own error is not a client's to read. A
+            // replacement that already wrote a terminal status keeps it, and
+            // this stale answer clears no cookie.
+            let owned = commands::fail_executing_sign_in(&server.signins, pending.sign_in).await;
+            return sign_in_failed_response(&server, pending.sign_in, owned);
+        }
+    };
+    if !neha::record::McpServerAdded::valid_credential(&token) {
+        let owned = commands::fail_executing_sign_in(&server.signins, pending.sign_in).await;
+        return sign_in_failed_response(&server, pending.sign_in, owned);
+    }
+    let writes = commands::SignInWrites {
+        store: &server.store,
+        state: &server.state,
+        secrets: &server.secrets,
+        library: &server.library,
+    };
+    match commands::commit_executing_sign_in(&server.signins, &pending, &token, writes).await {
+        commands::SignInCommit::Committed { events } => {
+            broadcast(&server, &events);
+            sign_in_response(
+                &server,
+                pending.sign_in,
+                StatusCode::OK,
+                SIGN_IN_FINISHED_PAGE,
+            )
+        }
+        // The record did not change, so the client reads a fixed sentence.
+        commands::SignInCommit::Failed { .. } => sign_in_response(
+            &server,
+            pending.sign_in,
+            StatusCode::BAD_REQUEST,
+            SIGN_IN_FAILED_PAGE,
+        ),
+        // A newer sign-in replaced this flow while its token was in flight:
+        // the token is discarded and no binding is cleared. The newer flow's
+        // cookie is its own name, so this answer cannot disturb it.
+        commands::SignInCommit::Discarded => {
+            sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE)
+        }
+    }
+}
+
+/// Answers a browser callback whose exchange produced no credential.
+///
+/// Only a delivery that still owns its flow clears that flow's binding cookie:
+/// a replaced flow's answer may arrive after a newer flow bound the same
+/// browser, and clearing only this flow's cookie leaves the newer flow's
+/// binding alone.
+fn sign_in_failed_response(server: &SpaceServer, sign_in: Id, owned: bool) -> Response {
+    if owned {
+        sign_in_response(
+            server,
+            sign_in,
+            StatusCode::BAD_REQUEST,
+            SIGN_IN_FAILED_PAGE,
+        )
+    } else {
+        sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE)
+    }
+}
+
 async fn client_file(
     State(server): State<Arc<SpaceServer>>,
     headers: HeaderMap,
@@ -1271,7 +2119,7 @@ async fn join(
             "is_admin": account.is_admin,
         }),
     );
-    server
+    let appended = server
         .store
         .append(AppendRequest::new(
             Id::new(),
@@ -1280,6 +2128,20 @@ async fn join(
         ))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    // The projection holds the people a row can name by their display name.
+    // The join has to reach it now, not only when a later start replays the
+    // record.
+    {
+        let mut state = server
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("the Space state is locked"))?;
+        for event in &appended.events {
+            state
+                .apply(event)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+    }
     server.consume_invite();
 
     let browser = browser_request(&server, &headers);
@@ -1403,6 +2265,27 @@ fn browser_request(server: &SpaceServer, headers: &HeaderMap) -> bool {
                 && same_authority(origin, host, server.browser_scheme())
         })
     })
+}
+
+/// Returns the account a browser request's session cookie names, when it
+/// carries one.
+///
+/// The session cookie is first-party and `SameSite=Strict`; a browser sends it
+/// on a same-site top-level navigation, which is what `window.open` from one
+/// of this Space's pages is. Like [`Authed`], the cookie is read only when the
+/// Host names the Space's own browser hostname, so another site cannot borrow
+/// the session.
+async fn browser_session(server: &SpaceServer, headers: &HeaderMap) -> Option<Account> {
+    let browser_host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(split_authority)
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case(&server.browser_host));
+    if !browser_host {
+        return None;
+    }
+    let token = cookie_token(headers, &server.session_cookie)?;
+    server.identity.authenticate(token).await.ok().flatten()
 }
 
 async fn me(Authed { account }: Authed) -> Json<Account> {
@@ -2409,6 +3292,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             store: &server.store,
                             state: &server.state,
                             home: &server.home,
+                            blobs: &server.blobs,
                             secrets: &server.secrets,
                             identity: &server.identity,
                             links: &server.links,
@@ -2417,9 +3301,15 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             computer_assignments: &server.computer_assignments,
                             provider_writes: &server.provider_writes,
                             workers: server.worker_config.is_some(),
+                            library: &server.library,
                             runs: &server.runs,
                             events: &server.events,
                             catalog: &server.catalog,
+                            plugins: &server.plugins,
+                            signins: &server.signins,
+                            signin_start: &server.signin_start,
+                            oauth: &server.oauth,
+                            browser_origin: server.browser_origin(),
                         };
                         let reset = matches!(command, CommandCall::ComputerReset { .. });
                         let outcome = commands::execute(&context, &account, id, command).await;
@@ -2695,13 +3585,6 @@ async fn catch_up(
     }
 }
 
-/// Returns whether one account may see an event.
-///
-/// This milestone has no Groups: an event belongs to the User who wrote it,
-/// to the User a Bot wrote it for, or to the Space itself. A Space-wide event
-/// is one every account can already read through `provider list` or
-/// `model list`: the Provider's address and its Models are not per-account
-/// secrets, so a settings page open in another account follows them too.
 /// Returns whether a caller's declared capabilities admit one event kind.
 ///
 /// A kind the protocol version already carries needs no capability; a later
@@ -2711,7 +3594,26 @@ fn admits(capabilities: &HashSet<String>, kind: neha::record::EventKind) -> bool
     neha::surface::event_capability(kind).is_none_or(|capability| capabilities.contains(capability))
 }
 
+/// Returns whether one account may see an event.
+///
+/// This milestone has no Groups: an event belongs to the User who wrote it, to
+/// the User a Bot wrote it for, or to the Space itself. A Space-wide event is
+/// one every account can already read through `provider list` or `model list`:
+/// the Provider's address and its Models are not per-account secrets, so a
+/// settings page open in another account follows them too. What the Space
+/// offers every member is also Space-wide: a Space MCP server or skill, and the
+/// changes to them. A personal credential, a personal server, a Bot's skill,
+/// and a package's installation stay with the account they belong to. A
+/// package's removal is every account's: the payload is only the package's
+/// identifier, and a member whose open views still show the package's servers
+/// and skills must refresh when the Admin takes it away.
+///
+/// The record is what decides: an event that names no scope is a historical
+/// one, and a reader treats it the way the command surface treats a personal
+/// resource, so it never widens what an older record lets a member read.
 fn visible_to(account: Id, event: &neha::record::Event) -> bool {
+    use neha::record::EventKind;
+
     if matches!(event.author, neha::record::Author::User(author) if author == account) {
         return true;
     }
@@ -2719,12 +3621,32 @@ fn visible_to(account: Id, event: &neha::record::Event) -> bool {
         return true;
     }
 
-    matches!(
-        event.kind,
-        neha::record::EventKind::UserJoined
-            | neha::record::EventKind::ProviderAdded
-            | neha::record::EventKind::ProviderModelsUpdated
-    )
+    match event.kind {
+        EventKind::UserJoined | EventKind::ProviderAdded | EventKind::ProviderModelsUpdated => true,
+        // A Space server is every member's; a personal one is its owner's.
+        EventKind::McpServerAdded => {
+            event.data.get("scope").and_then(Value::as_str) == Some("space")
+        }
+        // Only a Space server's change is every member's: the update payload
+        // names no person, so the scope the writer recorded decides. A
+        // personal credential's change records the User scope even on a Space
+        // server, so attaching a credential never reveals who did it.
+        EventKind::McpServerUpdated | EventKind::McpServerRemoved => {
+            event.data.get("scope").and_then(Value::as_str) == Some("space")
+        }
+        // A Space skill is every member's; a Bot's is its owner's.
+        EventKind::SkillAdded => event.data.get("library").and_then(Value::as_str) == Some("space"),
+        EventKind::SkillRemoved => {
+            event.data.get("library").and_then(Value::as_str) == Some("space")
+        }
+        // A removal carries only the package id, so every member may learn
+        // that the package left and refresh what it offered. An installation
+        // and an enabled/disabled change carry source, commit, and digest
+        // metadata and stay the Admin's, as do the package events of a record
+        // this rule does not name.
+        EventKind::PluginRemoved => true,
+        _ => false,
+    }
 }
 
 /// An authenticated account.
@@ -2843,7 +3765,7 @@ async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result
             .collect()
     };
     for run in interrupted {
-        match commands::prepare_recovery(state, &run) {
+        match commands::prepare_recovery(state, &run, &commands::McpCatalog::default()) {
             Ok(plan) => {
                 let mut state = state
                     .lock()
@@ -3247,9 +4169,303 @@ pub enum ServerError {
     PublicUrl(String),
 }
 
+/// What the integration tests need from inside this module.
+///
+/// Integration tests live in `tests/` and see only the crate's public
+/// interface. The fixtures and accessors for the internals the tests inspect
+/// live here, behind the `test-support` feature, so a production build keeps
+/// them out.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    use super::{ApiError, PairingAttempts, Running, ServerError, StreamError};
+    use crate::catalog::CatalogStore;
+    use crate::computer_link::ComputerLinks;
+    use crate::home::{Home, HomeError};
+    use crate::identity::Identity;
+    use crate::runs::RunQueue;
+    use crate::secrets::Secrets;
+    use crate::state::State;
+    use crate::store::{Store, StoreReader};
+
+    /// The longest machine name or workspace a pairing request may carry.
+    pub const MAX_PAIRING_FIELD_BYTES: usize = super::MAX_PAIRING_FIELD_BYTES;
+
+    /// Why sending a reader's recorded pages stopped, as the socket reports it.
+    #[derive(Debug)]
+    pub enum CatchUpError {
+        /// The record could not be read.
+        Store,
+        /// The page did not fit one frame.
+        Oversized(neha::seq::Seq),
+        /// The socket closed.
+        Closed,
+    }
+
+    /// The private state of a running Space, for tests that inspect it.
+    pub struct Fields<'a> {
+        /// The Space's home directory.
+        pub home: &'a Home,
+        /// The record.
+        pub store: &'a Store,
+        /// The in-process projection.
+        pub state: &'a std::sync::Mutex<State>,
+        /// The Provider keys.
+        pub secrets: &'a Secrets,
+        /// Accounts, device tokens, and pairings.
+        pub identity: &'a Identity,
+        /// The live Computer channels.
+        pub links: &'a ComputerLinks,
+        /// The Space's pairing attempts.
+        pub pairings: &'a tokio::sync::Mutex<PairingAttempts>,
+        /// Serializes approval answers and rule changes.
+        pub approvals: &'a tokio::sync::Mutex<()>,
+        /// Serializes Computer creation and Bot assignment.
+        pub computer_assignments: &'a tokio::sync::Mutex<()>,
+        /// Serializes Provider writes.
+        pub provider_writes: &'a tokio::sync::Mutex<()>,
+        /// Whether Hosted Computers run in worker containers.
+        pub workers: bool,
+        /// The run queue.
+        pub runs: &'a RunQueue,
+        /// The live event stream.
+        pub events: &'a tokio::sync::broadcast::Sender<neha::record::Event>,
+        /// The models.dev catalog and its cache.
+        pub catalog: &'a Arc<CatalogStore>,
+        /// The File store.
+        pub blobs: &'a crate::blobs::Blobs,
+    }
+
+    impl Running {
+        /// Returns the private state a test inspects without moving the Space.
+        pub fn test_fields(&self) -> Fields<'_> {
+            let server = &self.server;
+
+            Fields {
+                home: &server.home,
+                store: &server.store,
+                state: &server.state,
+                secrets: &server.secrets,
+                identity: &server.identity,
+                links: &server.links,
+                pairings: &server.pairings,
+                approvals: &server.approvals,
+                computer_assignments: &server.computer_assignments,
+                provider_writes: &server.provider_writes,
+                workers: server.worker_config.is_some(),
+                runs: &server.runs,
+                events: &server.events,
+                catalog: &server.catalog,
+                blobs: &server.blobs,
+            }
+        }
+    }
+
+    impl ApiError {
+        /// The error code the API answered with.
+        pub fn test_code(&self) -> neha::error::ErrorCode {
+            self.code
+        }
+
+        /// The message the API answered with.
+        pub fn test_message(&self) -> &str {
+            &self.message
+        }
+    }
+
+    /// Sends every recorded page that fits a frame, as the socket would.
+    pub async fn catch_up(
+        reader: &StoreReader,
+        out: &tokio::sync::mpsc::Sender<neha::surface::ServerFrame>,
+        cursor: neha::seq::Seq,
+        limit: Option<usize>,
+        account: neha::id::Id,
+        capabilities: &std::collections::HashSet<String>,
+    ) -> Result<neha::seq::Seq, CatchUpError> {
+        super::catch_up(reader, out, cursor, limit, account, capabilities)
+            .await
+            .map_err(|error| match error {
+                StreamError::Store => CatchUpError::Store,
+                StreamError::Oversized(cursor) => CatchUpError::Oversized(cursor),
+                StreamError::Closed => CatchUpError::Closed,
+            })
+    }
+
+    /// Migrates the old one-workspace-per-Hosted-Computer layout, as startup
+    /// does, so a test can inspect the result.
+    pub fn migrate_legacy_hosted_workspaces(
+        home: &Home,
+        state: &mut State,
+    ) -> Result<(), ServerError> {
+        super::migrate_legacy_hosted_workspaces(home, state)
+    }
+
+    /// Stores or updates one browser push subscription.
+    pub fn subscribe_push(
+        running: &Running,
+        account: neha::id::Id,
+        endpoint: String,
+        p256dh: String,
+        auth: String,
+    ) -> Result<(), String> {
+        running
+            .server
+            .push
+            .subscribe(account, endpoint, p256dh, auth)
+            .map_err(|error| error.message().to_owned())
+    }
+
+    /// Mutes this Space's push notifications for a while.
+    pub fn mute_push(running: &Running, minutes: u64) -> Result<u64, String> {
+        running
+            .server
+            .push
+            .mute(minutes)
+            .map_err(|error| error.message().to_owned())
+    }
+
+    /// Opens a Home whose ticket file stays inside the test's own directory.
+    pub fn open_home_with_ticket_directory(
+        root: impl Into<PathBuf>,
+        directory: impl Into<PathBuf>,
+    ) -> Result<Home, HomeError> {
+        Home::open_with_ticket_directory(root, directory)
+    }
+
+    /// Installs a pause for one Bot's next run start; returns (reached, release).
+    pub fn pause_start_for_test(bot: neha::id::Id) -> (Arc<Notify>, Arc<Notify>) {
+        crate::runs::pause_start_for_test(bot)
+    }
+
+    /// Returns how many callers wait for one Bot's admit lock.
+    pub fn admit_waiters(bot: neha::id::Id) -> usize {
+        crate::runs::admit_waiters(bot)
+    }
+
+    /// The fixed page a Card's sandbox proxy answers with.
+    pub const CARD_SANDBOX_PAGE: &str = super::CARD_SANDBOX_PAGE;
+
+    /// The fixed policy a Card's sandbox proxy answers with.
+    pub const CARD_SANDBOX_CSP: &str = super::CARD_SANDBOX_CSP;
+
+    /// The fixed explanation an expired sign-in reports.
+    pub const SIGN_IN_EXPIRED: &str = super::SIGN_IN_EXPIRED;
+
+    /// The fixed explanation a sign-in that did not finish reports.
+    pub const SIGN_IN_INCOMPLETE: &str = super::SIGN_IN_INCOMPLETE;
+
+    /// The fixed explanation a replaced sign-in reports.
+    pub const SIGN_IN_REPLACED: &str = super::SIGN_IN_REPLACED;
+
+    /// The largest answer one MCP call may read.
+    pub const MAX_ANSWER_BYTES: usize = crate::mcp::MAX_ANSWER_BYTES;
+
+    /// The most frame sources one Card's sandbox policy keeps.
+    pub const MAX_FRAME_SOURCES: usize = crate::mcp::MAX_FRAME_SOURCES;
+
+    /// Whether this machine's sandbox can start a stdio server.
+    pub fn sandbox_smoke() -> bool {
+        crate::stdio::sandbox_smoke()
+    }
+
+    /// The cookie name one browser sign-in's binding uses.
+    pub fn sign_in_cookie_name(sign_in: neha::id::Id) -> String {
+        super::sign_in_cookie_name(sign_in)
+    }
+
+    /// The cookie one browser sign-in's binding sets.
+    pub fn sign_in_cookie(sign_in: neha::id::Id, nonce: &str, secure: bool) -> String {
+        super::sign_in_cookie(sign_in, nonce, secure)
+    }
+
+    /// The header that clears one browser sign-in's binding.
+    pub fn sign_in_cookie_cleared(sign_in: neha::id::Id, secure: bool) -> String {
+        super::sign_in_cookie_cleared(sign_in, secure)
+    }
+
+    /// Sends recorded events on the Space's live stream, as an append would.
+    pub fn broadcast(running: &Running, events: &[neha::record::Event]) {
+        super::broadcast(&running.server, events);
+    }
+
+    /// The home directory behind one running Space.
+    pub fn server_home(running: &Running) -> PathBuf {
+        running.server_home()
+    }
+
+    /// The origin the browser client uses to reach one running Space.
+    pub fn browser_origin(running: &Running) -> String {
+        running.server.browser_origin()
+    }
+
+    /// The browser sign-ins one running Space holds.
+    pub async fn sign_in_count(running: &Running) -> usize {
+        running.server.signins.lock().await.len()
+    }
+
+    /// Ages one pending browser sign-in past its usable life.
+    pub async fn expire_sign_in(running: &Running, sign_in: neha::id::Id) {
+        let mut signins = running.server.signins.lock().await;
+        let pending = signins.get_mut(&sign_in).expect("the flow is pending");
+        pending.created_at =
+            std::time::Instant::now() - (super::SIGN_IN_TTL + std::time::Duration::from_secs(1));
+    }
+
+    /// The fixed explanation one failed browser sign-in reports, if it failed.
+    pub async fn sign_in_failure(running: &Running, sign_in: neha::id::Id) -> Option<String> {
+        let signins = running.server.signins.lock().await;
+        match &signins.get(&sign_in)?.status {
+            super::SignInStatus::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The command context an integration test executes commands through.
+///
+/// It is not part of the Space's API: only a test build or the integration
+/// tests' `test-support` feature sees it.
+#[cfg(any(test, feature = "test-support"))]
+impl Running {
+    /// Returns the command context a test executes commands through.
+    pub fn command_context(&self) -> crate::commands::CommandContext<'_> {
+        let server = &self.server;
+
+        crate::commands::CommandContext {
+            store: &server.store,
+            state: &server.state,
+            home: &server.home,
+            blobs: &server.blobs,
+            secrets: &server.secrets,
+            identity: &server.identity,
+            links: &server.links,
+            pairings: &server.pairings,
+            approvals: &server.approvals,
+            computer_assignments: &server.computer_assignments,
+            provider_writes: &server.provider_writes,
+            workers: server.worker_config.is_some(),
+            library: &server.library,
+            runs: &server.runs,
+            events: &server.events,
+            catalog: &server.catalog,
+            plugins: &server.plugins,
+            signins: &server.signins,
+            signin_start: &server.signin_start,
+            oauth: &server.oauth,
+            browser_origin: server.browser_origin(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use neha::id::Id;
+    use neha::surface::{ClientFrame, CommandCall};
 
     use crate::computer_link::AccessCapabilities;
 
@@ -3436,180 +4652,89 @@ mod tests {
         );
         assert!(!attempts.reserve(ada));
     }
-}
 
-/// What the integration tests need from inside this module.
-///
-/// Integration tests live in `tests/` and see only the crate's public
-/// interface. The fixtures and accessors for the internals the tests inspect
-/// live here, behind the `test-support` feature, so a production build keeps
-/// them out.
-#[cfg(feature = "test-support")]
-#[doc(hidden)]
-pub mod test_support {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use tokio::sync::Notify;
-
-    use super::{ApiError, PairingAttempts, Running, ServerError, StreamError};
-    use crate::catalog::CatalogStore;
-    use crate::computer_link::ComputerLinks;
-    use crate::home::{Home, HomeError};
-    use crate::identity::Identity;
-    use crate::runs::RunQueue;
-    use crate::secrets::Secrets;
-    use crate::state::State;
-    use crate::store::{Store, StoreReader};
-
-    /// The longest machine name or workspace a pairing request may carry.
-    pub const MAX_PAIRING_FIELD_BYTES: usize = super::MAX_PAIRING_FIELD_BYTES;
-
-    /// Why sending a reader's recorded pages stopped, as the socket reports it.
-    #[derive(Debug)]
-    pub enum CatchUpError {
-        /// The record could not be read.
-        Store,
-        /// The page did not fit one frame.
-        Oversized(neha::seq::Seq),
-        /// The socket closed.
-        Closed,
+    /// Decodes one command frame exactly where the socket decodes it.
+    ///
+    /// The browser builds the command object as JSON text; this test anchors
+    /// the shapes it sends to the production `ClientFrame` decoder instead of
+    /// a mock.
+    fn decode_command_frame(command: &str) -> Result<ClientFrame, serde_json::Error> {
+        serde_json::from_str(&format!(
+            r#"{{"type":"command","id":"{}","command":{command}}}"#,
+            Id::new()
+        ))
     }
 
-    /// The private state of a running Space, for tests that inspect it.
-    pub struct Fields<'a> {
-        /// The Space's home directory.
-        pub home: &'a Home,
-        /// The record.
-        pub store: &'a Store,
-        /// The in-process projection.
-        pub state: &'a std::sync::Mutex<State>,
-        /// The Provider keys.
-        pub secrets: &'a Secrets,
-        /// Accounts, device tokens, and pairings.
-        pub identity: &'a Identity,
-        /// The live Computer channels.
-        pub links: &'a ComputerLinks,
-        /// The Space's pairing attempts.
-        pub pairings: &'a tokio::sync::Mutex<PairingAttempts>,
-        /// Serializes approval answers and rule changes.
-        pub approvals: &'a tokio::sync::Mutex<()>,
-        /// Serializes Computer creation and Bot assignment.
-        pub computer_assignments: &'a tokio::sync::Mutex<()>,
-        /// Serializes Provider writes.
-        pub provider_writes: &'a tokio::sync::Mutex<()>,
-        /// Whether Hosted Computers run in worker containers.
-        pub workers: bool,
-        /// The run queue.
-        pub runs: &'a RunQueue,
-        /// The live event stream.
-        pub events: &'a tokio::sync::broadcast::Sender<neha::record::Event>,
-        /// The models.dev catalog and its cache.
-        pub catalog: &'a Arc<CatalogStore>,
-    }
-
-    impl Running {
-        /// Returns the private state a test inspects without moving the Space.
-        pub fn test_fields(&self) -> Fields<'_> {
-            let server = &self.server;
-
-            Fields {
-                home: &server.home,
-                store: &server.store,
-                state: &server.state,
-                secrets: &server.secrets,
-                identity: &server.identity,
-                links: &server.links,
-                pairings: &server.pairings,
-                approvals: &server.approvals,
-                computer_assignments: &server.computer_assignments,
-                provider_writes: &server.provider_writes,
-                workers: server.worker_config.is_some(),
-                runs: &server.runs,
-                events: &server.events,
-                catalog: &server.catalog,
-            }
-        }
-    }
-
-    impl ApiError {
-        /// The error code the API answered with.
-        pub fn test_code(&self) -> neha::error::ErrorCode {
-            self.code
-        }
-
-        /// The message the API answered with.
-        pub fn test_message(&self) -> &str {
-            &self.message
-        }
-    }
-
-    /// Sends every recorded page that fits a frame, as the socket would.
-    pub async fn catch_up(
-        reader: &StoreReader,
-        out: &tokio::sync::mpsc::Sender<neha::surface::ServerFrame>,
-        cursor: neha::seq::Seq,
-        limit: Option<usize>,
-        account: neha::id::Id,
-        capabilities: &std::collections::HashSet<String>,
-    ) -> Result<neha::seq::Seq, CatchUpError> {
-        super::catch_up(reader, out, cursor, limit, account, capabilities)
-            .await
-            .map_err(|error| match error {
-                StreamError::Store => CatchUpError::Store,
-                StreamError::Oversized(cursor) => CatchUpError::Oversized(cursor),
-                StreamError::Closed => CatchUpError::Closed,
+    #[test]
+    fn browser_command_frames_decode_exactly_where_the_socket_decodes_them() {
+        // A command with no parameters is sent without `args`: an empty object
+        // is not the unit variant's shape.
+        assert!(matches!(
+            decode_command_frame(r#"{"name":"provider_list"}"#),
+            Ok(ClientFrame::Command {
+                command: CommandCall::ProviderList,
+                ..
             })
+        ));
+        assert!(
+            decode_command_frame(r#"{"name":"provider_list","args":{}}"#).is_err(),
+            "a unit command that carries args is not a frame this Space takes"
+        );
+        // A command whose parameters are all optional takes an empty object,
+        // the shape the browser sends for a parameterless struct argument.
+        assert!(matches!(
+            decode_command_frame(r#"{"name":"skill_list","args":{}}"#),
+            Ok(ClientFrame::Command {
+                command: CommandCall::SkillList { bot: None },
+                ..
+            })
+        ));
     }
 
-    /// Migrates the old one-workspace-per-Hosted-Computer layout, as startup
-    /// does, so a test can inspect the result.
-    pub fn migrate_legacy_hosted_workspaces(
-        home: &Home,
-        state: &mut State,
-    ) -> Result<(), ServerError> {
-        super::migrate_legacy_hosted_workspaces(home, state)
-    }
-
-    /// Stores or updates one browser push subscription.
-    pub fn subscribe_push(
-        running: &Running,
-        account: neha::id::Id,
-        endpoint: String,
-        p256dh: String,
-        auth: String,
-    ) -> Result<(), String> {
-        running
-            .server
-            .push
-            .subscribe(account, endpoint, p256dh, auth)
-            .map_err(|error| error.message().to_owned())
-    }
-
-    /// Mutes this Space's push notifications for a while.
-    pub fn mute_push(running: &Running, minutes: u64) -> Result<u64, String> {
-        running
-            .server
-            .push
-            .mute(minutes)
-            .map_err(|error| error.message().to_owned())
-    }
-
-    /// Opens a Home whose ticket file stays inside the test's own directory.
-    pub fn open_home_with_ticket_directory(
-        root: impl Into<PathBuf>,
-        directory: impl Into<PathBuf>,
-    ) -> Result<Home, HomeError> {
-        Home::open_with_ticket_directory(root, directory)
-    }
-
-    /// Installs a pause for one Bot's next run start; returns (reached, release).
-    pub fn pause_start_for_test(bot: neha::id::Id) -> (Arc<Notify>, Arc<Notify>) {
-        crate::runs::pause_start_for_test(bot)
-    }
-
-    /// Returns how many callers wait for one Bot's admit lock.
-    pub fn admit_waiters(bot: neha::id::Id) -> usize {
-        crate::runs::admit_waiters(bot)
+    #[test]
+    fn a_sign_in_cookie_is_scoped_to_the_flow() {
+        let sign_in = Id::new();
+        let name = super::sign_in_cookie_name(sign_in);
+        // The name carries the sign-in, and a UUID's text is a cookie-name
+        // token: letters, digits, and hyphens.
+        assert_eq!(name, format!("neha_signin_{sign_in}"));
+        assert!(
+            sign_in
+                .to_string()
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+            "a UUID's text is a cookie-name token"
+        );
+        let cookie = super::sign_in_cookie(sign_in, "a-nonce", false);
+        assert!(
+            cookie.starts_with(&format!("{name}=a-nonce;")),
+            "the cookie's name is the flow's and carries its nonce: {cookie}"
+        );
+        for attribute in [
+            "HttpOnly",
+            "SameSite=Lax",
+            "Path=/api/mcp/signin",
+            "Max-Age=600",
+        ] {
+            assert!(
+                cookie.contains(attribute),
+                "{attribute} missing from {cookie}"
+            );
+        }
+        assert!(
+            !cookie.contains("Secure"),
+            "a plain-HTTP Space sets no Secure cookie: {cookie}"
+        );
+        assert!(super::sign_in_cookie(sign_in, "a-nonce", true).contains("; Secure"));
+        let cleared = super::sign_in_cookie_cleared(sign_in, true);
+        assert!(
+            cleared.starts_with(&format!("{name}=;")),
+            "the clearing header names the flow's cookie: {cleared}"
+        );
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(cleared.contains("; Secure"), "{cleared}");
+        // Two flows never share a name, so one flow's binding is another's
+        // never to write or clear.
+        assert_ne!(name, super::sign_in_cookie_name(Id::new()));
     }
 }

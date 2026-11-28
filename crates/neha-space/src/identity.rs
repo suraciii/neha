@@ -175,7 +175,8 @@ impl Identity {
         self.insert_account(&display_name, password, true).await
     }
 
-    /// Adds an account beyond the Admin, as an invitation will; for tests.
+    /// Adds an account beyond the Admin, as an invitation will; for the
+    /// integration tests, through `test_support`.
     #[cfg(feature = "test-support")]
     pub(crate) async fn add_account_for_test(
         &self,

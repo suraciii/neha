@@ -11,14 +11,19 @@ pub mod computer_link;
 pub mod config;
 pub mod home;
 pub mod identity;
+pub mod mcp;
 pub mod model;
+pub mod oauth;
+pub mod plugins;
 mod push;
 pub mod remote;
 pub mod runs;
 pub mod schema;
 pub mod secrets;
 pub mod server;
+pub mod skills;
 pub mod state;
+pub mod stdio;
 pub mod store;
 pub mod ticket;
 pub mod workers;
@@ -32,6 +37,7 @@ pub use secrets::{Secrets, SecretsError};
 #[cfg(feature = "test-support")]
 pub use server::start_with_worker_config;
 pub use server::{Running, ServerError, SpaceServer, start, start_with_ui, start_with_ui_public};
+pub use skills::{SkillDocument, SkillError};
 pub use state::{
     BotView, ChatStatus, ChatView, ComputerView, FileView, MessageView, ModelView, ProviderView,
     RunStatus, RunView, State, UserView,

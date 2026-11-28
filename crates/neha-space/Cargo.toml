@@ -19,32 +19,42 @@ axum = { version = "0.8", features = ["http1", "json", "tokio", "ws"] }
 base64 = "0.23"
 eventsource-stream = "0.2"
 flate2 = "1"
+tar = "0.4"
 futures-util.workspace = true
+libc = "0.2"
 neha = { path = "../neha" }
 neha-computer = { path = "../neha-computer" }
 neha-loop = { path = "../neha-loop" }
 opendal.workspace = true
 rand = "0.10"
-reqwest = { workspace = true, features = ["json", "query", "rustls", "stream"] }
+reqwest = { workspace = true, features = ["form", "json", "query", "rustls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
 sha2 = "0.11"
 serde_json.workspace = true
+serde_norway = "0.9.42"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 subtle = "2"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "rt", "sync", "time"] }
 toml.workspace = true
 sad-web-push = { version = "0.12", default-features = false }
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
+
+[target.'cfg(unix)'.dependencies]
+# The stdio sandbox's working-directory walk binds each step to an opened
+# directory descriptor; this is the safe wrapper over the calls it needs.
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+# The unsandboxed stdio launcher puts the child in a Job Object so its
+# descendants die with the client even after the launcher exits.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 hkdf = "0.13"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = "0.30"
-
-[lints]
-workspace = true
 
 # The Space's integration tests, one binary.
 [[test]]
@@ -58,3 +68,11 @@ required-features = ["test-support"]
 name = "replay"
 harness = false
 test = false
+
+# The workspace forbids unsafe code; this crate narrows that to the Win32 Job
+# Object calls the Windows stdio launcher needs (creates a job that kills its
+# processes when its handle closes, and assigns the child to it). Every unsafe
+# block in the crate is in the one `#[cfg(windows)]` module in `stdio.rs`; no
+# code path on Linux, macOS, or any other platform uses unsafe.
+[lints.rust]
+unsafe_code = "allow"

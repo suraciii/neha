@@ -24,6 +24,28 @@ pub struct Config {
     pub storage: Storage,
     /// Where the model catalog comes from and how long it stays fresh.
     pub catalog: CatalogConfig,
+    /// What the Space does with the scripts a skill carries.
+    pub skills: SkillsConfig,
+    /// Where the Space may install a package from.
+    pub plugins: PluginsConfig,
+}
+
+/// The sources a Space installs packages from.
+///
+/// An empty list allows none: the Admin names the repositories and directory
+/// prefixes a package may come from.
+#[derive(Clone, Debug, Default)]
+pub struct PluginsConfig {
+    /// Source prefixes a package may come from.
+    pub sources: Vec<String>,
+}
+
+/// What the Space does with the scripts a skill carries.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SkillsConfig {
+    /// Whether the Space treats skills as instructions only, so the scripts of
+    /// a skill never reach a Computer.
+    pub instructions_only: bool,
 }
 
 /// The models.dev catalog.
@@ -64,6 +86,10 @@ impl Config {
         Ok(Self {
             storage: document.storage.into_storage()?,
             catalog: document.catalog.into_catalog()?,
+            skills: SkillsConfig {
+                instructions_only: document.skills.instructions_only.unwrap_or(false),
+            },
+            plugins: document.plugins.into_plugins()?,
         })
     }
 }
@@ -120,6 +146,47 @@ struct Document {
     storage: StorageSettings,
     #[serde(default)]
     catalog: CatalogSettings,
+    #[serde(default)]
+    skills: SkillsSettings,
+    #[serde(default)]
+    plugins: PluginsSettings,
+}
+
+/// The `[plugins]` section.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsSettings {
+    sources: Option<Vec<String>>,
+}
+
+impl PluginsSettings {
+    fn into_plugins(self) -> Result<PluginsConfig, ConfigError> {
+        let Some(sources) = self.sources else {
+            return Ok(PluginsConfig::default());
+        };
+        if sources.len() > 64 {
+            return Err(ConfigError::Invalid(
+                "plugins.sources names at most 64 sources".to_owned(),
+            ));
+        }
+        for source in &sources {
+            if source.is_empty() || source.len() > 512 || source.chars().any(char::is_control) {
+                return Err(ConfigError::Invalid(
+                    "a plugins.sources entry is 1 to 512 printable bytes".to_owned(),
+                ));
+            }
+        }
+
+        Ok(PluginsConfig { sources })
+    }
+}
+
+/// The `[skills]` section.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillsSettings {
+    /// Whether skills are instructions only, so their scripts never run.
+    instructions_only: Option<bool>,
 }
 
 /// The `[catalog]` section, before its values are checked against each other.

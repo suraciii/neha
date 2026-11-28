@@ -57,7 +57,7 @@ A caller that names no Presentation kinds reads every kind its protocol version 
 
 A caller that does not name a later kind receives no frame for it, and its cursor advances past it. An older handshake still receives `neha.message.added` and the other kinds its version carries, and it skips only the new ones.
 
-A caller declares the Presentation event kinds it reads as a capability, and the command surface defines the capability names and the fixed set of kinds each one admits. A capability admits no kind added after it was published; a later kind needs a new capability name.
+A caller declares the Presentation event kinds it reads as a capability, and the command surface defines the capability names and the fixed set of kinds each one admits. `memory` admits `neha.memory.added`, `neha.memory.removed`, and `neha.memory.answered`; `compaction` admits `neha.chat.compacted`. A capability admits no kind added after it was published; a later kind needs a new capability name.
 
 Turning full access on needs the consent version the Space states. An older caller that sends none is refused, and nothing is recorded.
 

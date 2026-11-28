@@ -14,16 +14,17 @@ import type { ErrorCode } from "./generated/error";
 import type { Account } from "./generated/identity";
 import type {
   ActionStatus,
-  ApprovalReason,
   Author,
+  CardData,
   ComputerSharing,
-  EventKind,
   MemoryKind,
   MemoryScope,
   MemorySourceKind,
   RunStatus,
   Undoability,
+  ApprovalReason as WireApprovalReason,
   Event as WireEvent,
+  EventKind as WireEventKind,
 } from "./generated/record";
 import type {
   ActionView,
@@ -50,9 +51,7 @@ import type { Usage } from "./generated/usage";
 export type {
   Account,
   ActionStatus,
-  ApprovalReason,
   Author,
-  BotView as Bot,
   CatalogRefresh as CatalogRefreshResult,
   CatalogStatus,
   ChatStatus,
@@ -62,24 +61,135 @@ export type {
   ComputerSharing,
   ComputerView as Computer,
   ErrorCode,
-  EventKind,
   FileSummary,
   MemoryKind,
   MemoryScope,
   MemorySourceKind,
   MemoryView as Memory,
-  MessageView as Message,
   ModelView as Model,
   ProviderView as Provider,
-  RuleView as Rule,
   RunStatus,
   ServerFrame,
   StepView as RunStepView,
   ThinkingLevel,
   Undoability as Undoable,
   Usage,
-  WireEvent as RecordEvent,
 };
+
+// What the Space's record now says beyond the generated shapes above. The
+// fields travel on the wire the same way the generated ones do; the generated
+// files are rebuilt from the Rust definitions with `just wire-types`, and until
+// then the client states the additions here, beside the shapes they extend.
+
+// One lasting rule as `rule_list` answers it. The generated view carries the
+// identifiers a rule stores; the read adds the names behind them — the skill's
+// and the MCP server's — so a reader shows the name it can check against the
+// library instead of an identifier.
+export interface Rule extends RuleView {
+  // The name of the skill a `run_skill_script` rule runs, when the Space can
+  // still find it. The record holds the identifier only.
+  skill_name?: string | null;
+  // The name of the MCP server whose tool a rule matches, when the Space can
+  // still find it. The record holds the identifier only.
+  server_name?: string | null;
+}
+
+// One MCP server as the Integrations view lists it: how the Space reaches it,
+// who connected it, and whether a call by the reader would find it.
+export interface McpServer {
+  server: string;
+  name: string;
+  // How the Space reaches the server: over Streamable HTTP, or by launching
+  // the package's executable on its own machine.
+  transport?: "streamable-http" | "stdio";
+  // Where the server answers, when it is an HTTP server.
+  url: string | null;
+  // The executable a stdio server launches, and the arguments it gives it.
+  command?: string | null;
+  args?: string[];
+  // A stdio server's environment. The values are package data, so the view
+  // never shows them.
+  env?: Record<string, string>;
+  // A stdio server's working directory, relative to the root below.
+  cwd?: string | null;
+  // Whether the working directory hangs from the package's data directory
+  // rather than its root. Absent means the package root.
+  data_cwd?: boolean;
+  // Where the server belongs: the whole Space, or one User.
+  scope: "space" | "user";
+  // The User whose server it is, when its scope is one User's.
+  user: string | null;
+  // The account that connected it.
+  by: string;
+  // That account's display name, when the Space names it.
+  by_name?: string;
+  // The package that brought it, when one did.
+  plugin?: string | null;
+  connected: boolean;
+  // What a call by the reader would find: a personal credential wins over the
+  // Space's, so this names both when both are stored.
+  credential?: "none" | "space" | "user" | "space-and-user";
+}
+
+// One package an Admin installed, and what it brought.
+export interface InstalledPackage {
+  plugin: string;
+  name: string;
+  version: string | null;
+  commit: string | null;
+  digest: string;
+  source: string;
+  enabled: boolean;
+  // What one server row of the package says: the transport, and the address
+  // of an HTTP server or the command of a stdio one.
+  servers: {
+    server: string;
+    name: string;
+    transport?: "streamable-http" | "stdio";
+    url?: string | null;
+    command?: string | null;
+  }[];
+  skills: { skill: string; name: string }[];
+}
+
+// One skill a library holds: the Space's or one Bot's.
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  body: string;
+  scripts: { name: string; sha256: string }[];
+  library: "space" | "bot";
+  bot: string | null;
+  plugin?: string | null;
+}
+
+// What became of one MCP browser sign-in, as the client polls it.
+export interface McpSignInState {
+  sign_in: string;
+  state: "pending" | "finished" | "failed";
+  server: string | null;
+  connected: boolean;
+  reason: string | null;
+}
+
+// A Bot, a Message, and the Card a tool's result carries: the generated shapes
+// already hold the fields the library and Card work added.
+export type Bot = BotView;
+export type Message = MessageView;
+export type Card = CardData;
+
+// The record's event kinds, generated from the Rust definitions.
+export type EventKind = WireEventKind;
+
+// One recorded event, with the kinds above. Its `data` is the kind's own
+// record, which the page reads by field rather than by one fixed shape.
+export type RecordEvent = Omit<WireEvent, "kind"> & { kind: EventKind };
+
+// Why a Bot asked before an action: the first use of the User's own Computer,
+// the first run of a skill's script, the first call of an MCP server, or a rule
+// the User set to be asked.
+export type ApprovalReason = WireApprovalReason;
 
 // The Approval card: `neha.approval.requested` carries the ask, and the
 // approval listing adds the answer fields, so the answer fields stay optional
@@ -256,7 +366,7 @@ export interface RunActivity {
   error: string | null;
 }
 
-export type Preview = { text: string; file: boolean } | { error: true } | null;
+export type Preview = { text: string; file: boolean; card?: boolean } | { error: true } | null;
 
 // The `run_show` answer. The Space starts from the projection's RunView and
 // adds a queued run's position; a very large run is bounded, so its actions
