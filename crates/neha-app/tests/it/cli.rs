@@ -4306,7 +4306,7 @@ async fn a_first_local_action_waits_for_approval() {
     // The list and the show name the pending approval for this Bot.
     let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
     let row = format!(
-        "{approval}  {run_id}  {}  shell  first_use_local  shell: printf 'x\\ty' >> proof.txt",
+        "{approval}  {run_id}  {}  shell  first_use_local  shell: printf 'x\\\\ty' >> proof.txt",
         computer.bot
     );
     assert!(listed.lines().any(|line| line == row), "{listed}");
@@ -4318,7 +4318,7 @@ async fn a_first_local_action_waits_for_approval() {
     assert!(shown.contains("  step "), "{shown}");
     assert!(shown.contains("  index 0"), "{shown}");
     assert!(shown.contains("  action "), "{shown}");
-    let arguments = "{\"command\":\"printf 'x\\ty' >> proof.txt\"}";
+    let arguments = "{\"command\":\"printf 'x\\\\ty' >> proof.txt\"}";
     assert!(
         shown.contains(&format!("  arguments {arguments}")),
         "the show names the full action:\n{shown}"
