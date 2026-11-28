@@ -179,7 +179,7 @@ docker compose up -d --force-recreate space supervisor caddy
 
 Workers are not Compose services. Remove old `neha-worker-*` containers after the Space starts; the lifecycle manager creates workers from the new image for Computers that need them. A worker running an old channel version refuses to serve, so a mixed-version stack does not answer as if it worked.
 
-The internal network has a fixed subnet so the proxy's address survives a proxy-only restart. A stack created before that change recreates the network on the next `up`; if Compose reports that `neha-internal` already exists with a different configuration, stop the stack, run `docker network rm neha-internal` once, and start it again. Data lives on the host, not in the network.
+The internal network has a fixed subnet so the proxy's address survives a proxy-only restart. A stack created before that change recreates the network on the next `up`; if Compose reports that `neha-internal` already exists with a different configuration, stop the stack, run `docker network rm neha-internal` once, and start it again. Data lives on the host, not in the network. If `172.28.0.0/24` collides with a network on your Docker host, change the subnet and Caddy's address in `compose.yml` before the first start.
 
 Back up the data directory before an upgrade. The schema migration runs when the Space starts; [Upgrade a Space](upgrading.md) covers the version check and rollback expectations.
 

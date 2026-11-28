@@ -88,6 +88,11 @@ impl TrustedProxies {
                     ));
                 }
             }
+            if entries.len() > MAX_PROXIES {
+                return Err(format!(
+                    "NEHA_TRUSTED_PROXIES names more than {MAX_PROXIES} addresses"
+                ));
+            }
         }
 
         Ok(Some(Self { entries }))
@@ -303,6 +308,15 @@ mod tests {
             )))
             .unwrap_err()
             .contains("cannot resolve")
+        );
+
+        let many = (0..=64)
+            .map(|last| ip([10, 0, 0, last]))
+            .collect::<Vec<_>>();
+        assert!(
+            TrustedProxies::parse_with("many.internal", |_| Ok(many.clone()))
+                .unwrap_err()
+                .contains("more than")
         );
     }
 
