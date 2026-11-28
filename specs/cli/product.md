@@ -24,7 +24,25 @@ A Bot's shell runs the same CLI with a short-lived run token instead of a sign-i
 
 ## Running a Space
 
-`neha serve` starts a Space on the machine and prints its address and an invitation link. The first User opens the link in an app or a browser to become the Admin.
+`neha serve` starts a Space on the machine and prints its address. A Space that has no User prints an invitation link too, and the first User opens the link in an app or a browser to become the Space Owner.
+
+## Users and invitations
+
+`neha user list` prints each User's role and display name. Every signed-in User MAY run it.
+
+`neha whoami` asks the Space which account the saved credential signs in as, so it shows the role the Space holds now, not the one the credential saved when it signed in.
+
+A command that names a `<user>` reads a display name first. If the argument is also another listed User's identifier, the command refuses and asks for `--id`; otherwise a name no User has is read as an identifier.
+
+`neha user role <user> admin|member` changes a User's role, and `neha user transfer <user>` makes that User the Space Owner and the caller an Admin. Only the Space Owner MAY run either, and a role change never names `owner`. Both read `<user>` as a display name, or as an identifier with `--id`.
+
+`neha invitation create` prints an invitation link once; `neha invitation list` prints each pending invitation and its expiry, and `neha invitation revoke <invitation>` revokes one. Only the Space Owner and Admins MAY run these commands.
+
+`neha login --name <name>` signs in with a password.
+
+`neha login --device-code [--server <origin>]` signs in a terminal that cannot prompt for one: it prints a code and waits while a signed-in User approves it with `neha device approve <code>` or in the browser's Settings, Devices.
+
+The terminal saves its credential only after the approved token works for an authenticated command; a failed or cancelled sign-in leaves any saved credential unchanged.
 
 ## Providers
 
@@ -51,7 +69,7 @@ NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
 
 `neha provider list` prints each Provider's vendor, protocol, and address. `neha model list` prints each Model's context, output, image, thinking levels, tools, and default state.
 
-`neha model default <model>` sets the Space's default Model, as [Settings](../client/product.md#settings) does in the browser. Only the Admin sets it, and every Bot without its own Model uses it.
+`neha model default <model>` sets the Space's default Model, as [Settings](../client/product.md#settings) does in the browser. Only an Admin sets it, and every Bot without its own Model uses it.
 
 ## Catalog
 
@@ -59,33 +77,35 @@ NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
 
 `neha catalog status` prints whether the built-in snapshot or the cache is in use, its age, and whether it is stale. `neha catalog refresh` fetches the catalog again; a failed fetch keeps the last known good copy.
 
-Only the Admin refreshes the catalog. The other catalog commands are reads.
+Only an Admin refreshes the catalog. The other catalog commands are reads.
 
 ## Plugins and tools
 
-`neha mcp add <name> <url>` adds an MCP server under a name that follows the [Plugin](../plugin/design.md#tools) naming rule. `--scope user` adds it for the signed-in User alone; the default adds it for the Space, which only the Admin MAY do.
+`neha mcp add <name> <url>` adds an MCP server under a name that follows the [Plugin](../plugin/design.md#tools) naming rule. `--scope user` adds it for the signed-in User alone; the default adds it for the Space, which only an Admin MAY do.
 
-`neha mcp add <name>` without an address attaches the Space's credential to an existing package `stdio` server of that name, which only the Admin MAY do.
+`neha mcp add <name>` without an address attaches the Space's credential to an existing package `stdio` server of that name, which only an Admin MAY do.
 
 The credential comes from `NEHA_MCP_TOKEN` or a sign-in the command opens in the browser, never from the command line. `neha mcp list` prints each server, its scope, who connected it, and whether it is connected.
 
-`neha plugin install <source>[@<commit>]` installs a package from a source the Admin allows. `neha plugin list` prints each package, its commit, and what it brought.
+`neha plugin install <source>[@<commit>]` installs a package from a source an Admin allows. `neha plugin list` prints each package, its commit, and what it brought.
 
 `neha skill add <path> [--bot <bot>]` adds a skill to the Space's library or to a Bot's. `neha bot mcp enable <bot> <server>` and `neha bot skill enable <bot> <skill>` give a Bot a server or a skill; `disable` takes it away.
 
 ## Computers
 
-A Local Computer runs the CLI. `neha computer pair` joins a Local Computer to the Space. On the Space's own machine it uses the ticket the Space wrote; on another machine it uses a pairing code a signed-in User enters.
+A Local Computer runs the CLI. `neha computer pair` joins a Local Computer to the Space.
 
-In this milestone the Space listens only on loopback, so `neha computer pair` accepts only loopback; the code path arrives with public deployment.
+On the Space's own machine it uses the ticket the Space wrote. On another machine it takes `--space <https origin>`, starts a pairing, prints a pairing code, and waits until a signed-in User enters that code in an app or a browser. A local ticket and a saved session are never sent to that origin.
 
-On the Space's own machine it finds the startup ticket under Neha's configuration directory; on another machine the signed-in User's code names the Space. Either way it pairs the Space the ticket or code names.
+On the Space's own machine it finds the startup ticket under Neha's configuration directory; on another machine `--space` names the Space and the code the machine prints admits it. Either way it pairs the Space the ticket or code names.
 
 `--ticket-file` names another file. `neha computer run` starts the machine again after a stop.
 
 `neha computer list` shows the Computers the User owns, Local and Hosted. `neha computer reset <computer>` clears a Hosted Computer's Workspace: every Bot's directory and every file inside it are deleted, and the Workspace root stays.
 
 Only the Computer's owner resets it, and only a Hosted Computer is reset. A Computer with a Bot whose run is queued, running, or waiting refuses a reset until that run ends, and a second reset of an empty Workspace succeeds.
+
+`neha computer revoke <computer>` withdraws a Local Computer's credential and disconnects its daemon. Only the Computer's owner revokes it, and a Hosted Computer is withdrawn by its worker instead. The record stays listed offline, and pairing the machine again creates a new Computer.
 
 `neha computer create` makes a Hosted Computer. `--name` names it, and `--shared` or `--exclusive` chooses who MAY use it; exclusive is the default. `neha computer update <computer> --shared` makes an exclusive Computer shared; `--exclusive` is refused while more than one Bot uses it.
 
@@ -113,7 +133,9 @@ A Hosted Bot has no file access to change: it starts in its own directory inside
 
 The access commands below change a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses a file-access change because its Workspace is its only write range.
 
-`neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer when the owner grants it; a revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
+`neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer, which resolves the absolute path when it opens the write root; the client that grants it does not need to hold that folder.
+
+A revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
 
 A revoke compares the path exactly as the owner spelled it first: a name that ends in a space takes the grant for that name.
 
@@ -128,6 +150,25 @@ Only the Bot's owner can change a Bot's access. A run uses the access recorded w
 The directory is that run's write root, is recorded with the run and shown on an approval card, and grants nothing to a later run. A path that is not absolute is refused.
 
 The directory MUST exist and be a folder. In granted mode a directory inside a hidden root, or one that holds a hidden path, is refused. The shell mounts an external write root read-write only when its tree holds no link or special file and stays inside the Computer's scan limits; the file tools check every write path.
+
+## Runs
+
+`neha run show <run>` prints a Run's status, its steps, and its actions.
+
+`neha run plan <run>` prints the Run's [Plan](../bot/product.md#plan) and changes nothing.
+
+```text
+Plan for run <id>: 3 of 7 done
+  [done] Read last year's receipts
+  [done] Find the conference page
+  [done] Collect the travel dates
+  [doing] Buy the ticket
+  [pending] Email finance
+  [pending] File the receipt
+  [pending] Update the calendar
+```
+
+Each entry prints its state in brackets before its title, and a line break or a control character in a title prints escaped. A Run with no Plan prints `Plan for run <id>: no plan`.
 
 ## Chat
 
@@ -151,7 +192,7 @@ The command prints each kind's total used size and its limit. With no entry, it 
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a built-in Computer tool the loop offers — `shell`, `read_file`, `write_file`, or `list_files` — a skill's script, or an MCP server's tool. A rule that names a memory tool or an unknown tool is refused.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a built-in Computer tool the loop offers — `shell`, `read_file`, `write_file`, or `list_files` — a skill's script, or an MCP server's tool. A rule that names a record tool, such as a memory tool or `plan`, or an unknown tool is refused.
 
 A rule that names a tool the loop does not offer MUST be offered by an MCP server enabled for the Bot and reachable by the acting User (the named server, when the rule names one). A name no such server lists is refused as unknown, so a misspelling is never recorded.
 

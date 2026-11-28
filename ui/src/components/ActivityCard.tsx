@@ -1,6 +1,6 @@
 import { createEffect, createSignal, For, Show } from "solid-js";
 import { t } from "../i18n";
-import type { FileSummary, RunActivity, ToolAction } from "../types";
+import type { FileSummary, PlanState, RunActivity, ToolAction } from "../types";
 import Avatar from "./Avatar";
 import FileCard from "./FileCard";
 import Icon from "./Icon";
@@ -23,6 +23,13 @@ function statusOf(action: ToolAction): string {
   return t("chat.activity.unknown");
 }
 
+// How one plan entry stands, in the reader's language.
+function planStateOf(state: PlanState): string {
+  if (state === "done") return t("chat.activity.plan.done");
+  if (state === "doing") return t("chat.activity.plan.doing");
+  return t("chat.activity.plan.pending");
+}
+
 // The tools the Run used, each named once, in the order it used them.
 function toolsOf(actions: ToolAction[]): string {
   const names: string[] = [];
@@ -33,9 +40,10 @@ function toolsOf(actions: ToolAction[]): string {
 }
 
 // What the followed Run is doing: one quiet summary the User can open. It never
-// shows a tool's arguments; it names the steps, the tools, how each action
-// ended, and the Files the Run produced. It starts folded, so the stream stays
-// calm while the Run works, and a failed Run opens itself to show its reason.
+// shows a tool's arguments; it names the state, the plan and its progress or
+// the steps and tools, how each action ended, and the Files the Run produced. It
+// starts folded, so the stream stays calm while the Run works, and a failed Run
+// opens itself to show its reason.
 export default function ActivityCard(props: ActivityCardProps) {
   const [opened, setOpened] = createSignal(false);
   // A failed Run opens itself: its reason is what the User came to read.
@@ -47,8 +55,19 @@ export default function ActivityCard(props: ActivityCardProps) {
   );
 
   const expanded = () => opened();
+  // The plan the Run holds now. Its entries are the whole list, oldest first,
+  // so the count and the bar follow the record's newest write.
+  const plan = () => props.activity.plan;
+  const done = () => plan().filter((entry) => entry.state === "done").length;
+  const total = () => plan().length;
+  // The share of the bar to fill. A plan with no entry has nothing to show, so
+  // the bar only renders for one with entries.
+  const percent = () => (total() === 0 ? 0 : Math.round((done() / total()) * 100));
+  // A Run with a plan states its progress instead of its step: the plan is the
+  // better answer to how far the work has come.
   const title = () => {
     const label = props.failed ? t("chat.failed") : t("chat.working");
+    if (total() > 0) return label;
     const step = props.activity.step;
     return step > 0 ? `${label} · ${t("chat.activity.step", { count: step })}` : label;
   };
@@ -79,10 +98,48 @@ export default function ActivityCard(props: ActivityCardProps) {
           <Icon name="alert" size="sm" />
         </Show>
         <span class="activity__title">{title()}</span>
-        <span class="activity__tools">{toolsOf(props.activity.actions)}</span>
+        <Show
+          when={total() > 0}
+          fallback={<span class="activity__tools">{toolsOf(props.activity.actions)}</span>}
+        >
+          <span
+            class="activity__progress"
+            role="progressbar"
+            aria-label={t("chat.activity.plan")}
+            aria-valuemin={0}
+            aria-valuemax={total()}
+            aria-valuenow={done()}
+            aria-valuetext={t("chat.activity.progress", { done: done(), total: total() })}
+          >
+            <span class="activity__progress-fill" style={{ width: `${percent()}%` }} />
+          </span>
+          <span class="activity__count">
+            {t("chat.activity.plan.count", { done: done(), total: total() })}
+          </span>
+        </Show>
         <Icon name="chevron-down" size="sm" class="activity__chev" />
       </button>
       <Show when={expanded()}>
+        <Show when={total() > 0}>
+          <ol class="activity__plan" aria-label={t("chat.activity.plan")}>
+            <For each={plan()}>
+              {(entry) => (
+                <li class={`activity__plan-entry activity__plan-entry--${entry.state}`}>
+                  <span class="activity__plan-mark" aria-hidden="true">
+                    <Show when={entry.state === "done"} fallback={<i class="activity__plan-dot" />}>
+                      <Icon name="check" size="sm" />
+                    </Show>
+                  </span>
+                  <span class="activity__plan-title">{entry.title}</span>
+                  <span class="activity__plan-state">{planStateOf(entry.state)}</span>
+                </li>
+              )}
+            </For>
+          </ol>
+          <Show when={props.activity.actions.length > 0}>
+            <p class="activity__label">{t("chat.activity.actions")}</p>
+          </Show>
+        </Show>
         <ol class="activity__steps">
           <For each={props.activity.actions}>
             {(action) => (

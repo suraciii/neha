@@ -388,13 +388,29 @@ async fn work(
                     };
                     #[cfg(feature = "test-support")]
                     pause_before_start(bot).await;
+                    // A revoke may land between selecting this run and
+                    // recording its start. Take the same gate the revoke
+                    // holds and re-check the channel under it: revocation wins
+                    // leaves the run queued instead of starting and failing it
+                    // after the owner already saw success.
+                    let revoking = server.links.lock_revocations().await;
+                    let still_online = server.state.lock().is_ok_and(|state| {
+                        bot_computer_online(&state, &server.links, pending.bot.id)
+                    });
+                    if !still_online {
+                        drop(revoking);
+                        drop(admit);
+                        continue;
+                    }
                     if commands::start_run(&server.store, &server.state, &server.events, &pending)
                         .await
                         .is_err()
                     {
+                        drop(revoking);
                         drop(admit);
                         return;
                     }
+                    drop(revoking);
                     drop(admit);
                     match commands::finish_run(
                         &server.store,
@@ -459,6 +475,28 @@ fn next_resumable(
         .filter(|run| computer_online(state, links, run))
         .min_by_key(|run| run.seq)
         .cloned()
+}
+
+/// Returns whether the Bot's current Computer can take a queued run now.
+///
+/// A queued run may not name a Computer yet: the Bot's assignment decides,
+/// which is also the assignment `next_queued` read when it selected the run.
+fn bot_computer_online(
+    state: &crate::state::State,
+    links: &crate::computer_link::ComputerLinks,
+    bot: Id,
+) -> bool {
+    let Some(computer) = state.bots.get(&bot).map(|bot| bot.computer) else {
+        return false;
+    };
+    if state.is_resetting(computer) {
+        return false;
+    }
+    let remote = state.computers.get(&computer).is_some_and(|view| {
+        view.kind == "local" || (view.kind == "hosted" && links.hosted_workers())
+    });
+
+    !remote || links.online(computer)
 }
 
 /// Returns whether the Computer a run works on can take the run now.

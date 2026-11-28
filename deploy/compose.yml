@@ -25,9 +25,12 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     networks:
-      - edge
-      - internal
-      - workers
+      edge:
+      internal:
+        # The Space resolves `caddy` once, at start. Caddy shares only the
+        # internal network with the Space, and its fixed address sits outside
+        # the dynamic range, so that resolution survives a proxy-only restart.
+        ipv4_address: 172.28.0.200
 
   space:
     image: neha-space:dev
@@ -46,6 +49,7 @@ services:
       NEHA_HOME: /data
       NEHA_BIND: 0.0.0.0
       NEHA_PUBLIC_URL: https://${NEHA_DOMAIN:?set NEHA_DOMAIN in .env}
+      NEHA_TRUSTED_PROXIES: caddy
       NEHA_BOT_SPACE_URL: http://space:7337
       NEHA_BOT_HOST: ${NEHA_DOMAIN:?set NEHA_DOMAIN in .env}
       NEHA_WORKER_SUPERVISOR_URL: http://supervisor:8787
@@ -97,6 +101,10 @@ networks:
   internal:
     name: neha-internal
     internal: true
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          ip_range: 172.28.0.0/25
   workers:
     name: neha-workers
 

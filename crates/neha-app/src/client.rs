@@ -5,12 +5,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::{SinkExt as _, StreamExt as _};
 use neha::file::MAX_FILE_BYTES;
 use neha::id::Id;
 use neha::surface::{ClientFrame, CommandCall, FileSummary, PROTOCOL_VERSION, ServerFrame};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -39,8 +42,26 @@ pub struct SignedIn {
     pub id: Id,
     /// The display name.
     pub display_name: String,
-    /// Whether the account is the Admin.
+    /// Whether the account administers the Space.
     pub is_admin: bool,
+    /// The role the account holds; a credential saved before roles existed
+    /// reads `None`, and its Admin flag decides.
+    #[serde(default)]
+    pub role: Option<neha::role::Role>,
+}
+
+impl SignedIn {
+    /// Returns the role the account holds in the Space.
+    #[must_use]
+    pub fn role(&self) -> neha::role::Role {
+        self.role.unwrap_or({
+            if self.is_admin {
+                neha::role::Role::Owner
+            } else {
+                neha::role::Role::Member
+            }
+        })
+    }
 }
 
 /// What the CLI remembers between runs.
@@ -218,6 +239,27 @@ async fn session(request: reqwest::RequestBuilder) -> Result<(String, SignedIn)>
     Ok((token, account))
 }
 
+/// Returns the account the Space currently signs this credential in as.
+///
+/// A role can change while the CLI keeps its credential, so whoami asks the
+/// Space instead of trusting the account saved at sign-in.
+pub async fn me(credential: &Credential) -> Result<SignedIn> {
+    let url = credential.url.trim_end_matches('/');
+    let response = reqwest::Client::new()
+        .get(format!("{url}/api/me"))
+        .bearer_auth(&credential.token)
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+
+    serde_json::from_value(body).context("the Space's account does not fit")
+}
+
 /// Returns the answer when the Space accepted the request, or names why it refused.
 async fn accepted(response: reqwest::Response) -> Result<reqwest::Response> {
     let status = response.status();
@@ -231,6 +273,33 @@ async fn accepted(response: reqwest::Response) -> Result<reqwest::Response> {
         .or(status.canonical_reason())
         .unwrap_or("no message");
     bail!("the Space refused ({code}): {message}");
+}
+
+/// The device login a Space gives a CLI without a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartedDeviceLogin {
+    /// The device identifier the CLI polls with.
+    pub device: String,
+    /// The code a signed-in User enters.
+    pub code: String,
+    /// How long the code stays valid.
+    pub expires_in: u64,
+    /// How often the CLI should poll.
+    pub interval: u64,
+}
+
+/// What a device-login poll answers.
+#[derive(Clone, Debug)]
+pub enum DeviceLoginPoll {
+    /// No User approved the CLI yet.
+    Pending,
+    /// A User approved the CLI; its own token is now a session.
+    Approved {
+        /// The account that approved the terminal.
+        account: SignedIn,
+    },
+    /// The Space no longer knows the login: it expired or was replaced.
+    Gone,
 }
 
 /// The pairing a Space gives a Local Computer.
@@ -278,6 +347,195 @@ pub async fn request_ticket(space_url: &str, token: &str) -> Result<String> {
     text_field(&body, "ticket")
 }
 
+/// A pairing a Space started for a machine that printed a code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartedPairing {
+    /// The identifier the machine polls with.
+    pub device: String,
+    /// The code a signed-in User enters.
+    pub code: String,
+    /// How long the Space keeps the code alive.
+    pub expires_in: u64,
+    /// How often the machine should poll, in seconds.
+    pub interval: u64,
+}
+
+/// What a machine learns when it polls a remote pairing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairingPoll {
+    /// No User has approved the machine yet.
+    Pending,
+    /// A User approved the machine and the Space recorded its Computer.
+    Approved {
+        /// The Computer the machine now controls.
+        computer: String,
+    },
+    /// The Space no longer knows this pairing: it expired or was replaced.
+    Gone,
+}
+
+/// The HTTP client for a Space reached over the network.
+///
+/// The start and poll bodies carry secrets; a redirect would hand them to
+/// whatever origin the answer names. The system's certificate store is the
+/// only trust anchor, so a self-signed Space is refused.
+fn remote_pairing_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("cannot build the pairing HTTP client")
+}
+
+/// Starts a remote pairing and returns the code to show the User.
+pub async fn start_pairing(
+    space_url: &str,
+    machine: &str,
+    workspace: &str,
+    token: &str,
+    poll_secret: &str,
+) -> Result<StartedPairing> {
+    let response = remote_pairing_client()?
+        .post(format!(
+            "{}/api/computers/pair",
+            space_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "machine": machine,
+            "workspace": workspace,
+            "token": token,
+            "poll_secret": poll_secret,
+        }))
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+    // A Space is not trusted to send a device id, a short code, or timing
+    // values the machine then prints and waits on; each field has the shape
+    // this Space issues, or the answer is refused.
+    let expires_in = body["expires_in"].as_u64().unwrap_or(900).clamp(1, 3600);
+    let interval = body["interval"].as_u64().unwrap_or(2).clamp(1, 60);
+
+    Ok(StartedPairing {
+        device: pairing_device(&text_field(&body, "device")?)?,
+        code: pairing_code(&text_field(&body, "code")?)?,
+        expires_in,
+        interval,
+    })
+}
+
+/// Polls one remote pairing. A 404 means the Space forgot the pairing.
+pub async fn poll_pairing(space_url: &str, device: &str, poll_secret: &str) -> Result<PairingPoll> {
+    let response = remote_pairing_client()?
+        .post(format!(
+            "{}/api/computers/pair/{device}",
+            space_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({"secret": poll_secret}))
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(PairingPoll::Gone);
+    }
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+    match body["state"].as_str() {
+        Some("pending") => Ok(PairingPoll::Pending),
+        Some("approved") => Ok(PairingPoll::Approved {
+            computer: pairing_computer(&text_field(&body, "computer")?)?,
+        }),
+        other => bail!("the Space answered a pairing poll with {other:?}"),
+    }
+}
+
+/// Returns the base64url SHA-256 digest of a secret sent at device-login start.
+fn secret_hash(secret: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()))
+}
+
+/// Returns a fresh 32-byte URL-safe base64 secret.
+pub(crate) fn random_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Starts a CLI device login and returns the code to show the User.
+pub async fn start_device_login(
+    space_url: &str,
+    client: &str,
+    token: &str,
+    poll_secret: &str,
+) -> Result<StartedDeviceLogin> {
+    let response = remote_pairing_client()?
+        .post(format!(
+            "{}/api/devices/login",
+            space_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "client": client,
+            "token_hash": secret_hash(token),
+            "poll_hash": secret_hash(poll_secret),
+        }))
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+    let expires_in = body["expires_in"].as_u64().unwrap_or(900).clamp(1, 3600);
+    let interval = body["interval"].as_u64().unwrap_or(2).clamp(1, 60);
+
+    Ok(StartedDeviceLogin {
+        device: pairing_device(&text_field(&body, "device")?)?,
+        code: pairing_code(&text_field(&body, "code")?)?,
+        expires_in,
+        interval,
+    })
+}
+
+/// Polls one CLI device login. A 404 means the login expired or was replaced.
+pub async fn poll_device_login(
+    space_url: &str,
+    device: &str,
+    poll_secret: &str,
+) -> Result<DeviceLoginPoll> {
+    let response = remote_pairing_client()?
+        .post(format!(
+            "{}/api/devices/login/{device}",
+            space_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({"secret": poll_secret}))
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(DeviceLoginPoll::Gone);
+    }
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+    match body["state"].as_str() {
+        Some("pending") => Ok(DeviceLoginPoll::Pending),
+        Some("approved") => Ok(DeviceLoginPoll::Approved {
+            account: serde_json::from_value(body["account"].clone())
+                .context("the approved account does not fit")?,
+        }),
+        other => bail!("the Space answered a device-login poll with {other:?}"),
+    }
+}
+
 /// Exchanges one local ticket for this machine's Computer and credential.
 pub async fn pair_with_ticket(space_url: &str, ticket: &str) -> Result<PairedComputer> {
     let body: Value = accepted(
@@ -321,6 +579,47 @@ fn text_field(value: &Value, field: &str) -> Result<String> {
         .and_then(Value::as_str)
         .with_context(|| format!("the Space's answer has no {field}"))?
         .to_owned())
+}
+
+/// Returns a device identifier this Space could have issued.
+fn pairing_device(value: &str) -> Result<String> {
+    if value.len() == 22
+        && URL_SAFE_NO_PAD
+            .decode(value)
+            .is_ok_and(|bytes| bytes.len() == 16)
+    {
+        return Ok(value.to_owned());
+    }
+
+    bail!("the Space answered with an unusable pairing device")
+}
+
+/// The characters a pairing code may contain.
+///
+/// This is the Space's alphabet: base32 without `I`, `O`, `0`, and `1`; it
+/// keeps `8` and `9`. Validation must accept every code the Space issues, or
+/// a valid pairing would be discarded before it is shown.
+const PAIRING_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Returns an eight-letter pairing code this Space could have issued.
+fn pairing_code(value: &str) -> Result<String> {
+    if value.len() == 8
+        && value
+            .bytes()
+            .all(|byte| PAIRING_CODE_ALPHABET.contains(&byte))
+    {
+        return Ok(value.to_owned());
+    }
+
+    bail!("the Space answered with an unusable pairing code")
+}
+
+/// Returns the Computer identifier the Space recorded for this machine.
+fn pairing_computer(value: &str) -> Result<String> {
+    value
+        .parse::<Id>()
+        .map(|_| value.to_owned())
+        .context("the Space answered with an unusable Computer identifier")
 }
 
 /// The short-lived session a Bot's shell has instead of a User credential.
@@ -791,6 +1090,11 @@ pub mod test_support {
         super::pair_body(ticket)
     }
 
+    /// Checks one start-response pairing code against the Space's alphabet.
+    pub fn pairing_code(value: &str) -> anyhow::Result<String> {
+        super::pairing_code(value)
+    }
+
     /// Reads the File name out of a `filename*=UTF-8''…` disposition parameter.
     pub fn disposition_name(disposition: &str) -> Option<String> {
         super::disposition_name(disposition)
@@ -825,6 +1129,67 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::BotSession;
+
+    #[tokio::test]
+    async fn a_device_login_start_sends_digests_not_the_secrets() {
+        use std::sync::{Arc, Mutex};
+
+        use axum::extract::Json as AxumJson;
+        use axum::routing::post;
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let handler = {
+            let captured = Arc::clone(&captured);
+            move |AxumJson(body): AxumJson<serde_json::Value>| {
+                *captured.lock().expect("the captured body") = Some(body);
+                async {
+                    AxumJson(serde_json::json!({
+                        "device": URL_SAFE_NO_PAD.encode([1_u8; 16]),
+                        "code": "ABCD2345",
+                        "expires_in": 900,
+                        "interval": 2,
+                    }))
+                }
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/api/devices/login", post(handler)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let started = super::start_device_login(
+            &format!("http://{address}"),
+            "laptop",
+            "cli-token",
+            "poll-secret",
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(started.code, "ABCD2345");
+        let body = captured
+            .lock()
+            .expect("the captured body")
+            .clone()
+            .expect("the start body");
+        assert_eq!(body["token_hash"], super::secret_hash("cli-token"));
+        assert_eq!(body["poll_hash"], super::secret_hash("poll-secret"));
+        assert!(
+            body.get("token").is_none(),
+            "the bearer never leaves the terminal"
+        );
+        assert!(body.get("poll_secret").is_none());
+        assert_ne!(body["token_hash"], "cli-token");
+    }
 
     #[test]
     fn a_bot_request_names_the_public_host_when_the_deployment_gives_one() {

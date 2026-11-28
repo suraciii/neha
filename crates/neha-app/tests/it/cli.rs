@@ -61,15 +61,182 @@ fn serve_without_bwrap(home: &Path) -> (SpaceProcess, String, Option<String>) {
     serve_on_with(home, 0, Some(std::ffi::OsStr::new("/nonexistent")))
 }
 
+/// Starts `neha serve` and asserts it refuses, without opening the home.
+fn refused_serve(environment: &[(&str, &str)]) -> String {
+    let directory = tempfile::tempdir().unwrap();
+    // A refused start must not open the home: this file would be cleared if it
+    // did.
+    let marker = directory.path().join("tmp").join("marker");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, b"keep").unwrap();
+    let mut command = Command::new(BIN);
+    command
+        .args(["serve", "--port", "0"])
+        .env("NEHA_HOME", directory.path())
+        .env("XDG_CONFIG_HOME", directory.path().join("xdg"))
+        .env_remove("NEHA_PUBLIC_URL")
+        .env_remove("NEHA_DOMAIN")
+        .env_remove("NEHA_TRUSTED_PROXIES");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!("neha serve did not refuse the configuration");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let output = child.wait_with_output().unwrap();
+    assert!(!status.success());
+    assert!(marker.is_file(), "the refused start opened the Space home");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn a_listener_beyond_loopback_refuses_to_start_without_a_public_origin() {
+    let stderr = refused_serve(&[("NEHA_BIND", "0.0.0.0")]);
+    assert!(stderr.contains("TLS proxy"), "unexpected refusal: {stderr}");
+}
+
+#[test]
+fn a_plain_public_origin_refuses_before_the_home_opens() {
+    let stderr = refused_serve(&[
+        ("NEHA_BIND", "0.0.0.0"),
+        ("NEHA_PUBLIC_URL", "http://space.example.com"),
+    ]);
+    assert!(stderr.contains("https"), "unexpected refusal: {stderr}");
+}
+
+#[test]
+fn an_unusable_proxy_list_refuses_before_the_home_opens() {
+    let stderr = refused_serve(&[("NEHA_TRUSTED_PROXIES", "not a host")]);
+    assert!(
+        stderr.contains("NEHA_TRUSTED_PROXIES"),
+        "unexpected refusal: {stderr}"
+    );
+}
+
+/// Records the Supervisor create request for one Hosted Computer.
+async fn record_worker_request(
+    axum::extract::State(requests): axum::extract::State<Arc<Mutex<Vec<serde_json::Value>>>>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::http::StatusCode {
+    requests
+        .lock()
+        .expect("the supervisor probe")
+        .push(serde_json::json!({
+            "path": "/v1/workers",
+            "authorization": headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            "body": serde_json::from_str::<serde_json::Value>(&body)
+                .unwrap_or(serde_json::Value::Null),
+        }));
+    axum::http::StatusCode::OK
+}
+
+/// Starts a fake Supervisor that records every worker create request.
+async fn fake_supervisor() -> (
+    String,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1/workers", post(record_worker_request))
+        .with_state(Arc::clone(&requests));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the fake Supervisor listens");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (url, requests, task)
+}
+
+/// A Space started from the CLI must use the Supervisor its deployment names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosted_computer_asks_the_configured_supervisor() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (supervisor_url, requests, supervisor_task) = fake_supervisor().await;
+    let (server, _url, invite) = serve_with_environment(
+        &home,
+        &[
+            ("NEHA_WORKER_SUPERVISOR_URL", supervisor_url.as_str()),
+            ("NEHA_WORKER_SUPERVISOR_TOKEN", "test-supervisor-token"),
+        ],
+    );
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &["computer", "create", "--name", "Build Box"],
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if !requests.lock().expect("the supervisor probe").is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("the Space never asked the Supervisor named by its environment");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let request = requests.lock().expect("the supervisor probe").remove(0);
+    assert_eq!(request["path"], "/v1/workers");
+    assert_eq!(request["authorization"], "Bearer test-supervisor-token");
+    assert!(
+        request["body"]["computer"].is_string(),
+        "the create request names no Computer: {request}"
+    );
+    drop(server);
+    supervisor_task.abort();
+}
+
+/// Starts `neha serve` with one loopback port and extra environment.
+fn serve_with_environment(
+    home: &Path,
+    environment: &[(&str, &str)],
+) -> (SpaceProcess, String, Option<String>) {
+    serve_on_with_environment(home, 0, None, environment)
+}
+
 /// Starts `neha serve` on one loopback port with an optional `PATH` override.
 fn serve_on_with(
     home: &Path,
     port: u16,
     path: Option<&std::ffi::OsStr>,
 ) -> (SpaceProcess, String, Option<String>) {
+    serve_on_with_environment(home, port, path, &[])
+}
+
+fn serve_on_with_environment(
+    home: &Path,
+    port: u16,
+    path: Option<&std::ffi::OsStr>,
+    environment: &[(&str, &str)],
+) -> (SpaceProcess, String, Option<String>) {
     let mut failures = String::new();
     for attempt in 1..=3 {
-        match serve_once(home, port, path) {
+        match serve_once(home, port, path, environment) {
             Ok(space) => return space,
             Err(error) => {
                 eprintln!("neha serve failed on start {attempt}:\n{error}");
@@ -94,6 +261,7 @@ fn serve_once(
     home: &Path,
     port: u16,
     path: Option<&std::ffi::OsStr>,
+    environment: &[(&str, &str)],
 ) -> Result<(SpaceProcess, String, Option<String>), String> {
     let mut command = Command::new(BIN);
     command
@@ -102,8 +270,16 @@ fn serve_once(
         // The Space writes its one-use pairing ticket into the per-user
         // configuration directory; keep that inside the fixture.
         .env("XDG_CONFIG_HOME", home.join("xdg"))
+        // A fixture's worker mode is the test's choice, not the host's.
+        .env_remove("NEHA_WORKER_SUPERVISOR_URL")
+        .env_remove("NEHA_WORKER_SUPERVISOR_TOKEN")
+        .env_remove("NEHA_WORKER_ALWAYS_ON")
+        .env_remove("NEHA_WORKER_IDLE_SECONDS")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
     // Keep the Space from finding the fixture's bubblewrap when a test asks
     // for a machine that cannot provide Hosted.
     if let Some(path) = path {
@@ -1309,6 +1485,82 @@ async fn a_bot_works_on_its_computer_with_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_run_plan_prints_what_the_bot_planned() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential: PathBuf = directory.path().join("session").join("credential.json");
+    let (base, script, provider_task) = scripted_provider().await;
+    script.call(
+        "plan",
+        serde_json::json!({"entries": [
+            {"title": "Read the receipts", "state": "done"},
+            {"title": "Buy the pass", "state": "doing"},
+        ]}),
+    );
+    script.call(
+        "plan",
+        serde_json::json!({"entries": [
+            {"title": "Read the receipts", "state": "done"},
+            {"title": "Buy the pass", "state": "done"},
+            {"title": "Email finance", "state": "pending"},
+        ]}),
+    );
+    script.say("Done.");
+
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+    run(&home, &credential, &["bot", "create", "Scout"]);
+
+    let sent = run(&home, &credential, &["chat", "send", "do the work"]);
+    assert!(sent.contains("Done."), "{sent}");
+    let run_id = field(&sent, "run ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+
+    // `run plan` prints the newest list the record holds, with each line's
+    // state; it writes nothing, so a second read prints the same answer.
+    let plan = run(&home, &credential, &["run", "plan", &run_id]);
+    assert!(
+        plan.starts_with(&format!("Plan for run {run_id}: 2 of 3 done\n")),
+        "{plan}"
+    );
+    assert!(plan.contains("  [done] Read the receipts"), "{plan}");
+    assert!(plan.contains("  [done] Buy the pass"), "{plan}");
+    assert!(plan.contains("  [pending] Email finance"), "{plan}");
+    let again = run(&home, &credential, &["run", "plan", &run_id]);
+    assert_eq!(again, plan, "the command changes nothing");
+
+    // A Run that kept no plan says so.
+    script.say("No plan needed.");
+    let plain = run(&home, &credential, &["chat", "send", "just answer"]);
+    let plain_id = field(&plain, "run ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let plan = run(&home, &credential, &["run", "plan", &plain_id]);
+    assert!(plan.contains(": no plan"), "{plan}");
+
+    drop(server);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_user_runs_a_space_and_chats_with_a_bot() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
@@ -2454,6 +2706,64 @@ async fn a_full_access_writes_outside_the_workspace_until_it_is_turned_off() {
     provider_task.abort();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_revokes_a_local_computer_and_its_daemon_stops() {
+    if !local_computer_ready() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = bare_local_computer(directory, "http://127.0.0.1:1");
+    let id = computer.computer.clone();
+
+    let revoked = run(
+        &computer.home,
+        &computer.credential,
+        &["computer", "revoke", &id],
+    );
+    assert!(
+        revoked.contains(&format!("Revoked Computer {id}")),
+        "{revoked}"
+    );
+
+    let listed = run(&computer.home, &computer.credential, &["computer", "list"]);
+    let listed_line = listed
+        .lines()
+        .find(|line| line.starts_with(&format!("{id}  ")))
+        .unwrap_or_else(|| panic!("the record stays listed: {listed}"));
+    assert!(listed_line.contains("  offline  "), "{listed}");
+    assert!(listed_line.contains("  local  "), "{listed}");
+
+    // The daemon's next reconnect is refused with 401, so it exits rather
+    // than retrying forever.
+    let daemon = &mut computer.daemon;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if daemon
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .expect("the daemon's status")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon must stop after a revoke"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Revoking again is idempotent.
+    let again = run(
+        &computer.home,
+        &computer.credential,
+        &["computer", "revoke", &id],
+    );
+    assert!(again.contains(&format!("Revoked Computer {id}")), "{again}");
+}
+
 #[test]
 fn a_bot_owner_manages_file_access_from_the_cli() {
     if !local_computer_ready() {
@@ -2469,27 +2779,41 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
     let credential = computer.credential.clone();
     let bot = computer.bot.clone();
 
-    // A grant names a folder that exists: a relative path, a `..` climb, and a
-    // folder nobody created are all refused.
+    // A grant names an absolute folder: a relative path and a `..` climb are
+    // refused. The client does not check this machine's filesystem, because
+    // the folder belongs to the Computer that runs the Bot.
     let shared = base.join("shared");
     std::fs::create_dir(&shared).unwrap();
     let shared_path = shared.to_str().unwrap().to_owned();
-    let bad = [
-        "shared".to_owned(),
-        format!("{shared_path}/../shared"),
-        base.join("missing").to_str().unwrap().to_owned(),
-    ];
+    let bad = ["shared".to_owned(), format!("{shared_path}/../shared")];
     for bad in &bad {
         let refused = cli(&home, &credential, &["bot", "grant", &bot, bad]);
         assert!(!refused.status.success(), "accepted {bad}");
         let stderr = String::from_utf8_lossy(&refused.stderr);
         assert!(
-            stderr.contains("absolute")
-                || stderr.contains("`..`")
-                || stderr.contains("does not exist"),
+            stderr.contains("absolute") || stderr.contains("`..`"),
             "{bad}: stderr: {stderr}"
         );
     }
+
+    // A folder that is not on the client's machine is still a valid grant:
+    // the Computer resolves it when it opens the write root.
+    let elsewhere = base.join("on-the-computer");
+    let elsewhere_path = elsewhere.to_str().unwrap().to_owned();
+    let granted_elsewhere = run(&home, &credential, &["bot", "grant", &bot, &elsewhere_path]);
+    assert!(
+        granted_elsewhere.contains(&format!("grant {elsewhere_path}")),
+        "{granted_elsewhere}"
+    );
+    let revoked_elsewhere = run(
+        &home,
+        &credential,
+        &["bot", "revoke", &bot, &elsewhere_path],
+    );
+    assert!(
+        !revoked_elsewhere.contains(&format!("grant {elsewhere_path}")),
+        "{revoked_elsewhere}"
+    );
 
     // The first grant is stored, and the Bot reports it.
     let granted = run(&home, &credential, &["bot", "grant", &bot, &shared_path]);
@@ -2539,21 +2863,18 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
     let access = run(&home, &credential, &["bot", "access", &bot]);
     assert!(access.contains("full access: off"), "{access}");
 
-    // A symlink names the folder it points at: a grant stores the canonical
-    // folder, and revoking the same symlink takes that grant away.
+    // A symlink on this machine is just a path: the grant stores the path as
+    // typed, because the folder it names may be on the Computer, and revoking
+    // the same path takes that grant away.
     let real = base.join("real-folder");
     std::fs::create_dir(&real).unwrap();
     let link = base.join("linked-folder");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let canonical = std::fs::canonicalize(&real).unwrap();
-    let symlinked = run(
-        &home,
-        &credential,
-        &["bot", "grant", &bot, link.to_str().unwrap()],
-    );
+    let link_path = link.to_str().unwrap().to_owned();
+    let symlinked = run(&home, &credential, &["bot", "grant", &bot, &link_path]);
     assert!(
-        symlinked.contains(&format!("grant {}", canonical.display())),
-        "a grant stores the folder a symlink names: {symlinked}"
+        symlinked.contains(&format!("grant {link_path}")),
+        "a grant stores the path as typed: {symlinked}"
     );
     let revoked = run(
         &home,
@@ -6376,4 +6697,298 @@ fn a_trace_level_never_logs_the_saved_bearer_token() {
             "a line without an event: {line}"
         );
     }
+}
+
+#[test]
+fn a_cli_signs_in_with_a_device_code_from_another_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let admin = directory.path().join("admin").join("credential.json");
+    let terminal = directory.path().join("terminal").join("credential.json");
+    let (server, url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &admin, &["join", &invite, "--name", "Ada"]);
+
+    let (mut child, lines, _errors) = spawn_cli(
+        &home,
+        &terminal,
+        &["login", "--server", &url, "--device-code"],
+    );
+    let line = lines
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|_| panic!("the CLI prints a device code: {}", child.id()));
+    assert!(
+        line.starts_with(&format!("To sign in, open {url} and enter code ")),
+        "the CLI names the Space and the code: {line}"
+    );
+    let code = line
+        .split("enter code ")
+        .nth(1)
+        .and_then(|rest| rest.split(" under").next())
+        .expect("the line carries a code")
+        .to_owned();
+
+    // The signed-in Admin approves the terminal from this one.
+    let approved = run(&home, &admin, &["device", "approve", &code]);
+    assert!(
+        approved.contains("Approved a sign-in for Ada"),
+        "{approved}"
+    );
+
+    let mut output = String::new();
+    read_until(&lines, &mut output, "Waiting for approval...");
+    // The saved credential arrives only after an authenticated command works.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the terminal sign-in did not finish: {output}");
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success(), "the terminal sign-in failed: {output}");
+    assert!(
+        std::fs::read_to_string(&terminal).unwrap().contains("Ada"),
+        "the terminal saved its new credential"
+    );
+    // The device login did not replace the Admin's own credential.
+    assert!(run(&home, &admin, &["whoami"]).contains("Account: Ada"));
+
+    drop(server);
+}
+
+#[test]
+fn a_cancelled_device_sign_in_keeps_the_saved_credential() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let admin = directory.path().join("admin").join("credential.json");
+    let terminal = directory.path().join("terminal").join("credential.json");
+    std::fs::create_dir_all(terminal.parent().unwrap()).unwrap();
+    std::fs::write(&terminal, b"old credential bytes").unwrap();
+    let (server, url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &admin, &["join", &invite, "--name", "Ada"]);
+
+    let (mut child, lines, _errors) = spawn_cli(
+        &home,
+        &terminal,
+        &["login", "--server", &url, "--device-code"],
+    );
+    let _line = lines
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the CLI prints a code");
+    // Cancelling before approval leaves the old credential byte-for-byte.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        std::fs::read(&terminal).unwrap(),
+        b"old credential bytes",
+        "a cancelled sign-in must not touch the saved credential"
+    );
+
+    drop(server);
+}
+
+#[test]
+fn the_cli_refuses_an_ambiguous_user_and_takes_an_identifier() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let member_credential = directory.path().join("member").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    let ada_id = field(&run(&home, &credential, &["whoami"]), "Id: ");
+
+    let created = run(&home, &credential, &["invitation", "create"]);
+    let link = created
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no invitation link:\n{created}"))
+        .to_owned();
+    // Eve's display name is Ada's identifier, so naming that identifier is
+    // ambiguous: it is a display name and another User's identifier at once.
+    run(
+        &home,
+        &member_credential,
+        &["join", &link, "--name", &ada_id],
+    );
+    let eve_id = field(&run(&home, &member_credential, &["whoami"]), "Id: ");
+    assert_ne!(ada_id, eve_id);
+
+    // The command refuses to guess.
+    let refused = cli(&home, &credential, &["user", "role", &ada_id, "admin"]);
+    assert!(!refused.status.success(), "an ambiguous name is refused");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("the identifier") && stderr.contains("--id"),
+        "{stderr}"
+    );
+
+    // A plain name still resolves, and --id reads an identifier.
+    let changed = run(&home, &credential, &["user", "role", &eve_id, "admin"]);
+    assert!(changed.contains("admin"), "{changed}");
+    let changed = run(
+        &home,
+        &credential,
+        &["user", "role", &eve_id, "member", "--id"],
+    );
+    assert!(changed.contains("member"), "{changed}");
+    let list = run(&home, &credential, &["user", "list"]);
+    assert!(list.contains("member"), "{list}");
+
+    // Ada's credential still saves the Owner account, but the Space moved the
+    // Space to Eve; whoami asks the Space instead of the saved answer.
+    let moved = run(&home, &credential, &["user", "transfer", &eve_id, "--id"]);
+    assert!(moved.contains("owner"), "{moved}");
+    assert!(
+        run(&home, &member_credential, &["whoami"]).contains("Role: owner"),
+        "the new Owner reads its live role"
+    );
+    assert!(
+        run(&home, &credential, &["whoami"]).contains("Role: admin"),
+        "the former Owner reads its live role"
+    );
+
+    drop(server);
+}
+
+#[test]
+fn a_device_code_sign_in_requires_a_server_when_none_is_saved() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("credential.json");
+    let output = cli(&home, &credential, &["login", "--device-code"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("pass --server"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn the_cli_invites_a_member_and_shows_roles() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let member_credential = directory.path().join("member").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+
+    let who = run(&home, &credential, &["whoami"]);
+    assert!(who.contains("Role: owner"), "{who}");
+    let list = run(&home, &credential, &["user", "list"]);
+    assert!(list.contains("owner") && list.contains("Ada"), "{list}");
+
+    let created = run(&home, &credential, &["invitation", "create"]);
+    let link = created
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no invitation link:\n{created}"))
+        .to_owned();
+    assert!(created.contains("Expires:"), "{created}");
+    assert!(link.contains("/invite#"), "{link}");
+
+    // The invited person joins from the same machine but its own credential.
+    run(&home, &member_credential, &["join", &link, "--name", "Eve"]);
+    let who = run(&home, &member_credential, &["whoami"]);
+    assert!(who.contains("Role: member"), "{who}");
+    let list = run(&home, &credential, &["user", "list"]);
+    assert!(list.contains("member") && list.contains("Eve"), "{list}");
+
+    // A Member cannot invite.
+    let refused = cli(&home, &member_credential, &["invitation", "create"]);
+    assert!(!refused.status.success(), "a Member invites no one");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("Owner or an Admin"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // The Owner makes the Member an Admin, and the invite works from there.
+    let changed = run(&home, &credential, &["user", "role", "Eve", "admin"]);
+    assert!(
+        changed.contains("admin") && changed.contains("Eve"),
+        "{changed}"
+    );
+    let created = run(&home, &member_credential, &["invitation", "create"]);
+    assert!(created.contains("Invitation: "), "{created}");
+
+    drop(server);
+}
+
+#[test]
+fn the_cli_lists_revokes_and_replaces_invitations() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let member_credential = directory.path().join("member").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+
+    let first = run(&home, &credential, &["invitation", "create"]);
+    let first_link = first
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no invitation link:\n{first}"))
+        .to_owned();
+    let pending = run(&home, &credential, &["invitation", "list"]);
+    assert!(pending.contains("expires"), "{pending}");
+    let invitation_id = first_word(&pending);
+    assert!(!invitation_id.is_empty(), "{pending}");
+
+    // A new link replaces the pending one: the older secret stops working.
+    let second = run(&home, &credential, &["invitation", "create"]);
+    let second_link = second
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no replacement link:\n{second}"))
+        .to_owned();
+    let refused = cli(
+        &home,
+        &member_credential,
+        &["join", &first_link, "--name", "Mallory"],
+    );
+    assert!(!refused.status.success(), "a replaced link admits no one");
+    run(
+        &home,
+        &member_credential,
+        &["join", &second_link, "--name", "Eve"],
+    );
+
+    // A link made after the two Users' joins can be revoked; it then admits
+    // no one.
+    let third = run(&home, &credential, &["invitation", "create"]);
+    let third_link = third
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no third link:\n{third}"))
+        .to_owned();
+    let pending = run(&home, &credential, &["invitation", "list"]);
+    let revoke_id = first_word(&pending);
+    run(&home, &credential, &["invitation", "revoke", &revoke_id]);
+    assert!(
+        run(&home, &credential, &["invitation", "list"])
+            .trim()
+            .is_empty(),
+        "the revoked invitation is not pending"
+    );
+    let refused = cli(
+        &home,
+        &member_credential,
+        &["join", &third_link, "--name", "Mallory"],
+    );
+    assert!(!refused.status.success(), "a revoked link admits no one");
+
+    drop(server);
 }

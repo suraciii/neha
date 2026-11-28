@@ -14,6 +14,7 @@ pub mod folder;
 pub mod id;
 pub mod memory;
 pub mod record;
+pub mod role;
 pub mod seq;
 pub mod surface;
 pub mod time;

@@ -12,9 +12,9 @@ Owned by model. [Space](../space/product.md) holds the Providers; [Bot](../bot/p
 
 ## Providers
 
-The Admin connects a Provider to the Space in one of two ways.
+An Admin connects a Provider to the Space in one of two ways.
 
-| Way | What the Admin gives | What Neha does |
+| Way | What an Admin gives | What Neha does |
 | --- | --- | --- |
 | A known vendor | Picks the vendor and pastes an API key | Reads the vendor's Models and address from the catalog |
 | An OpenAI-compatible server | Pastes the server's address | Finds the server's Models on its own |
@@ -25,7 +25,7 @@ A vendor without those stays visible in the catalog but cannot be connected with
 
 Under Advanced, a connection names its protocol: chat completions, which is the default, OpenAI Responses, or Anthropic Messages. It can also override the base address.
 
-The Admin can refresh a Provider's Models from its catalog entry or its endpoint. A refresh keeps a Model's identity when its name stays, and retires Models the Provider no longer offers.
+An Admin can refresh a Provider's Models from its catalog entry or its endpoint. A refresh keeps a Model's identity when its name stays, and retires Models the Provider no longer offers.
 
 A fresh known-vendor connection defaults to a Model that calls tools.
 
@@ -39,13 +39,13 @@ A refresh uses the cached ETag, keeps the last known good catalog when the netwo
 
 ## Models
 
-Each Model has a name, its Provider, and these capabilities: context window, largest output, reads images, calls tools, and thinks. The catalog states them for a known vendor; the Admin states them for a manual Model.
+Each Model has a name, its Provider, and these capabilities: context window, largest output, reads images, calls tools, and thinks. The catalog states them for a known vendor; an Admin states them for a manual Model.
 
 The catalog's image capability comes from its input modalities: a Model reads images only when `image` is among them. File attachment support alone does not make a Model an image reader.
 
 A Model's thinking levels come from the catalog's reasoning options. A Model that cannot think has no level; a Model that can think accepts the levels named for it, or every level when none are named.
 
-The Admin can correct a Model's capabilities from a self-hosted server. Manual values win over the catalog.
+An Admin can correct a Model's capabilities from a self-hosted server. Manual values win over the catalog.
 
 A Model that cannot read images is marked in every picker, and a Bot that works a screen cannot choose it. A Model that cannot call tools refuses a run.
 
@@ -53,7 +53,7 @@ A Model that cannot read images is marked in every picker, and a Bot that works 
 
 The Space has a default Model and thinking level. Every Bot uses them unless its owner chooses a Model and a thinking level for that Bot.
 
-The Admin changes the default Model in [Settings](../client/product.md#settings) or with [`neha model default`](../cli/product.md#providers). Each Provider's default Model is the Space's default Model, and a Provider that does not offer it marks no default.
+An Admin changes the default Model in [Settings](../client/product.md#settings) or with [`neha model default`](../cli/product.md#providers). Each Provider's default Model is the Space's default Model, and a Provider that does not offer it marks no default.
 
 Changing the default Model changes no thinking level; the Space's default level comes from a Provider connection.
 

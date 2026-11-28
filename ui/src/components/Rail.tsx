@@ -71,7 +71,15 @@ export default function Rail(props: RailProps) {
       <div class="rail__spacer" />
       <div class="rail__account" title={props.account.display_name}>
         <Avatar name={props.account.display_name} kind="user" small />
-        <span class="rail__admin">{props.account.is_admin ? t("rail.admin") : t("rail.user")}</span>
+        <span class="rail__admin">
+          {t(
+            props.account.role === "owner"
+              ? "rail.owner"
+              : props.account.role === "admin"
+                ? "rail.admin"
+                : "rail.member",
+          )}
+        </span>
       </div>
     </aside>
   );

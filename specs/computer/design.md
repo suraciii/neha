@@ -25,7 +25,9 @@ A Hosted Computer depends on [Space](../space/product.md) for the Workspace it k
 
 A Local Computer runs Neha as a persistent process. The process holds one outgoing connection to the Space for control and data, and one more per screen; it listens on no network port.
 
-A machine joins a Space by pairing; [Identity](../identity/design.md#codes) covers the local ticket, pairing code, and the token the machine keeps. A Space-provisioned Hosted Computer worker receives its token from the Space and opens the same channel.
+A machine joins a Space by pairing; [Identity](../identity/design.md#codes) covers the local ticket, pairing code, and the token the machine keeps. A Local Computer reports the Space origin it reaches in its greeting, and the Space gives that origin to the Bot's shell commands.
+
+A Space-provisioned Hosted Computer worker receives its token from the Space and opens the same channel.
 
 The channel carries commands, file reads and writes, process streams, and the screen. A File's bytes cross it as their own exchange. A Hosted Computer runs its actions in an environment the Space provides; a worker-backed or provider-backed Hosted Computer uses the same channel.
 
@@ -68,6 +70,12 @@ A move is recorded as an Authority event. A run fixes the Bot's Computer when it
 A move reaches any Computer the Bot's owner owns; a Hosted Computer is not special. An exclusive Computer refuses a second Bot until its owner makes it shared.
 
 Working files do not migrate. The old Computer keeps them, and the new Computer gives the Bot a directory of its own inside its Workspace.
+
+## Credentials and revocation
+
+A Local Computer's token is reserved with its pairing claim and becomes final before the Space publishes the Computer; a crash between the two is reconciled on the next start. Its owner MAY revoke that credential; revocation deletes the token and every pairing row that could restore it, so a restart cannot rebuild it.
+
+The revoke closes the machine's channel and serializes with a channel registration, so a handshake racing it either completes before the revoke or cannot publish a link. The Computer record stays, its Bots wait, and a later pairing creates a new Computer.
 
 ## Isolation
 

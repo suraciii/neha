@@ -7,13 +7,14 @@
 use futures_util::{SinkExt as _, StreamExt as _};
 use neha::surface::{ClientFrame, PROTOCOL_VERSION, ServerFrame};
 use serde_json::json;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use neha_space::blobs::test_s3;
 use neha_space::config::S3Storage;
 use neha_space::home::Home;
 use neha_space::secrets::Secrets;
-use neha_space::store::{AppendRequest, ContinuationWrite, Store};
+use neha_space::store::{AppendRequest, ContinuationWrite, Projection as _, Store};
 use neha_space::test_support::server::{CatchUpError, catch_up};
 use neha_space::{Running, ServerError, SpaceServer, start, start_with_ui, start_with_ui_public};
 
@@ -459,6 +460,7 @@ async fn a_finished_run_reaches_its_subscribed_device() {
                 bot,
                 status: neha_space::state::ChatStatus::Idle,
                 active_run: None,
+                plan: None,
             },
         );
         state.runs.insert(
@@ -484,6 +486,7 @@ async fn a_finished_run_reaches_its_subscribed_device() {
                 access: None,
                 steps: Vec::new(),
                 actions: Vec::new(),
+                plan: Vec::new(),
             },
         );
     }
@@ -634,6 +637,7 @@ async fn a_mute_stops_the_next_device_in_the_same_event() {
                 bot,
                 status: neha_space::state::ChatStatus::Idle,
                 active_run: None,
+                plan: None,
             },
         );
         state.runs.insert(
@@ -659,6 +663,7 @@ async fn a_mute_stops_the_next_device_in_the_same_event() {
                 access: None,
                 steps: Vec::new(),
                 actions: Vec::new(),
+                plan: Vec::new(),
             },
         );
     }
@@ -1504,6 +1509,61 @@ async fn admin(running: &Running, invite: &str) -> (Socket, String) {
     (socket, token)
 }
 
+/// Adds an account with its recorded User, as an invitation join does, and
+/// returns the account's token.
+///
+/// The integration tests need more than one account; the product makes the
+/// second one by joining an invitation, so the fixture writes both the account
+/// and the `neha.user.joined` event the join would write.
+async fn add_joined_account(running: &Running, name: &str) -> String {
+    add_joined_member(running, name).await.1
+}
+
+/// Adds an account with its recorded User and returns its identifier and
+/// token, as an invitation join does.
+async fn add_joined_member(running: &Running, name: &str) -> (Id, String) {
+    let fields = running.test_fields();
+    let id = Id::new();
+    let (_account, token) = fields
+        .identity
+        .create_invited(id, name, "correct horse battery")
+        .await
+        .unwrap();
+    let appended = fields
+        .store
+        .append(AppendRequest::new(
+            Id::new(),
+            format!("join:{id}"),
+            vec![EventDraft::new(
+                EventKind::UserJoined,
+                Author::User(id),
+                json!({"display_name": name, "is_admin": false}),
+            )],
+        ))
+        .await
+        .unwrap();
+    {
+        let mut state = fields.state.lock().unwrap();
+        for event in &appended.events {
+            state.apply(event).unwrap();
+        }
+    }
+
+    (id, token)
+}
+
+/// Seeds the account a prebuilt record names, so the Space can serve it.
+///
+/// Fixtures that start a Space on a record they wrote themselves need the
+/// account row too; the start-up repair refuses a record without it.
+async fn seed_account(home: &Home, id: Id, name: &str) {
+    let identity = neha_space::identity::Identity::open(home).await.unwrap();
+    identity
+        .create_invited(id, name, "correct horse battery")
+        .await
+        .unwrap();
+}
+
 async fn admin_socket(running: &Running, invite: &str) -> Socket {
     admin(running, invite).await.0
 }
@@ -1899,6 +1959,63 @@ async fn a_source_is_rate_limited_across_names() {
     running.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_source_keeps_its_own_login_bucket() {
+    let (_dir, running, invite) = running().await;
+    let _session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let client = reqwest::Client::new();
+    // Each attempt arrives from the loopback proxy with a different forwarded
+    // client, so no source bucket sees more than one failure.
+    for index in 0..20 {
+        let wrong = client
+            .post(format!("{}/api/login", running.url()))
+            .header("x-forwarded-for", format!("198.51.100.{index}"))
+            .json(&json!({"display_name": format!("name-{index}"), "password": "wrong password"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    // A fresh forwarded source is not the shared loopback bucket.
+    let accepted = client
+        .post(format!("{}/api/login", running.url()))
+        .header("x-forwarded-for", "203.0.113.9")
+        .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::OK);
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_source_does_not_reset_an_account_bucket() {
+    let (_dir, running, invite) = running().await;
+    let _session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let client = reqwest::Client::new();
+    for index in 0..5 {
+        let wrong = client
+            .post(format!("{}/api/login", running.url()))
+            .header("x-forwarded-for", format!("198.51.100.{index}"))
+            .json(&json!({"display_name": "Ada", "password": "wrong password"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    let limited = client
+        .post(format!("{}/api/login", running.url()))
+        .header("x-forwarded-for", "203.0.113.9")
+        .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    running.shutdown().await;
+}
+
 async fn raw_socket(running: &Running, token: &str) -> Socket {
     let mut request = format!("ws://{}/api/socket", running.addr)
         .into_client_request()
@@ -2022,6 +2139,7 @@ async fn a_restart_answers_an_interrupted_run() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let bot = Id::new();
     let computer = Id::new();
     let chat = Id::new();
@@ -2120,6 +2238,7 @@ async fn a_restart_notifies_about_the_run_it_fails() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let bot = Id::new();
     let computer = Id::new();
     let chat = Id::new();
@@ -2511,13 +2630,7 @@ async fn an_old_bot_create_replays_for_its_creator() {
     let replay = command(&mut socket, command_id, call.clone()).await;
     assert_eq!(replay, legacy);
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let refused = try_command(&mut grace_socket, command_id, call).await;
     assert!(
@@ -2542,13 +2655,7 @@ async fn a_recorded_bot_create_answers_only_its_creator() {
         "the result names the User it belongs to"
     );
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let refused = try_command(&mut grace_socket, command_id, call).await;
     assert!(
@@ -3162,13 +3269,7 @@ async fn a_provider_models_update_reaches_every_account() {
 
     // A second account opens its Settings: the snapshot holds the
     // Provider but no Model update yet.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
     let (cursor, events) = snapshot_events(&mut grace_socket).await;
     assert!(
@@ -3234,6 +3335,7 @@ async fn an_event_larger_than_one_frame_is_reported() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     store
         .append(AppendRequest::new(
             Id::new(),
@@ -3268,6 +3370,7 @@ async fn an_event_larger_than_one_frame_is_reported() {
         None,
         user,
         &std::collections::HashSet::new(),
+        true,
     )
     .await;
 
@@ -3945,6 +4048,7 @@ async fn a_recovered_unknown_write_reloads_its_own_continuation() {
     .await;
 
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let provider = Id::new();
     let model = Id::new();
     let computer = Id::new();
@@ -5281,13 +5385,7 @@ async fn a_provider_refresh_checks_a_kept_models_capabilities() {
     .await;
 
     // Grace owns the Bot that keeps `high`; a refusal must not name it.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let created = command(
         &mut grace_socket,
@@ -6331,6 +6429,130 @@ async fn memory_events_reach_only_a_caller_that_names_the_capability() {
     assert!(
         capable_kinds.contains(&neha::record::EventKind::MemoryAnswered),
         "the capable reader receives the answer live: {capable_kinds:?}"
+    );
+
+    old.close(None).await.unwrap();
+    capable.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_keeps_one_plan_for_its_run() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![
+        tools(&[(
+            "plan",
+            json!({"entries": [
+                {"title": "Read the receipts", "state": "done"},
+                {"title": "Buy the pass", "state": "doing"},
+            ]}),
+        )]),
+        tools(&[(
+            "plan",
+            json!({"entries": [
+                {"title": "Read the receipts", "state": "done"},
+                {"title": "Buy the pass", "state": "done"},
+                {"title": "Email finance", "state": "pending"},
+            ]}),
+        )]),
+        text("Done."),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+    let sent = send(&mut socket, chat, "do the work").await;
+    assert_eq!(sent["status"], "succeeded", "{sent}");
+    let run = run_of(&sent);
+    let shown = show_run(&mut socket, run).await;
+
+    // A plan write is a record operation: the run records no action for it.
+    assert!(
+        shown["actions"].as_array().unwrap().is_empty(),
+        "a plan call runs no Computer action: {shown}"
+    );
+    // The projection keeps the newest write of the run.
+    let plan = shown["plan"].as_array().unwrap();
+    assert_eq!(plan.len(), 3, "{shown}");
+    assert_eq!(plan[0]["title"], "Read the receipts");
+    assert_eq!(plan[1]["state"], "done");
+    assert_eq!(plan[2]["title"], "Email finance");
+    assert_eq!(plan[2]["state"], "pending");
+
+    // The record holds both writes, oldest first.
+    let mut reader = open_socket_with(&running, &token, &[neha::surface::PLAN_CAPABILITY]).await;
+    let (_cursor, events) = snapshot_events(&mut reader).await;
+    let writes: Vec<&neha::record::Event> = events
+        .iter()
+        .filter(|event| event.kind == neha::record::EventKind::RunPlanned)
+        .collect();
+    assert_eq!(writes.len(), 2, "{events:?}");
+    assert_eq!(writes[0].data["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(writes[1].data["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(writes[1].data["run"], json!(run));
+
+    // The prompt is rebuilt for every request: the second step read the first
+    // plan and its tool answer, and the third read the second plan.
+    let (second, third) = {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 3, "two plan steps and the answer");
+        (requests[1].to_string(), requests[2].to_string())
+    };
+    assert!(
+        second.contains("Your plan for this request, oldest line first:"),
+        "{second}"
+    );
+    assert!(second.contains("- doing: Buy the pass"), "{second}");
+    assert!(second.contains("Plan updated: 1 of 2 done."), "{second}");
+    assert!(third.contains("- pending: Email finance"), "{third}");
+    assert!(third.contains("Plan updated: 2 of 3 done."), "{third}");
+
+    reader.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_events_reach_only_a_caller_that_names_the_capability() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, _recorded) = gated_provider(vec![
+        tools(&[(
+            "plan",
+            json!({"entries": [{"title": "Read the receipts", "state": "doing"}]}),
+        )]),
+        text("Done."),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let sent = send(&mut socket, chat, "do the work").await;
+    assert_eq!(sent["status"], "succeeded", "{sent}");
+
+    // A reader that names no capability reads no plan event.
+    let mut old = open_socket(&running, &token).await;
+    let (_cursor, old_events) = snapshot_events(&mut old).await;
+    assert!(
+        !old_events
+            .iter()
+            .any(|event| event.kind == neha::record::EventKind::RunPlanned),
+        "an old reader skips the plan event: {:?}",
+        old_events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>()
+    );
+
+    // A capable reader reads it.
+    let mut capable = open_socket_with(&running, &token, &[neha::surface::PLAN_CAPABILITY]).await;
+    let (_cursor, events) = snapshot_events(&mut capable).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == neha::record::EventKind::RunPlanned),
+        "a capable reader reads the plan"
     );
 
     old.close(None).await.unwrap();
@@ -7724,13 +7946,8 @@ async fn an_old_record_without_a_queued_event_replays() {
 
     let directory = tempfile::tempdir().unwrap();
     let home = Home::open(directory.path()).unwrap();
-    let identity = neha_space::identity::Identity::open(&home).await.unwrap();
-    let account = identity
-        .test_add_account_for_test("Ada", "correct horse battery")
-        .await
-        .unwrap();
-    drop(identity);
-    let user = account.id;
+    let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let (bot, computer, chat) = (Id::new(), Id::new(), Id::new());
     let (message, run, command) = (Id::new(), Id::new(), Id::new());
     let store = Store::open(&home).await.unwrap();
@@ -7979,6 +8196,7 @@ async fn a_long_record_of_large_events_catches_up_across_frames() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let bot = Id::new();
     let chat = Id::new();
     let run = Id::new();
@@ -8063,6 +8281,7 @@ async fn a_long_record_of_large_events_catches_up_across_frames() {
         None,
         user,
         &std::collections::HashSet::new(),
+        true,
     )
     .await;
     assert!(result.is_ok());
@@ -8559,15 +8778,7 @@ async fn a_file_stays_with_the_account_of_its_chat() {
     assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
 
     // Another account may neither write to the Chat nor read its Files.
-    let identity =
-        neha_space::identity::Identity::open(&Home::open(running.server_home()).unwrap())
-            .await
-            .unwrap();
-    identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let foreign = upload(
         &running,
         &grace,
@@ -9259,7 +9470,7 @@ use neha_computer::channel::{CHANNEL_VERSION, DeviceFrame, HostFrame, WireAction
 use neha_computer::{ActionStatus, ToolOutput};
 
 use neha_space::computer_link::{AccessCapabilities, Answer};
-use neha_space::identity::MAX_PENDING_PAIRINGS;
+use neha_space::identity::{PAIRING_POLL_SECS, PAIRING_TTL_SECS};
 
 use neha_space::test_support::server::MAX_PAIRING_FIELD_BYTES;
 
@@ -9281,6 +9492,11 @@ fn machine_token() -> String {
 
 fn machine_poll() -> String {
     URL_SAFE_NO_PAD.encode([9_u8; 32])
+}
+
+/// Returns the base64url SHA-256 digest a CLI sends at device-login start.
+fn hash_of(secret: &str) -> String {
+    URL_SAFE_NO_PAD.encode(neha_space::test_support::identity::digest(secret))
 }
 
 /// The body a fake machine sends to start pairing.
@@ -9513,6 +9729,17 @@ async fn send_hello_with(
     sandbox: bool,
     access: AccessCapabilities,
 ) {
+    send_hello_with_origin(socket, version, computer, sandbox, access, None).await;
+}
+
+async fn send_hello_with_origin(
+    socket: &mut Socket,
+    version: u32,
+    computer: &str,
+    sandbox: bool,
+    access: AccessCapabilities,
+    origin: Option<String>,
+) {
     let frame = DeviceFrame::Hello {
         version,
         computer: computer.to_owned(),
@@ -9520,6 +9747,7 @@ async fn send_hello_with(
         sandbox,
         supports_grants: Some(access.grants),
         supports_full_access: Some(access.full_access),
+        origin,
     };
     socket
         .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
@@ -9539,13 +9767,25 @@ async fn connect_computer_with(
     computer: Id,
     access: AccessCapabilities,
 ) -> Socket {
+    connect_computer_with_origin(running, token, computer, access, None).await
+}
+
+/// Connects a fake machine that reports the Space origin it reaches.
+async fn connect_computer_with_origin(
+    running: &Running,
+    token: &str,
+    computer: Id,
+    access: AccessCapabilities,
+    origin: Option<String>,
+) -> Socket {
     let mut socket = raw_computer(running, token).await;
-    send_hello_with(
+    send_hello_with_origin(
         &mut socket,
         CHANNEL_VERSION,
         &computer.to_string(),
         true,
         access,
+        origin,
     )
     .await;
 
@@ -9560,7 +9800,7 @@ async fn next_host_frame(socket: &mut Socket) -> HostFrame {
             continue;
         };
         let frame: HostFrame = serde_json::from_str(text.as_str()).unwrap();
-        if frame != HostFrame::Ping {
+        if frame != HostFrame::Ping && frame != HostFrame::Welcome {
             return frame;
         }
     }
@@ -9647,6 +9887,49 @@ async fn a_hosted_computer_is_always_sandboxed() {
     );
 
     socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_computer_reports_the_origin_its_commands_should_use() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let mut device = raw_computer(&running, &machine).await;
+    send_hello_with_origin(
+        &mut device,
+        CHANNEL_VERSION,
+        &computer.to_string(),
+        true,
+        AccessCapabilities::SUPPORTED,
+        Some("https://space.example.com".to_owned()),
+    )
+    .await;
+    wait_online(&mut socket, computer).await;
+
+    assert_eq!(
+        running.test_fields().links.origin(computer),
+        Some("https://space.example.com".to_owned()),
+        "the Space keeps the origin the daemon reported"
+    );
+
+    // A malformed origin would put another host in front of a run token, so
+    // the handshake is refused rather than stored.
+    let mut invalid = raw_computer(&running, &machine).await;
+    send_hello_with_origin(
+        &mut invalid,
+        CHANNEL_VERSION,
+        &computer.to_string(),
+        true,
+        AccessCapabilities::SUPPORTED,
+        Some("https://user:secret@space.example.com/path".to_owned()),
+    )
+    .await;
+    assert!(
+        closed(&mut invalid).await,
+        "a malformed origin closes the channel"
+    );
+
     running.shutdown().await;
 }
 
@@ -10313,7 +10596,7 @@ async fn a_second_machine_cannot_reuse_a_paired_token() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pairing_start_validates_its_fields_and_recycles_the_waiting_quota() {
+async fn pairing_start_validates_its_fields_and_limits_each_source() {
     let (_dir, running, _invite) = running().await;
     let overlong = "m".repeat(MAX_PAIRING_FIELD_BYTES + 1);
     let overlong_workspace = format!("/{}", "w".repeat(MAX_PAIRING_FIELD_BYTES));
@@ -10359,33 +10642,185 @@ async fn pairing_start_validates_its_fields_and_recycles_the_waiting_quota() {
         );
     }
 
-    let mut machines = Vec::new();
-    for _ in 0..MAX_PENDING_PAIRINGS {
-        machines.push(pair_machine(&running).await);
-    }
-    // A full quota recycles a waiting machine instead of refusing the
-    // legitimate one, so an anonymous caller cannot lock a User out.
-    let newest = pair_machine(&running).await;
-    let mut pending = 0;
-    let mut evicted = 0;
-    for (device, _code) in &machines {
-        let status = poll_pairing(&running, device, &machine_poll())
+    // One source may wait with a bounded number of pairings; the next start
+    // from the same source is refused instead of recycling another waiter.
+    let first = pair_machine(&running).await;
+    let second = pair_machine(&running).await;
+    let refused = pair_start(
+        &running,
+        &pair_body(
+            "laptop",
+            MACHINE_WORKSPACE,
+            &machine_token(),
+            &machine_poll(),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let refused: Value = refused.json().await.unwrap();
+    assert_eq!(refused["code"], "rate_limited");
+    for (device, _code) in [first, second] {
+        let pending: Value = poll_pairing(&running, &device, &machine_poll())
             .await
-            .status();
-        match status {
-            reqwest::StatusCode::OK => pending += 1,
-            reqwest::StatusCode::NOT_FOUND => evicted += 1,
-            other => panic!("unexpected poll status: {other}"),
-        }
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pending, json!({"state": "pending"}));
     }
-    assert_eq!(evicted, 1, "only one waiting pairing is recycled");
-    assert_eq!(pending, MAX_PENDING_PAIRINGS - 1);
-    let newest: Value = poll_pairing(&running, &newest.0, &machine_poll())
-        .await
-        .json()
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_start_counts_the_address_a_trusted_proxy_forwards() {
+    let dir = tempfile::tempdir().unwrap();
+    let running = start_with_ui_public(
+        test_home(dir.path()),
+        0,
+        None,
+        Some("https://space.example.com".to_owned()),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let start = |forwarded: &'static str| {
+        let client = client.clone();
+        let url = format!("{}/api/computers/pair", running.url());
+        async move {
+            client
+                .post(url)
+                .header("x-forwarded-for", forwarded)
+                .json(&pair_body(
+                    "laptop",
+                    MACHINE_WORKSPACE,
+                    &machine_token(),
+                    &machine_poll(),
+                ))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // The loopback peer is the trusted proxy; the bound counts the forwarded
+    // address, so one client cannot fill another client's slots.
+    assert_eq!(start("203.0.113.5").await.status(), reqwest::StatusCode::OK);
+    assert_eq!(start("203.0.113.5").await.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        start("203.0.113.5").await.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(start("203.0.113.6").await.status(), reqwest::StatusCode::OK);
+
+    // A Windows machine's Workspace is absolute on that machine, though this
+    // Space runs on Linux.
+    let (device, _code) =
+        pair_machine_as(&running, "windows-laptop", r"C:\Users\ada\neha\workspace").await;
+    assert!(!device.is_empty());
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_start_announces_the_poll_timing() {
+    let (_dir, running, _invite) = running().await;
+    let started: Value = pair_start(
+        &running,
+        &pair_body(
+            "laptop",
+            MACHINE_WORKSPACE,
+            &machine_token(),
+            &machine_poll(),
+        ),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(started["expires_in"], json!(PAIRING_TTL_SECS));
+    assert_eq!(started["interval"], json!(PAIRING_POLL_SECS));
+
+    // A poll whose values cannot be one this Space issued is refused before
+    // any lookup, with the same answer as an unknown pairing.
+    let unknown = poll_pairing(&running, "not-a-device", &machine_poll()).await;
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+    let device = started["device"].as_str().unwrap();
+    let short = poll_pairing(&running, device, "AAAA").await;
+    assert_eq!(short.status(), reqwest::StatusCode::NOT_FOUND);
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proxied_request_cannot_use_the_local_ticket_routes() {
+    let (_dir, running, invite) = running().await;
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap().to_owned();
+    let client = reqwest::Client::new();
+
+    let issued = client
+        .post(format!("{}/api/computer/ticket", running.url()))
+        .bearer_auth(&token)
+        .header("x-forwarded-for", "203.0.113.7")
+        .send()
         .await
         .unwrap();
-    assert_eq!(newest, json!({"state": "pending"}));
+    assert_eq!(issued.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: Value = issued.json().await.unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Space's machine"),
+        "the refusal names the local rule: {body}"
+    );
+
+    // The exchange route checks the same rule before reading the ticket.
+    let exchanged = client
+        .post(format!("{}/api/computer/pair", running.url()))
+        .header("forwarded", "for=203.0.113.7")
+        .json(&json!({"ticket": "any ticket"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exchanged.status(), reqwest::StatusCode::FORBIDDEN);
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_public_host_cannot_use_the_local_ticket_route_without_forwarding() {
+    let dir = tempfile::tempdir().unwrap();
+    let running = start_with_ui_public(
+        test_home(dir.path()),
+        0,
+        None,
+        Some("https://space.example.com".to_owned()),
+    )
+    .await
+    .unwrap();
+    let invite = running.invite.clone().expect("a fresh Space invites");
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap().to_owned();
+
+    // The request comes from loopback and carries no forwarding marker, but
+    // its Host is the public authority: a same-host proxy must not expose the
+    // ticket route this way.
+    let refused = reqwest::Client::new()
+        .post(format!("{}/api/computer/ticket", running.url()))
+        .header("host", "space.example.com")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: Value = refused.json().await.unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Space's machine")),
+        "the refusal states the local rule: {body}"
+    );
 
     running.shutdown().await;
 }
@@ -10520,6 +10955,126 @@ async fn a_channel_that_never_greets_is_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_local_computer_disconnects_it_and_survives_a_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = Home::open(directory.path()).unwrap();
+    let first = start(home.clone(), 0).await.unwrap();
+    let invite = first.invite.clone().expect("a fresh Space invites");
+    let mut socket = admin_socket(&first, &invite).await;
+    let (computer, machine) = paired_computer(&mut socket, &first).await;
+    let mut device = connect_computer(&first, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+    let Message::Text(welcome) = device.next().await.unwrap().unwrap() else {
+        panic!("the channel begins with its Welcome frame");
+    };
+    assert_eq!(
+        serde_json::from_str::<HostFrame>(&welcome).unwrap(),
+        HostFrame::Welcome
+    );
+
+    let revoked = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    assert_eq!(revoked["id"], json!(computer));
+    assert_eq!(revoked["kind"], "local");
+    assert_eq!(revoked["online"], false);
+    // The live daemon's channel is closed, not left to report success after
+    // the owner withdrew its access.
+    assert!(closed(&mut device).await, "a revoked channel must close");
+    let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+    assert!(!online_of(&listed, computer), "the Computer is offline");
+    assert_eq!(
+        first
+            .test_fields()
+            .identity
+            .authenticate_computer(&machine)
+            .await
+            .unwrap(),
+        None,
+        "the old token no longer authenticates"
+    );
+
+    // A repeat is idempotent.
+    let again = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    assert_eq!(again["online"], false);
+
+    // Another User cannot revoke someone else's Computer.
+    let grace = add_joined_account(&first, "Grace").await;
+    let mut grace_socket = open_socket(&first, &grace).await;
+    let refused = try_command(
+        &mut grace_socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::NotFound, _))),
+        "only the owner can revoke: {refused:?}"
+    );
+    grace_socket.close(None).await.unwrap();
+
+    socket.close(None).await.unwrap();
+    first.shutdown().await;
+
+    // Start-up reconciliation must not rebuild the token from a claim.
+    let second = start(home, 0).await.unwrap();
+    assert_eq!(
+        second
+            .test_fields()
+            .identity
+            .authenticate_computer(&machine)
+            .await
+            .unwrap(),
+        None,
+        "a restart must not restore a revoked credential"
+    );
+    assert!(
+        try_raw_computer(&second, &machine).await.is_err(),
+        "the revoked token cannot open a new channel"
+    );
+    let token = sign_in(&second, "Ada").await;
+    let mut socket = open_socket(&second, &token).await;
+    let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+    assert!(!online_of(&listed, computer), "the record stays offline");
+    socket.close(None).await.unwrap();
+    second.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_racing_a_revoke_cannot_register_its_channel() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+
+    // The HTTP upgrade passed authentication, but this daemon has not sent
+    // Hello. The revoke lands first; the late Hello must not publish a link.
+    let mut delayed = raw_computer(&running, &machine).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    send_hello(&mut delayed, CHANNEL_VERSION, &computer.to_string(), true).await;
+    assert!(
+        closed(&mut delayed).await,
+        "a channel registering after the revoke must close"
+    );
+    wait_offline(&mut socket, computer).await;
+
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_reconnect_closes_the_replaced_socket() {
     let (_dir, running, invite) = running().await;
     let mut socket = admin_socket(&running, &invite).await;
@@ -10530,6 +11085,15 @@ async fn a_reconnect_closes_the_replaced_socket() {
     // The same Computer opens a second channel: the Space keeps the new
     // one and closes the old connection instead of serving both.
     let mut second = connect_computer(&running, &machine, computer).await;
+    // The first channel got its greeting acknowledgement before the second
+    // connection replaced it; the acknowledgement is not the close.
+    let Message::Text(welcome) = first.next().await.unwrap().unwrap() else {
+        panic!("the first channel must begin with its Welcome frame");
+    };
+    assert_eq!(
+        serde_json::from_str::<HostFrame>(&welcome).unwrap(),
+        HostFrame::Welcome
+    );
     assert!(closed(&mut first).await, "the replaced socket must close");
     wait_online(&mut socket, computer).await;
 
@@ -10613,7 +11177,16 @@ async fn a_run_on_a_real_computer_round_trips_an_action() {
     let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
     let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
 
-    let mut device = connect_computer(&running, &machine, computer).await;
+    // The machine reaches the Space through a public origin; a Bot's shell
+    // commands must name that origin rather than the Space's listening address.
+    let mut device = connect_computer_with_origin(
+        &running,
+        &machine,
+        computer,
+        AccessCapabilities::SUPPORTED,
+        Some("https://space.example.com".to_owned()),
+    )
+    .await;
     wait_online(&mut socket, computer).await;
     let shown_bot = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
     assert_eq!(shown_bot["computer"]["id"], json!(computer));
@@ -10623,12 +11196,23 @@ async fn a_run_on_a_real_computer_round_trips_an_action() {
     let queued = submit(&mut socket, chat, "run pwd", None).await;
     let run = run_of(&queued);
     allow_first_use(&mut socket, chat).await;
-    let (id, named, action) = match next_host_frame(&mut device).await {
+    let (id, named, action, env) = match next_host_frame(&mut device).await {
         HostFrame::Action {
-            id, bot, action, ..
-        } => (id, bot, action),
+            id,
+            bot,
+            action,
+            env,
+            ..
+        } => (id, bot, action, env),
         other => panic!("expected an action frame, got {other:?}"),
     };
+    assert!(
+        env.contains(&(
+            "NEHA_SPACE_URL".to_owned(),
+            "https://space.example.com".to_owned()
+        )),
+        "the action's commands must use the origin the daemon reported: {env:?}"
+    );
     assert_eq!(named, bot.to_string());
     assert_eq!(
         action,
@@ -10717,6 +11301,357 @@ async fn a_disconnected_computer_leaves_its_action_unknown_and_goes_offline() {
     );
     let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
     assert_eq!(listed[0]["online"], false);
+
+    provider_task.abort();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_that_wins_keeps_a_queued_run_queued() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    // Pause the pump after it selected the run and before RunStarted.
+    let (reached, release) = neha_space::test_support::server::pause_start_for_test(bot);
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the pump reaches the pause");
+
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    release.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let shown = show_run(&mut socket, run).await;
+    assert_eq!(
+        shown["status"], "queued",
+        "a run selected while the revoke wins stays queued: {shown}"
+    );
+    let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+    assert!(!online_of(&listed, computer));
+
+    provider_task.abort();
+    device.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_waits_for_the_writer_and_cancels_its_action() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    let (reached, release) = neha_space::test_support::server::pause_writer_for_test(computer);
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the writer dequeues the Action and pauses");
+    let _bot = bot;
+
+    let mut revoke_socket = open_socket(&running, &token).await;
+    let revoke = tokio::spawn(async move {
+        try_command(
+            &mut revoke_socket,
+            Id::new(),
+            CommandCall::ComputerRevoke { computer },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !revoke.is_finished(),
+        "the revoke answer waits for the writer to stop"
+    );
+    release.notify_one();
+    let revoked = tokio::time::timeout(std::time::Duration::from_secs(2), revoke)
+        .await
+        .expect("the revoke finishes")
+        .unwrap();
+    assert!(revoked.is_ok(), "revoke failed: {revoked:?}");
+
+    // The Action was already dequeued when the revoke began, but it must not
+    // reach the Computer after the owner saw success.
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), device.next()).await;
+        let Ok(Some(Ok(message))) = next else {
+            break;
+        };
+        if let Message::Text(text) = message
+            && let Ok(HostFrame::Action { .. }) = serde_json::from_str::<HostFrame>(&text)
+        {
+            panic!("an Action reached the Computer after the revoke: {text}");
+        }
+    }
+    let _ = wait_run(&mut socket, run).await;
+
+    provider_task.abort();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_an_in_flight_action_leaves_it_unknown() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    let HostFrame::Action { .. } = next_host_frame(&mut device).await else {
+        panic!("expected an action frame");
+    };
+    // The owner revokes while the Space still owes the action an answer: the
+    // channel closes, so the action must not report a success afterwards.
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+
+    let shown = wait_run(&mut socket, run).await;
+    assert_eq!(shown["status"], "failed");
+    assert_eq!(
+        shown["actions"][0]["status"], "unknown",
+        "an action whose channel a revoke closed is unknown"
+    );
+    let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+    assert!(!online_of(&listed, computer));
+
+    provider_task.abort();
+    device.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_drops_an_action_buffered_for_flush() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    // The sink has accepted the Action into its buffer; the flush has not
+    // started. Dropping the sink must discard it without a Close flushing it.
+    let (reached, release) =
+        neha_space::test_support::server::pause_writer_after_feed_for_test(computer);
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the sink buffers the Action and pauses before the flush");
+
+    let mut revoke_socket = open_socket(&running, &token).await;
+    let revoke = tokio::spawn(async move {
+        try_command(
+            &mut revoke_socket,
+            Id::new(),
+            CommandCall::ComputerRevoke { computer },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !revoke.is_finished(),
+        "the revoke answer waits for the writer to stop"
+    );
+    release.notify_one();
+    let revoked = tokio::time::timeout(std::time::Duration::from_secs(2), revoke)
+        .await
+        .expect("the revoke finishes")
+        .unwrap();
+    assert!(revoked.is_ok(), "revoke failed: {revoked:?}");
+
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), device.next()).await;
+        let Ok(Some(Ok(message))) = next else {
+            break;
+        };
+        if let Message::Text(text) = message
+            && let Ok(HostFrame::Action { .. }) = serde_json::from_str::<HostFrame>(&text)
+        {
+            panic!("a buffered Action reached the Computer after the revoke: {text}");
+        }
+    }
+    let _ = wait_run(&mut socket, run).await;
+
+    provider_task.abort();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_aborts_a_wedged_writer_and_waits_for_its_join() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    // The writer never flushes: the revoke's first wait times out and it must
+    // abort the writer and wait for the handler's join before reporting.
+    let (reached, release) =
+        neha_space::test_support::server::pause_writer_after_feed_for_test(computer);
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the sink buffers the Action and pauses");
+
+    let mut revoke_socket = open_socket(&running, &token).await;
+    let revoke = tokio::spawn(async move {
+        try_command(
+            &mut revoke_socket,
+            Id::new(),
+            CommandCall::ComputerRevoke { computer },
+        )
+        .await
+    });
+    let revoked = tokio::time::timeout(std::time::Duration::from_secs(3), revoke)
+        .await
+        .expect("the revoke forces the stalled writer")
+        .unwrap();
+    release.notify_one();
+    assert!(revoked.is_ok(), "revoke failed: {revoked:?}");
+
+    // The buffered Action must not have been flushed during the forced stop.
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), device.next()).await;
+        let Ok(Some(Ok(message))) = next else {
+            break;
+        };
+        if let Message::Text(text) = message
+            && let Ok(HostFrame::Action { .. }) = serde_json::from_str::<HostFrame>(&text)
+        {
+            panic!("a buffered Action reached the Computer after the revoke: {text}");
+        }
+    }
+    let _ = wait_run(&mut socket, run).await;
+
+    provider_task.abort();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_after_a_revoke_timeout_waits_for_the_same_writer() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    // After the sink buffers the Action, the writer blocks its worker thread
+    // longer than both shutdown waits. The first revoke times out and errors;
+    // a retry must await the same writer instead of finding no link.
+    let (reached, release) =
+        neha_space::test_support::server::pause_writer_after_feed_for_test(computer);
+    neha_space::test_support::server::stall_writer_after_feed_for_test(
+        computer,
+        std::time::Duration::from_millis(700),
+    );
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the sink buffers the Action and pauses");
+
+    let mut revoke_socket = open_socket(&running, &token).await;
+    let first = tokio::spawn(async move {
+        try_command(
+            &mut revoke_socket,
+            Id::new(),
+            CommandCall::ComputerRevoke { computer },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    release.notify_one();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(3), first)
+        .await
+        .expect("the first revoke times out")
+        .unwrap();
+    assert!(
+        matches!(first, Err((ErrorCode::Internal, _))),
+        "the first revoke reports that shutdown was not confirmed: {first:?}"
+    );
+
+    // The link is gone from the live table, but its completion is still
+    // discoverable by Computer id; the retry waits for the writer to stop.
+    let retry = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    assert!(retry.is_ok(), "the retry awaits the writer: {retry:?}");
+
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), device.next()).await;
+        let Ok(Some(Ok(message))) = next else {
+            break;
+        };
+        if let Message::Text(text) = message
+            && let Ok(HostFrame::Action { .. }) = serde_json::from_str::<HostFrame>(&text)
+        {
+            panic!("a buffered Action reached the Computer after the revoke: {text}");
+        }
+    }
+    let _ = wait_run(&mut socket, run).await;
 
     provider_task.abort();
     socket.close(None).await.unwrap();
@@ -11494,13 +12429,7 @@ async fn a_recorded_move_answers_only_the_bots_owner() {
 
     // Another account that knows the identifier and parameters reads
     // nothing, and the move happens once.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let refused = try_command(&mut grace_socket, command_id, call.clone()).await;
     assert!(
@@ -11610,15 +12539,7 @@ async fn a_move_checks_the_bot_and_both_computers() {
 
     // Another User's Bot and Computer are not found, exactly like missing
     // ones: the caller learns nothing about them.
-    let identity =
-        neha_space::identity::Identity::open(&Home::open(running.server_home()).unwrap())
-            .await
-            .unwrap();
-    identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace = open_socket(&running, &grace_token).await;
     let (grace_computer, _grace_machine) =
         paired_computer_with_token(&mut grace, &running, &machine_token_n(5)).await;
@@ -12529,6 +13450,7 @@ async fn a_legacy_hosted_workspace_moves_to_the_current_layout() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let computer = Id::new();
     let bot = Id::new();
     let chat = Id::new();
@@ -12705,6 +13627,54 @@ async fn a_legacy_migration_does_not_follow_an_in_home_alias() {
         std::fs::read_to_string(second_target.join("sentinel-b")).unwrap(),
         "second owner"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosted_computer_ignores_a_channel_origin() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool(
+            "shell",
+            json!({"command": "printf '%s' \"$NEHA_SPACE_URL\""}),
+        ),
+        text("done"),
+    ])
+    .await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let computer: Id = serde_json::from_value(created["computer"]["id"].clone()).unwrap();
+    assert_eq!(created["computer"]["kind"], "hosted");
+
+    // A Hosted credential can outlive a change from worker-backed hosting to
+    // process-local hosting. Its channel must not choose where an in-Space
+    // shell sends its run token.
+    let (frames, _held) = mpsc::channel(4);
+    let link = running.test_fields().links.connect_with_origin(
+        computer,
+        frames,
+        AccessCapabilities::SUPPORTED,
+        Some("https://evil.example.com".to_owned()),
+    );
+    let queued = submit(&mut socket, chat, "read the origin", None).await;
+    let run = run_of(&queued);
+    let result = finish(&mut socket, chat, queued).await;
+    assert_eq!(result["status"], "succeeded", "{result}");
+    let shown = show_run(&mut socket, run).await;
+    let output = shown["actions"][0]["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains(&running.url()),
+        "a process-local Hosted shell must use the listener origin: {shown}"
+    );
+    assert!(
+        !output.contains("evil.example.com"),
+        "a reported channel origin must not reach a Hosted shell: {shown}"
+    );
+
+    drop(link);
+    provider_task.abort();
+    running.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -14263,10 +15233,12 @@ async fn only_the_acting_user_answers_once() {
 
     // Only the User the Bot acts for answers.
     let context = running.command_context();
+    let (stranger_id, _stranger_token) = add_joined_member(&running, "Eve").await;
     let stranger = neha_space::identity::Account {
-        id: Id::new(),
+        id: stranger_id,
         display_name: "Eve".to_owned(),
         is_admin: false,
+        role: neha::role::Role::Member,
     };
     let error = neha_space::commands::execute(
         &context,
@@ -14371,11 +15343,6 @@ async fn only_the_acting_user_answers_once() {
     // A rule that does not exist answers exactly the same way, so the
     // answer cannot tell whether the Space holds it.
     let unknown_rule = command_context(&running);
-    let stranger = neha_space::identity::Account {
-        id: Id::new(),
-        display_name: "Eve".to_owned(),
-        is_admin: false,
-    };
     let missing = neha_space::commands::execute(
         &unknown_rule,
         &stranger,
@@ -15743,13 +16710,7 @@ async fn a_subscription_shows_only_the_accounts_own_events() {
     );
 
     // A second account signs in through the test-only account path.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let b_token = sign_in(&running, "Grace").await;
+    let b_token = add_joined_account(&running, "Grace").await;
     let mut b_socket = open_socket(&running, &b_token).await;
     let b_created = command(&mut b_socket, Id::new(), add_bot("Reader", None)).await;
     let _b_bot: Id = serde_json::from_value(b_created["bot"]["id"].clone()).unwrap();
@@ -16657,13 +17618,7 @@ async fn a_recorded_computer_add_answers_only_its_pairer() {
     let added = command(&mut socket, command_id, call.clone()).await;
     assert!(added["owner"].is_string(), "the answer names its owner");
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let refused = try_command(&mut grace_socket, command_id, call.clone()).await;
     assert!(
@@ -16707,13 +17662,7 @@ async fn a_recorded_command_answers_only_its_owner() {
     let admin: Id = serde_json::from_value(made["user"].clone()).unwrap();
     let rule: Id = serde_json::from_value(made["rule"].clone()).unwrap();
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
     let call = CommandCall::RuleRemove { rule };
     let fingerprint = command_fingerprint(&call);
@@ -18669,13 +19618,7 @@ async fn only_a_bots_owner_renames_it() {
     let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
     let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
 
     // Another account cannot rename a Bot it does not own, and nothing is
@@ -19294,14 +20237,11 @@ async fn the_admin_makes_one_model_the_space_default() {
     );
 
     // Only the Admin sets the Space's default Model.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
+    // The fixture's join wrote an event; refused commands write nothing after
+    // it.
+    let before = running.test_fields().store.last_seq().await.unwrap();
     let refused = try_command(
         &mut grace_socket,
         Id::new(),
@@ -21761,6 +22701,35 @@ async fn a_rule_add_asks_for_a_scripts_pair() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_lasting_rule_never_names_a_record_tool() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (bot, _chat, _computer) = tool_bot(&mut socket, "http://127.0.0.1:9/v1".to_owned()).await;
+
+    // The plan and memory tools are record operations the rules never see, so
+    // a rule that names one is refused instead of kept and ignored.
+    for tool in ["plan", "remember", "forget", "list_memories"] {
+        let (code, message) = try_command(
+            &mut socket,
+            Id::new(),
+            add_rule(bot, neha::record::RuleEffect::Ask, tool, None, None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidArgument, "{tool}: {message}");
+        assert!(message.contains("record tool"), "{tool}: {message}");
+    }
+    let rules = approvals_of(&mut socket, bot).await;
+    assert!(
+        rules.is_empty(),
+        "a refused rule is not recorded: {rules:?}"
+    );
+
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn removing_a_skill_takes_it_away_from_every_bot() {
     let (_dir, running, invite) = running().await;
     let (mut socket, _token) = admin(&running, &invite).await;
@@ -22383,13 +23352,7 @@ async fn a_second_account_cannot_add_a_skill_to_another_library() {
     let (mut admin_socket, _token) = admin(&running, &invite).await;
     let created = command(&mut admin_socket, Id::new(), add_bot("Scout", None)).await;
     let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace = open_socket(&running, &grace_token).await;
 
     let before = staged_blob_count(&running);
@@ -25132,12 +26095,7 @@ async fn a_bind_url_belongs_to_the_account_that_started_the_sign_in() {
     // The initiating browser's session; another account's browser on the
     // same Space has its own.
     let ada_cookie = browser_session(&running, "Ada").await;
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
+    add_joined_account(&running, "Grace").await;
     let grace_cookie = browser_session(&running, "Grace").await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -25716,17 +26674,11 @@ async fn a_member_sees_space_library_changes_and_not_personal_ones() {
     let admin = running
         .test_fields()
         .identity
-        .admin_account()
+        .owner_account()
         .await
         .unwrap()
         .expect("the Space has an Admin");
-    let member = running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let member_token = sign_in(&running, "Grace").await;
+    let (member, member_token) = add_joined_member(&running, "Grace").await;
     let mut member_socket = open_socket(&running, &member_token).await;
     // Both sockets read the stream live from here on.
     snapshot_events(&mut admin_socket).await;
@@ -25894,10 +26846,9 @@ async fn a_member_sees_space_library_changes_and_not_personal_ones() {
         "a member receives no installation or enablement event"
     );
     assert!(
-        events
-            .iter()
-            .any(|event| event.kind == EventKind::BotCreated
-                && event.author == Author::User(member.id)),
+        events.iter().any(
+            |event| event.kind == EventKind::BotCreated && event.author == Author::User(member)
+        ),
         "the member's own events still arrive"
     );
 
@@ -25934,20 +26885,8 @@ async fn a_member_sees_space_library_changes_and_not_personal_ones() {
 async fn a_personal_credential_attachment_stays_the_members_own() {
     let (_dir, running, invite) = running().await;
     let mut admin_socket = admin_socket(&running, &invite).await;
-    let grace = running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Lin", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
-    let lin_token = sign_in(&running, "Lin").await;
+    let (grace, grace_token) = add_joined_member(&running, "Grace").await;
+    let (_lin, lin_token) = add_joined_member(&running, "Lin").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
     let mut lin_socket = open_socket(&running, &lin_token).await;
 
@@ -25976,7 +26915,7 @@ async fn a_personal_credential_attachment_stays_the_members_own() {
             event.kind == EventKind::McpServerUpdated
                 && event.data["server"] == json!(server)
                 && event.data["scope"] == json!("user")
-                && event.data["by"] == json!(grace.id)
+                && event.data["by"] == json!(grace)
         }),
         "the attaching member sees their own credential's change"
     );
@@ -26038,17 +26977,11 @@ async fn a_member_refreshes_when_a_package_is_removed() {
     let admin = running
         .test_fields()
         .identity
-        .admin_account()
+        .owner_account()
         .await
         .unwrap()
         .expect("the Space has an Admin");
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let member_token = sign_in(&running, "Grace").await;
+    let member_token = add_joined_account(&running, "Grace").await;
     let mut member_socket = open_socket(&running, &member_token).await;
     snapshot_events(&mut admin_socket).await;
     snapshot_events(&mut member_socket).await;
@@ -26677,17 +27610,11 @@ async fn historical_events_without_a_scope_stay_their_authors() {
     let admin = running
         .test_fields()
         .identity
-        .admin_account()
+        .owner_account()
         .await
         .unwrap()
         .expect("the Space has an Admin");
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let member_token = sign_in(&running, "Grace").await;
+    let member_token = add_joined_account(&running, "Grace").await;
     let mut member_socket = open_socket(&running, &member_token).await;
 
     // A record written before the events carried a scope or a library: it
@@ -27754,5 +28681,213 @@ async fn a_plain_stream_error_that_is_not_too_long_ends_the_run_without_a_retry(
 
     socket.close(None).await.unwrap();
     provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_approval_recovers_only_for_its_owner_and_code() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let account = running
+        .test_fields()
+        .identity
+        .authenticate(&token)
+        .await
+        .unwrap()
+        .unwrap();
+    let started = running
+        .test_fields()
+        .identity
+        .begin_device_login(
+            "",
+            "laptop",
+            &neha_space::test_support::identity::digest(&machine_token()),
+            &neha_space::test_support::identity::digest(&machine_poll()),
+        )
+        .await
+        .unwrap();
+    let call = CommandCall::DeviceApprove {
+        code: started.code.clone(),
+    };
+    let command_id = Id::new();
+    // The production crash window: the command row is claimed, the identity
+    // transaction commits, and settlement never runs.
+    running
+        .test_fields()
+        .store
+        .claim_command(
+            command_id,
+            neha_space::test_support::commands::command_fingerprint(&call),
+        )
+        .await
+        .unwrap();
+    running
+        .test_fields()
+        .identity
+        .approve_device_login(&started.code, account.id, command_id)
+        .await
+        .unwrap();
+
+    let recovered = command(&mut socket, command_id, call.clone()).await;
+    assert_eq!(recovered["account"]["display_name"], "Ada");
+    let replay = command(&mut socket, command_id, call.clone()).await;
+    assert_eq!(replay, recovered, "the recovered result is recorded");
+
+    // A different account cannot replay that command's success.
+    running
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Grace", "correct horse battery")
+        .await
+        .unwrap();
+    let grace = sign_in(&running, "Grace").await;
+    let mut grace_socket = open_socket(&running, &grace).await;
+    let refused = try_command(&mut grace_socket, command_id, call.clone()).await;
+    assert!(
+        matches!(refused, Err((ErrorCode::Forbidden, _))),
+        "another account cannot replay the approval: {refused:?}"
+    );
+    grace_socket.close(None).await.unwrap();
+
+    // A different code under one command id is refused before it can reach
+    // the approval row.
+    let second = running
+        .test_fields()
+        .identity
+        .begin_device_login(
+            "",
+            "laptop",
+            &neha_space::test_support::identity::digest("second-token"),
+            &neha_space::test_support::identity::digest("second-poll"),
+        )
+        .await
+        .unwrap();
+    let second_id = Id::new();
+    let second_call = CommandCall::DeviceApprove {
+        code: second.code.clone(),
+    };
+    running
+        .test_fields()
+        .store
+        .claim_command(
+            second_id,
+            neha_space::test_support::commands::command_fingerprint(&second_call),
+        )
+        .await
+        .unwrap();
+    running
+        .test_fields()
+        .identity
+        .approve_device_login(&second.code, account.id, second_id)
+        .await
+        .unwrap();
+    let refused = try_command(
+        &mut socket,
+        second_id,
+        CommandCall::DeviceApprove {
+            code: "ZZZZ-ZZZZ".to_owned(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::IdempotencyConflict, _))),
+        "a different code is a different command: {refused:?}"
+    );
+
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cli_device_login_is_approved_once_and_answers_its_polls() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let client = reqwest::Client::new();
+
+    let started: serde_json::Value = client
+        .post(format!("{}/api/devices/login", running.url()))
+        .json(&json!({
+            "client": "laptop",
+            "token_hash": hash_of(&machine_token()),
+            "poll_hash": hash_of(&machine_poll()),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let device = started["device"].as_str().unwrap().to_owned();
+    let code = started["code"].as_str().unwrap().to_owned();
+    assert_eq!(started["expires_in"], 900);
+    assert_eq!(started["interval"], 2);
+
+    let pending: serde_json::Value = client
+        .post(format!("{}/api/devices/login/{device}", running.url()))
+        .json(&json!({"secret": machine_poll()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending["state"], "pending");
+
+    // A wrong code is refused with the same invalid-code answer, and does not
+    // consume this command's future approval.
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::DeviceApprove {
+            code: "ZZZZ-ZZZZ".to_owned(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+        "a wrong code is invalid: {refused:?}"
+    );
+
+    let command_id = Id::new();
+    let approved = command(
+        &mut socket,
+        command_id,
+        CommandCall::DeviceApprove { code: code.clone() },
+    )
+    .await;
+    assert_eq!(approved["account"]["display_name"], "Ada");
+    let replay = command(&mut socket, command_id, CommandCall::DeviceApprove { code }).await;
+    assert_eq!(replay, approved, "the command id replays its answer");
+
+    let answered: serde_json::Value = client
+        .post(format!("{}/api/devices/login/{device}", running.url()))
+        .json(&json!({"secret": machine_poll()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(answered["state"], "approved");
+    assert_eq!(answered["account"]["display_name"], "Ada");
+
+    // The CLI's own token is now an ordinary session token.
+    let mut cli = open_socket(&running, &machine_token()).await;
+    cli.close(None).await.unwrap();
+
+    // The code cannot approve a second device.
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::DeviceApprove {
+            code: "ZZZZ-ZZZZ".to_owned(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+        "a used or unknown code is invalid: {refused:?}"
+    );
+
+    socket.close(None).await.unwrap();
     running.shutdown().await;
 }

@@ -23,9 +23,9 @@ The browser client reads and writes through the command surface, as the CLI does
 
 ## Management
 
-Management is what a signed-in User changes on the Space: its Providers and Models, a Bot and its memory, the access and Workspace of that Bot's Computer, and the rules. An authenticated browser session and the CLI reach the same management commands.
+Management is what a signed-in User changes on the Space: its Providers and Models, a Bot and its memory, the access and Workspace of that Bot's Computer, the rules, and its Users' roles and invitations. An authenticated browser session and the CLI reach the same management commands.
 
-The browser's Bot page, Settings, and Computers list issue the same commands the CLI issues for a Bot, its memory, a Model, and a Computer. Turning full access on means the same consent in both.
+The browser's Bot page, Settings, and Computers list issue the same commands the CLI issues for a Bot, its memory, a Model, and a Computer, and Settings' People section issues the invitation, role, and transfer commands. Turning full access on means the same consent in both.
 
 ## A Bot's shell
 
@@ -36,6 +36,8 @@ With the token, `neha file get <id>` and `neha chat send --file <path>` move a F
 ## The computer daemon
 
 A Local Computer is reached through the CLI: the binary that runs `neha computer pair` is the daemon that `neha computer run` starts.
+
+A `--space` that names a non-loopback origin pairs through the Space's code flow: the command starts the pairing, prints the Space origin and code, and polls until a signed-in User approves it. It never sends a local ticket or a saved session token to that origin.
 
 The daemon holds no record and runs the actions the Space sends with the machine's rights. [Computer](../computer/design.md#the-channel) covers the connection it makes and what crosses it.
 
@@ -57,7 +59,7 @@ A caller that names no Presentation kinds reads every kind its protocol version 
 
 A caller that does not name a later kind receives no frame for it, and its cursor advances past it. An older handshake still receives `neha.message.added` and the other kinds its version carries, and it skips only the new ones.
 
-A caller declares the Presentation event kinds it reads as a capability, and the command surface defines the capability names and the fixed set of kinds each one admits. `memory` admits `neha.memory.added`, `neha.memory.removed`, and `neha.memory.answered`; `compaction` admits `neha.chat.compacted`. A capability admits no kind added after it was published; a later kind needs a new capability name.
+A caller declares the Presentation event kinds it reads as a capability, and the command surface defines the capability names and the fixed set of kinds each one admits. `memory` admits `neha.memory.added`, `neha.memory.removed`, and `neha.memory.answered`; `compaction` admits `neha.chat.compacted`; `plan` admits `neha.run.planned`. A capability admits no kind added after it was published; a later kind needs a new capability name.
 
 Turning full access on needs the consent version the Space states. An older caller that sends none is refused, and nothing is recorded.
 

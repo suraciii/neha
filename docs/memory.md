@@ -1,6 +1,6 @@
 # Memory
 
-A Bot keeps what it learns as memory. This guide shows the two kinds of memory entry, the scope each one applies in, how to read and clear them, and how memory differs from approval rules. It also shows what happens when a Chat grows long. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist.
+A Bot keeps what it learns as memory. This guide shows the two kinds of memory entry, the scope each one applies in, how to read and clear them, and how memory differs from approval rules. It also shows what happens when a Chat grows long. It follows [Quick start](quickstart.md), so the Space, an Admin, the Provider, the Bot, and the Chat already exist.
 
 ## What memory is
 

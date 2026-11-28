@@ -1,6 +1,6 @@
 # Let a Bot work on its Computer
 
-This guide shows a Bot using the built-in tools to work in its own directory inside its Computer's Workspace, and on a Hosted Computer in the rest of that Workspace: a shell, file reads, file writes, and file listing. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist. It describes a Bot on a Hosted Computer; [Computers](computer.md) covers a machine of its own.
+This guide shows a Bot using the built-in tools to work in its own directory inside its Computer's Workspace, and on a Hosted Computer in the rest of that Workspace: a shell, file reads, file writes, and file listing. It follows [Quick start](quickstart.md), so the Space, an Admin, the Provider, the Bot, and the Chat already exist. It describes a Bot on a Hosted Computer; [Computers](computer.md) covers a machine of its own.
 
 ## What the Bot has
 

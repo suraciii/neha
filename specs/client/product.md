@@ -18,11 +18,11 @@ The **browser client** is the Space-served client a User reaches over HTTP and o
 
 A fresh Space prints one invitation link. The link carries the secret in its fragment, so the page request never sends it to the Space. The client sends the secret only in the join request.
 
-The invitation page asks for a display name and a password, then joins the first User as the Admin. A used invitation is not usable again.
+The invitation page asks for a display name and a password. It joins the first User as the Space Owner and an invited User as a Member, and a used invitation is not usable again.
 
 When the Space already has an account, the client asks for the display name and password of an existing account. A successful sign-in sets the session cookie and opens the client.
 
-A client without a valid session shows the sign-in page. A client with a valid session opens the Chats view.
+A client without a valid session shows the sign-in page. A client with a valid session opens the Chats view. An invitation page is the one exception: it opens whether or not the client is signed in, because it joins a new User rather than the signed-in one.
 
 ## The desktop entry
 
@@ -32,8 +32,8 @@ adds only the choice of where the Space lives.
 On first launch the shell shows **Choose a Space**:
 
 - **This computer** starts a Local Space and opens that Space's
-  invitation or sign-in page. The shell never creates the Admin or signs in for
-  the User.
+  invitation or sign-in page. The shell never creates the Space Owner or signs
+  in for the User.
 - **Existing Space** connects to an `https://` address, or a loopback `http://`
   address for development, and opens that Space's sign-in page.
 
@@ -92,16 +92,18 @@ A new Space has no Provider and no Bot. The main area then shows two steps.
 
 The shell remains during first run. On a viewport 900 CSS pixels or narrower, the steps fill the main area.
 
-1. The Admin connects an OpenAI-compatible Provider with a base URL, an API key, and one Model name. The API key is never displayed again.
+1. An Admin connects an OpenAI-compatible Provider with a base URL, an API key, and one Model name. The API key is never displayed again.
 2. The User creates a Bot with a name. A new Bot has one owned Chat and starts on its owner's Space Computer.
 
-A User who is not the Admin sees that an Admin MUST connect the Provider. The client creates no Bot before a Provider exists.
+A User who is not an Admin sees that an Admin MUST connect the Provider. The client creates no Bot before a Provider exists.
 
 After the Bot is created, the client opens its Chat.
 
 ## The Chat list
 
 Each row in the Chat list shows the Chat's state: Working, Waiting, or Unread. [Chat](../messaging/chat/product.md#state) defines the states and their precedence.
+
+A Chat that works on a Run with a [Plan](../bot/product.md#plan) shows the done count in its Working badge, such as `3/7`.
 
 Unread is the client's own memory of a Message that landed while the User was not looking at the Chat. The record holds no such state, and the badge clears when the User opens the Chat.
 
@@ -129,9 +131,13 @@ A failed Run leaves a Bot Message that states the failure. The Chat keeps the Me
 
 ## Tool activity
 
-While a Run works, the Chat shows one collapsible activity card for that Run. The card starts collapsed, and its title row names the state, the step, and the tools in use.
+While a Run works, the Chat shows one collapsible activity card for that Run. The card starts collapsed.
 
-An action appears when it starts and updates with its result when it completes. A failed Run expands the card and shows its reason, and the card never shows an action's raw arguments.
+A Run with a [Plan](../bot/product.md#plan) shows its state in the title row, with a progress bar and the count of done lines, such as `3 / 7`. A Run with no Plan shows the state, the step, and the tools in use in its title row, and no progress bar.
+
+Expanding the card shows the Plan's entries with their states, then the tools the Run used.
+
+An action appears when it starts and updates with its result when it completes. A failed Run expands the card and shows its reason. The card never shows raw arguments.
 
 ## Needs attention
 
@@ -151,7 +157,7 @@ The page shows the Bot's name, its picture, its Computer, its Model, and its acc
 
 The owner changes the Bot's name on the page. The page shows the Computer's kind and whether it is online, and the owner moves the Bot to another Computer they own. A Hosted Computer is not special.
 
-The owner chooses the Bot's Model and thinking level on the page, and clears each back to the Space's default. Without one of its own, the Bot uses the Space's default, which the Admin sets in Settings. [Model](../model/product.md#choosing) covers the choice.
+The owner chooses the Bot's Model and thinking level on the page, and clears each back to the Space's default. Without one of its own, the Bot uses the Space's default, which an Admin sets in Settings. [Model](../model/product.md#choosing) covers the choice.
 
 A Local Bot's page shows the folders it can write and whether it has full access. The owner grants a folder, revokes one, and turns full access on or off there. The page offers only the access the Bot's Computer supports.
 
@@ -179,7 +185,7 @@ The page offers no control that adds or changes an entry. A User adds and change
 
 ## Integrations
 
-The Integrations view lists the MCP servers the Space and the signed-in User hold, and the packages the Admin installed. Each server shows whether it is connected, who connected it, and the Bots that use it.
+The Integrations view lists the MCP servers the Space and the signed-in User hold, and the packages an Admin installed. Each server shows whether it is connected, who connected it, and the Bots that use it.
 
 [Plugin](../plugin/product.md) states who adds or installs what. A server added with a sign-in opens the browser's sign-in, and the client never shows a credential after it is saved.
 
@@ -189,15 +195,25 @@ The Skills view lists the skills the Space holds and the skills of the User's Bo
 
 ## Settings
 
-The Settings entry opens the Space's settings in the main area. Every User reads them, and only the Admin changes them.
+The Settings entry opens the Space's settings in the main area. Every User reads them, and only an Admin changes them.
 
-The settings list the Space's Providers, each with its protocol and address, and the Models each Provider offers. The Admin connects a Provider and refreshes its Models there. [Model](../model/product.md#providers) covers connecting one.
+The settings list the Space's Providers, each with its protocol and address, and the Models each Provider offers. An Admin connects a Provider and refreshes its Models there. [Model](../model/product.md#providers) covers connecting one.
 
-The settings show the catalog's state: the snapshot or the cache in use, its age, and whether it is stale. The Admin refreshes the catalog there. [Model](../model/product.md#catalog) covers the catalog.
+The settings show the catalog's state: the snapshot or the cache in use, its age, and whether it is stale. An Admin refreshes the catalog there. [Model](../model/product.md#catalog) covers the catalog.
 
-The Admin sets the Space's default Model in the settings. [Model](../model/product.md#choosing) covers the default and what a Bot inherits.
+An Admin sets the Space's default Model in the settings. [Model](../model/product.md#choosing) covers the default and what a Bot inherits.
 
 A Space with no Provider shows that empty state with the action that connects one. Each Provider's Models list shows its own empty state when it offers none.
+
+The Devices section accepts the code a terminal shows after `neha login --device-code`. The User confirms that the terminal acts as their account, and the section says the sign-in succeeded. [Identity](../identity/product.md#devices) covers the code.
+
+### People
+
+Settings opens People, where every signed-in User reads the Space's Users and each User's role. The Space Owner and Admins create an invitation there and revoke a pending one, and the list shows when each pending invitation expires.
+
+The invitation link and its QR code appear only in the answer that creates them; a client hides that one-time panel as soon as the pending invitation changes. Another Admin's create, replacement, or revoke reaches an open People section as a secret-free event, so no client keeps copying a link the Space no longer offers.
+
+The Space Owner changes a role and transfers the Space there. [Identity](../identity/product.md#roles) covers the roles.
 
 ## Computers
 
@@ -206,6 +222,8 @@ The settings list every Computer the User owns, Local and Hosted, with its name,
 The owner creates a Hosted Computer from that list, choosing a name and whether it is shared or exclusive. The owner makes an exclusive Computer shared there.
 
 The owner resets a Hosted Computer from that list. The reset asks for confirmation and names what it deletes. [Computer](../computer/product.md#keeping-files) covers the reset.
+
+The owner revokes a Local Computer from that list. The revocation asks for confirmation, disconnects the machine, and leaves the Computer listed offline until it pairs again. [Computer](../computer/product.md#revoking-a-local-computer) covers revocation.
 
 A Bot moves on its own page, between the Computers its owner owns.
 
@@ -223,6 +241,7 @@ Product terms stay in English in both locales: Space, Bot, Chat, Computer, Provi
 
 - Every control has an accessible name; focus is visible.
 - A waiting Approval is exposed as a status, not by color alone.
+- Progress is stated as text: the count of done lines appears beside the bar, not by the bar alone.
 - On a narrow viewport, controls meet the touch targets in [design-system.md](design-system.md).
 
 ## Page states
