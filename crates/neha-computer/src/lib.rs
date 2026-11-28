@@ -33,3 +33,7 @@ pub use action::{Action, ActionResult, ActionStatus, ByteError, ComputerRuntime,
 pub use channel::{CHANNEL_VERSION, DeviceFrame, HostFrame, MAX_CHANNEL_FRAME_BYTES, WireAction};
 pub use local::{LocalRuntime, MachineAccess, RuntimeError};
 pub use output::{HEAD_BYTES, TAIL_BYTES, truncate};
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use local::test_support;

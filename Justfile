@@ -10,11 +10,12 @@ fmt:
 
 # Lint the workspace; any warning fails. Clippy also type-checks every target.
 clippy:
-    cargo clippy --locked --workspace --all-targets -- -D warnings
+    cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
-# Run the workspace test suite.
+# Run the workspace test suite. The integration binaries need the test-support
+# feature for the internals their fixtures reach.
 test:
-    cargo test --locked --workspace
+    cargo test --locked --workspace --all-features
 
 # Regenerate the client's wire types from the Rust definitions and fail when
 # the committed files differ. The export runs in one process into a fresh
@@ -25,7 +26,7 @@ wire-types:
 
 # Run the Space tests with the S3 tests switched on; the environment comes from docs/storage.md.
 test-s3:
-    cargo test --locked -p neha-space
+    cargo test --locked -p neha-space --all-features
 
 # Replay synthetic records of 10^5, 10^6, and 10^7 events and report time and
 # memory. Not part of the gate: the largest record needs about 5 GB of disk.
@@ -34,7 +35,7 @@ bench-replay:
 
 # Run the machine-side tests with the fence switched on; needs bubblewrap (docs/building.md).
 test-bwrap:
-    cargo test --locked -p neha-computer
+    cargo test --locked -p neha-computer --all-features
 
 # Install the browser client's locked dependencies.
 ui-deps:
