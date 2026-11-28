@@ -55,6 +55,9 @@ pub enum EventKind {
     /// A Computer was created.
     #[serde(rename = "neha.computer.created")]
     ComputerCreated,
+    /// A Computer's owner changed its sharing.
+    #[serde(rename = "neha.computer.updated")]
+    ComputerUpdated,
     /// A Chat was created.
     #[serde(rename = "neha.chat.created")]
     ChatCreated,
@@ -118,6 +121,7 @@ impl EventKind {
             Self::BotUpdated => "neha.bot.updated",
             Self::BotRenamed => "neha.bot.renamed",
             Self::ComputerCreated => "neha.computer.created",
+            Self::ComputerUpdated => "neha.computer.updated",
             Self::ChatCreated => "neha.chat.created",
             Self::MessageAdded => "neha.message.added",
             Self::FileAdded => "neha.file.added",
@@ -168,6 +172,7 @@ impl EventKind {
             | Self::BotMoved
             | Self::BotUpdated
             | Self::ComputerCreated
+            | Self::ComputerUpdated
             | Self::ChatCreated => EventClass::Authority,
         }
     }
@@ -186,6 +191,7 @@ impl FromStr for EventKind {
             "neha.bot.updated" => Ok(Self::BotUpdated),
             "neha.bot.renamed" => Ok(Self::BotRenamed),
             "neha.computer.created" => Ok(Self::ComputerCreated),
+            "neha.computer.updated" => Ok(Self::ComputerUpdated),
             "neha.chat.created" => Ok(Self::ChatCreated),
             "neha.message.added" => Ok(Self::MessageAdded),
             "neha.file.added" => Ok(Self::FileAdded),
@@ -276,8 +282,9 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::{
-        Author, BotMoved, BotRenamed, BotUpdated, ComputerKind, EventData, EventDataError,
-        EventDraft, EventKind, FileAdded, FileError, RunAccess, RunQueued,
+        Author, BotMoved, BotRenamed, BotUpdated, ComputerKind, ComputerSharing, ComputerUpdated,
+        EventData, EventDataError, EventDraft, EventKind, FileAdded, FileError, RunAccess,
+        RunQueued,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -294,6 +301,7 @@ mod tests {
             EventKind::BotUpdated,
             EventKind::BotRenamed,
             EventKind::ComputerCreated,
+            EventKind::ComputerUpdated,
             EventKind::ChatCreated,
             EventKind::MessageAdded,
             EventKind::FileAdded,
@@ -745,6 +753,47 @@ mod tests {
     }
 
     #[test]
+    fn a_computer_sharing_change_round_trips() {
+        let computer = Id::new();
+        let data = ComputerUpdated {
+            computer,
+            sharing: ComputerSharing::Shared,
+        };
+        let value = serde_json::json!({"computer": computer, "sharing": "shared"});
+        assert_eq!(
+            EventKind::ComputerUpdated.decode(&value).unwrap(),
+            EventData::ComputerUpdated(data)
+        );
+        assert_eq!(
+            serde_json::to_value(ComputerSharing::Exclusive).unwrap(),
+            serde_json::json!("exclusive")
+        );
+        assert!(
+            EventKind::ComputerUpdated
+                .validate_author(Author::User(Id::new()), None)
+                .is_ok()
+        );
+        assert!(
+            EventKind::ComputerUpdated
+                .validate_author(Author::Bot(Id::new()), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_computer_created_before_sharing_replays_without_it() {
+        let decoded = EventKind::ComputerCreated
+            .decode(&computer_created_data("hosted"))
+            .unwrap();
+        let EventData::ComputerCreated(created) = decoded else {
+            panic!("a ComputerCreated event decodes to its data");
+        };
+        assert_eq!(created.sharing, None);
+        assert!(!created.space);
+        assert!(created.name.is_empty());
+    }
+
+    #[test]
     fn an_unknown_computer_kind_is_refused() {
         let error = EventKind::ComputerCreated
             .decode(&computer_created_data("mainframe"))
@@ -958,6 +1007,8 @@ pub enum EventData {
     BotRenamed(BotRenamed),
     /// A Computer was created.
     ComputerCreated(ComputerCreated),
+    /// A Computer's owner changed its sharing.
+    ComputerUpdated(ComputerUpdated),
     /// A Chat was created.
     ChatCreated(ChatCreated),
     /// A Message was added.
@@ -1020,6 +1071,7 @@ impl EventKind {
             Self::BotUpdated => EventData::BotUpdated(decode(data)?),
             Self::BotRenamed => EventData::BotRenamed(decode(data)?),
             Self::ComputerCreated => EventData::ComputerCreated(decode(data)?),
+            Self::ComputerUpdated => EventData::ComputerUpdated(decode(data)?),
             Self::ChatCreated => EventData::ChatCreated(decode(data)?),
             Self::MessageAdded => EventData::MessageAdded(decode(data)?),
             Self::FileAdded => {
@@ -1068,6 +1120,7 @@ impl EventKind {
             | Self::BotUpdated
             | Self::BotRenamed
             | Self::ComputerCreated
+            | Self::ComputerUpdated
             | Self::ChatCreated => {
                 if !matches!(author, Author::User(_)) || acting.is_some() {
                     return Err(EventDataError::Author);
@@ -1352,6 +1405,17 @@ impl<'de> Deserialize<'de> for ComputerKind {
     }
 }
 
+/// Whether more than one Bot may use a Computer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerSharing {
+    /// More than one Bot MAY use this Computer.
+    Shared,
+    /// One Bot uses this Computer.
+    Exclusive,
+}
+
 /// The data of `neha.computer.created`.
 #[derive(Clone, Debug, PartialEq, Deserialize, TS)]
 #[ts(export_to = "record.ts")]
@@ -1365,6 +1429,29 @@ pub struct ComputerCreated {
     pub kind: ComputerKind,
     /// The Computer's workspace directory.
     pub workspace: String,
+    /// Its name for its owner.
+    #[serde(default)]
+    pub name: String,
+    /// Who may use it.
+    ///
+    /// Absent in a record written before sharing was recorded. Such a record
+    /// replays as exclusive for a Hosted Computer and shared for a Local one.
+    #[serde(default)]
+    pub sharing: Option<ComputerSharing>,
+    /// Whether it is its owner's Space Computer.
+    #[serde(default)]
+    pub space: bool,
+}
+
+/// The data of `neha.computer.updated`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct ComputerUpdated {
+    /// The Computer.
+    pub computer: Id,
+    /// Who may use it now.
+    pub sharing: ComputerSharing,
 }
 
 /// The data of `neha.chat.created`.

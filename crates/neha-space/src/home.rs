@@ -26,7 +26,7 @@ const DIRECTORIES: [&str; 8] = [
     "tmp",
     "cache",
     "logs",
-    "computers",
+    "workspaces",
     "blobs",
 ];
 
@@ -122,13 +122,16 @@ impl Home {
         self.root.join("blobs")
     }
 
-    /// Returns the directory for a Computer's workspace.
+    /// Returns the root of a Computer's Workspace.
     #[must_use]
     pub fn workspace_dir(&self, computer: Id) -> PathBuf {
-        self.root
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace")
+        self.root.join("workspaces").join(computer.to_string())
+    }
+
+    /// Returns the directory one Bot works in inside its Computer's Workspace.
+    #[must_use]
+    pub fn bot_workspace_dir(&self, computer: Id, bot: Id) -> PathBuf {
+        self.workspace_dir(computer).join(bot.to_string())
     }
 }
 
@@ -208,7 +211,7 @@ mod tests {
 
         assert!(home.root().join("db").is_dir());
         assert!(home.root().join("secrets").is_dir());
-        assert!(home.root().join("computers").is_dir());
+        assert!(home.root().join("workspaces").is_dir());
         assert!(home.blobs_dir().is_dir());
         assert!(!home.root().join("tmp").join("leftover").exists());
         assert_eq!(home.db_path(), home.root().join("db").join("neha.sqlite3"));
@@ -261,8 +264,12 @@ mod tests {
 
         let workspace = home.workspace_dir(computer);
 
-        assert!(workspace.ends_with("workspace"));
-        assert!(workspace.starts_with(home.root().join("computers")));
+        assert!(workspace.starts_with(home.root().join("workspaces")));
+        assert!(workspace.ends_with(computer.to_string()));
+
+        let bot = neha::id::Id::new();
+        let folder = home.bot_workspace_dir(computer, bot);
+        assert_eq!(folder, workspace.join(bot.to_string()));
     }
 }
 

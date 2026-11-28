@@ -63,6 +63,10 @@ const computer = {
   kind: "local",
   online: true,
   workspace: "/w",
+  // Its name for its owner, which is what the client shows beside its kind.
+  name: "Workstation",
+  sharing: "shared" as Computer["sharing"],
+  space: false,
   supports_grants: true,
   supports_full_access: true,
   // The daemon fences this machine's commands, and it has said so. A test may
@@ -76,17 +80,24 @@ const otherComputer = {
   kind: "local",
   online: false,
   workspace: "/other",
+  name: "Laptop",
+  sharing: "shared" as Computer["sharing"],
+  space: false,
   supports_grants: true,
   supports_full_access: true,
   sandboxed: true as boolean | null,
 };
-// A Computer the Space runs itself, which only a reset can clear.
+// The Computer the Space runs itself, which every User gets when they first
+// create a Bot. A Hosted Computer's sharing may change.
 const hostedComputer = {
   id: "p5",
   owner: "u1",
   kind: "hosted",
   online: true,
   workspace: "/hosted",
+  name: "Space Computer",
+  sharing: "shared" as Computer["sharing"],
+  space: true,
   supports_grants: true,
   supports_full_access: true,
   sandboxed: true,
@@ -203,6 +214,10 @@ export const space = {
   // The moves and the resets the Space was asked for.
   moves: [] as { bot: string; computer: string }[],
   resets: [] as string[],
+  // The Hosted Computers the Space was asked to create, and the sharing
+  // changes it was asked to make.
+  computerCreates: [] as { name: string; sharing: Computer["sharing"] }[],
+  computerUpdates: [] as { computer: string; sharing: Computer["sharing"] }[],
   // The rules the Space was asked to add and to remove.
   ruleAdds: [] as unknown[],
   ruleRemoves: [] as string[],
@@ -224,7 +239,13 @@ export const space = {
     space.releaseApprovals();
     space.computer.kind = "local";
     space.computer.online = true;
+    space.computer.name = "Workstation";
+    space.computer.sharing = "shared";
+    space.computer.space = false;
     space.otherComputer.kind = "local";
+    space.otherComputer.name = "Laptop";
+    space.otherComputer.sharing = "shared";
+    space.otherComputer.space = false;
     space.computer.supports_grants = true;
     space.computer.supports_full_access = true;
     space.otherComputer.supports_grants = true;
@@ -233,6 +254,11 @@ export const space = {
     space.otherComputer.sandboxed = true;
     space.hostedComputer.sandboxed = true;
     space.hostedComputer.kind = "hosted";
+    space.hostedComputer.name = "Space Computer";
+    space.hostedComputer.sharing = "shared";
+    space.hostedComputer.space = true;
+    // A test that created a Computer leaves the first three in place.
+    space.computers = computers;
     space.bot.name = "Scout";
     space.bot.computer = "p1";
     space.bot.full_access = false;
@@ -265,6 +291,8 @@ export const space = {
     space.updates = [];
     space.moves = [];
     space.resets = [];
+    space.computerCreates = [];
+    space.computerUpdates = [];
     space.ruleAdds = [];
     space.ruleRemoves = [];
     space.connects = [];
@@ -407,6 +435,47 @@ export class FakeCommands {
       }
       case "computer_list":
         return space.computers.map((known) => ({ ...known })) as T;
+      case "computer_create": {
+        // A Space names the Hosted Computer it now holds and writes it to the
+        // record, so the page hears about its own write.
+        const asked = args as { name: string; sharing: Computer["sharing"] };
+        space.computerCreates.push(asked);
+        const created: Computer = {
+          // An id the paired Computers do not carry, so a created Computer is
+          // never mistaken for one the machine paired.
+          id: `p${space.computers.length + 10}`,
+          owner: "u1",
+          kind: "hosted",
+          online: true,
+          workspace: `/hosted/${asked.name}`,
+          name: asked.name,
+          sharing: asked.sharing,
+          space: false,
+          supports_grants: true,
+          supports_full_access: true,
+          sandboxed: true,
+        };
+        space.computers = [...space.computers, created];
+        emit("neha.computer.created", {
+          computer: created.id,
+          owner: created.owner,
+          kind: created.kind,
+          workspace: created.workspace,
+          name: created.name,
+          sharing: created.sharing,
+          space: created.space,
+        });
+        return { ...created } as T;
+      }
+      case "computer_update": {
+        const asked = args as { computer: string; sharing: Computer["sharing"] };
+        const known = space.computers.find((entry) => entry.id === asked.computer);
+        if (!known) throw new Error("the fake Space has no such Computer");
+        space.computerUpdates.push(asked);
+        known.sharing = asked.sharing;
+        emit("neha.computer.updated", { computer: known.id, sharing: known.sharing });
+        return { ...known } as T;
+      }
       case "bot_show": {
         const asked = args as { bot: string };
         const known = botFor(asked.bot);

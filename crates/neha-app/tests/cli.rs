@@ -1237,6 +1237,7 @@ async fn a_bot_works_on_its_computer_with_tools() {
         ],
     );
     let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let bot = first_word(&field(&created, "Created Bot "));
     let computer = field(&created, "Computer:");
     let chat = field(&created, "Chat:");
 
@@ -1251,7 +1252,7 @@ async fn a_bot_works_on_its_computer_with_tools() {
     assert!(shown.contains("write_file"), "{shown}");
     assert!(shown.contains("read_file"), "{shown}");
     assert!(shown.contains("hello neha"), "{shown}");
-    let workspace = home.join("computers").join(&computer).join("workspace");
+    let workspace = home.join("workspaces").join(&computer).join(&bot);
     assert_eq!(
         std::fs::read_to_string(workspace.join("hello.txt")).unwrap(),
         "hello neha"
@@ -1396,6 +1397,7 @@ async fn a_file_travels_between_a_user_and_a_bot() {
         ],
     );
     let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let bot = first_word(&field(&created, "Created Bot "));
     let computer = field(&created, "Computer:");
     let chat = field(&created, "Chat:");
 
@@ -1477,7 +1479,7 @@ async fn a_file_travels_between_a_user_and_a_bot() {
         &["chat", "send", "--chat", &chat, "please answer"],
     );
     assert!(answered.contains("Done."), "{answered}");
-    let workspace = home.join("computers").join(&computer).join("workspace");
+    let workspace = home.join("workspaces").join(&computer).join(&bot);
     // The implicit download landed in the Bot's Workspace even though the
     // shell's current directory was /tmp.
     assert_eq!(
@@ -3849,7 +3851,7 @@ async fn a_bot_moves_to_another_local_computer() {
 }
 
 #[test]
-fn a_move_to_an_unknown_or_hosted_computer_is_refused() {
+fn a_move_to_an_unknown_or_same_computer_is_refused() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
     let credential = directory.path().join("session").join("credential.json");
@@ -3877,7 +3879,7 @@ fn a_move_to_an_unknown_or_hosted_computer_is_refused() {
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("no such Computer"), "stderr: {stderr}");
 
-    // A Hosted Computer is not a move target.
+    // A Bot cannot move to the Computer it already uses.
     let refused = cli(
         &home,
         &credential,
@@ -3886,7 +3888,7 @@ fn a_move_to_an_unknown_or_hosted_computer_is_refused() {
     assert!(!refused.status.success());
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("a Bot moves to a Local Computer"),
+        stderr.contains("already works on that Computer"),
         "stderr: {stderr}"
     );
 
@@ -3895,6 +3897,48 @@ fn a_move_to_an_unknown_or_hosted_computer_is_refused() {
     assert!(
         shown.contains(&format!("Computer: {hosted} (Hosted, online: true)")),
         "a refused move must not move the Bot:\n{shown}"
+    );
+
+    drop(server);
+}
+
+#[test]
+fn a_user_creates_and_shares_a_hosted_computer() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+
+    let created = run(
+        &home,
+        &credential,
+        &["computer", "create", "--name", "Build Box"],
+    );
+    let computer = first_word(&field(&created, "Created Computer "));
+    assert!(created.contains("Build Box, exclusive"), "{created}");
+
+    let listed = run(&home, &credential, &["computer", "list"]);
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.contains("Build Box  hosted  exclusive  ")),
+        "{listed}"
+    );
+
+    let updated = run(
+        &home,
+        &credential,
+        &["computer", "update", &computer, "--shared"],
+    );
+    assert!(updated.contains("is now shared"), "{updated}");
+    let listed = run(&home, &credential, &["computer", "list"]);
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.contains("Build Box  hosted  shared  ")),
+        "{listed}"
     );
 
     drop(server);
@@ -3936,7 +3980,7 @@ async fn a_bot_created_with_computer_hosted_works_in_the_space() {
         shown.contains(&format!("Computer: {hosted} (Hosted, online: true)")),
         "{shown}"
     );
-    let workspace = home.join("computers").join(&hosted).join("workspace");
+    let workspace = home.join("workspaces").join(&hosted);
     assert!(
         shown.contains(&format!("Workspace: {}", workspace.display())),
         "a Hosted Computer names its workspace:\n{shown}"
@@ -3945,7 +3989,7 @@ async fn a_bot_created_with_computer_hosted_works_in_the_space() {
     assert!(
         listing
             .lines()
-            .any(|line| line.starts_with(&format!("{hosted}  hosted  online  "))),
+            .any(|line| line.starts_with(&format!("{hosted}  Computer  hosted  exclusive  "))),
         "`computer list` shows the Hosted Computer:\n{listing}"
     );
 
@@ -3965,7 +4009,8 @@ async fn a_bot_created_with_computer_hosted_works_in_the_space() {
         sent.contains("I ran the shell on my Hosted Computer."),
         "{sent}"
     );
-    let hosted_file = workspace.join("hosted.txt");
+    let bot_dir = workspace.join(&bot);
+    let hosted_file = bot_dir.join("hosted.txt");
     assert_eq!(std::fs::read_to_string(&hosted_file).unwrap(), "hosted");
 
     let reset = run(&home, &credential, &["computer", "reset", &hosted]);
@@ -3973,11 +4018,8 @@ async fn a_bot_created_with_computer_hosted_works_in_the_space() {
         reset.contains(&format!("Reset Computer {hosted} (hosted).")),
         "{reset}"
     );
-    assert!(!hosted_file.exists(), "reset clears the workspace");
-    assert!(
-        workspace.is_dir(),
-        "reset keeps the workspace folder itself"
-    );
+    assert!(!bot_dir.exists(), "reset clears every Bot directory");
+    assert!(workspace.is_dir(), "reset keeps the workspace root itself");
 
     // A Hosted run works only in its Workspace: a named host directory is
     // refused before a Provider request.

@@ -1,6 +1,6 @@
 # Quick start: chat with a Bot
 
-This guide starts a Space on one machine, joins it as the Admin, connects an OpenAI-compatible Provider, and chats with a Bot. The result is one Chat where a Bot answers a User and can work in its own Computer workspace with tools.
+This guide starts a Space on one machine, joins it as the Admin, connects an OpenAI-compatible Provider, and chats with a Bot. The result is one Chat where a Bot answers a User and can work in its own directory inside its Computer's Workspace with tools.
 
 Everything runs on the local machine. The Space listens on loopback and stores its record in `NEHA_HOME`. To reach it from a phone or another computer, [serve it on a domain](deploying.md).
 
@@ -110,7 +110,7 @@ target/debug/neha model list
 
 ## Create a Bot and chat
 
-A new Bot gets its own Chat and its own Computer: a Hosted Computer unless you name a Local one.
+A new Bot gets its own Chat and starts on your Space Computer. That is the Hosted Computer every User receives, and the Space creates it the first time a Bot needs one.
 
 ```bash
 target/debug/neha bot create Scout
@@ -122,11 +122,13 @@ CHAT_ID=$(target/debug/neha chat list | awk '{print $1; exit}')
 
 A Bot uses the Space's default Model and thinking level. Choose its own with `--model <model-id>` and `--thinking minimal|low|medium|high|max`; `neha bot show` prints them when set. `neha bot set <bot> --model <model-id> --thinking <level>` changes them later.
 
-The output names the Bot, its Chat, and its Computer. Show them again, including the Computer's workspace:
+The output names the Bot, its Chat, and its Computer. Show them again, including the Computer's Workspace root:
 
 ```bash
 target/debug/neha bot show "$BOT_ID"
 ```
+
+For a Hosted Computer, `neha bot show` prints the Workspace root, and the Bot works in a directory of its own inside it: `$NEHA_HOME/workspaces/<computer-id>/<bot-id>`.
 
 Send a Message and wait for the Bot's reply, including any steps it took on its Computer. With one Chat, no identifier is needed:
 
@@ -140,7 +142,7 @@ The CLI prints the Bot's reply and the run that produced it. Read the whole Chat
 target/debug/neha chat read "$CHAT_ID"
 ```
 
-A Bot can also write files, read them back, and run shell commands in its Computer's workspace. [Let a Bot work on its Computer](tools.md) shows how.
+A Bot can also write files, read them back, and run shell commands in its own directory inside its Computer's Workspace. [Let a Bot work on its Computer](tools.md) shows how.
 
 ## A Bot does one thing at a time
 
@@ -179,7 +181,7 @@ target/debug/neha run show "$RUN_ID"
 
 ## Put a Bot on a Local Computer
 
-A Local Computer is the machine where Neha runs: a Neha process that connects out to the Space and runs each Bot's actions in that Bot's Workspace on the machine. This milestone pairs the machine that runs the Space, because the Space listens on loopback only.
+A Local Computer is the machine where Neha runs: a Neha process that connects out to the Space and runs each Bot's actions in the Bot's own directory inside that Computer's Workspace on the machine. This milestone pairs the machine that runs the Space, because the Space listens on loopback only.
 
 The Space runs in one terminal. Open another terminal and pair this machine. There is no pairing code: the command gets a pairing ticket from the Space and asks you to confirm.
 
@@ -193,7 +195,7 @@ Answer `y`. It prints `Paired Computer <id> with <url>.`; the Computer belongs t
 target/debug/neha computer run
 ```
 
-In another terminal, list the Computers and create a Bot on the Local one. `computer list` shows `local` for this machine and `hosted` for the Computers the Space runs; the workspace column is empty because the Space records no path for a Local Computer, and the daemon's `Workspace root:` line names it:
+In another terminal, list the Computers and create a Bot on the Local one. `computer list` prints each Computer's id, name, kind, sharing, online state, and workspace; this machine shows `local` and the Space's Hosted Computers show `hosted`. The workspace column is empty for this machine because the Space records no path for a Local Computer, and the daemon's `Workspace root:` line names it:
 
 ```bash
 target/debug/neha computer list
@@ -201,7 +203,7 @@ target/debug/neha bot create Runner --computer local
 RUNNER_ID=$(target/debug/neha bot list | awk '$2 == "Runner" {print $1; exit}')
 ```
 
-Without `--computer`, a new Bot goes on a new Hosted Computer; `--computer local` puts it on your paired Local Computer.
+Without `--computer`, a new Bot goes on your Space Computer; `--computer local` puts it on your paired Local Computer. `--computer hosted` gives the Bot a new exclusive Hosted Computer of its own, and a Computer id names any Computer you own.
 
 Ask the new Bot to work:
 
@@ -211,19 +213,19 @@ target/debug/neha chat send --bot "$RUNNER_ID" "pwd; echo hi > a.txt"
 
 The first action on this Local Computer asks for approval. At the card, type `a` to allow it once; [Approvals](approvals.md) covers the other answers.
 
-The Bot works in its own Workspace on the machine, `~/.neha/workspaces/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, the folders its owner granted, and the directory a run names with `--cwd`, unless the Bot has full access, and the file tools check their own write paths. Files move through the Bot's shell with `neha file get` and `neha chat send --file`. [Add a Local Computer](computer.md) covers the fence, pairing, offline behavior, and [moving a Bot](computer.md#moving-a-bot).
+The Bot works in its own directory on the machine, `~/.neha/workspaces/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's own directory, the folders its owner granted, and the directory a run names with `--cwd`, unless the Bot has full access, and the file tools check their own write paths. Files move through the Bot's shell with `neha file get` and `neha chat send --file`. [Computers](computer.md) covers the fence, pairing, offline behavior, and [moving a Bot](computer.md#moving-a-bot).
 
 ## Manage a Bot in the browser
 
 The signed-in client has four entries in its rail: Chats, Needs attention, Bots, and Settings. Open Bots and pick a Bot to open its page.
 
-The page shows the Bot's name, its picture made from the initials of its name, its Computer and whether it is online, its Model and thinking level, and its access. Change the name there. Choose another Model or thinking level for the Bot; without one it uses the Space's default, and clearing one puts it back on that default. Move the Bot to another Local Computer you own from that page.
+The page shows the Bot's name, its picture made from the initials of its name, its Computer with its name, kind, sharing, and whether it is online, its Model and thinking level, and its access. Change the name there. Choose another Model or thinking level for the Bot; without one it uses the Space's default, and clearing one puts it back on that default. Move the Bot to another Computer you own from that page.
 
 For a Bot on a Local Computer, the page shows the folders the Bot may write and whether it has full access. Grant a folder there, or turn full access on: the page states the risk and asks you to confirm before anything changes. The page also lists the Bot's Ask and Allow rules, and you can add and remove them there.
 
-Settings shows the Space's Providers and Models, the catalog's state, and every Computer you own with its kind and whether it is online. Set the Space's default Model there.
+Settings shows the Space's Providers and Models, the catalog's state, and every Computer you own with its name, kind, sharing, and whether it is online. Create a Hosted Computer there, choosing its name and whether it is shared or exclusive, and make an exclusive one shared. Set the Space's default Model there.
 
-A Hosted Computer offers a reset in that list; it asks for confirmation first, and it deletes every file and folder inside the Bot's Workspace. Moving a Bot between your Local Computers stays on its page.
+A Hosted Computer offers a reset in that list; it asks for confirmation first, and it clears every Bot's directory in the Computer's Workspace. A Bot moves on its own page.
 
 The CLI does the same work. Read the ids from the lists, then rename a Bot and set the default Model:
 
@@ -234,7 +236,7 @@ MODEL_ID=$(target/debug/neha model list | awk '/  tools/ {print $1; exit}')
 target/debug/neha model default "$MODEL_ID"
 ```
 
-[Approvals](approvals.md) covers the rules and the answers, and [Add a Local Computer](computer.md#file-access-and-a-runs-directory) covers the folders and full access.
+[Approvals](approvals.md) covers the rules and the answers, and [Computers](computer.md#file-access-and-a-runs-directory) covers the folders and full access.
 
 ## Send a file
 
@@ -245,7 +247,7 @@ printf 'remember the milk\n' > notes.txt
 target/debug/neha chat send --file notes.txt --bot "$RUNNER_ID" "Read the attached file and tell me what it says."
 ```
 
-[Send and receive Files](files.md) shows how to list and download Files, and how the Bot takes a file into its Workspace and delivers one back.
+[Send and receive Files](files.md) shows how to list and download Files, and how the Bot takes a file into its own directory and delivers one back.
 
 ## Connect a client over the network
 
@@ -286,7 +288,8 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 
 ## What this milestone does not do
 
-- The Hosted Computer runs in a `bubblewrap` sandbox on the Space's machine. The sandbox mounts the machine's system directories read-only and the Bot's Workspace as the only place where files persist; it has its own `/tmp` and process list, and it shares the machine's network. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace.
+- The Hosted Computer runs in a `bubblewrap` sandbox on the Space's machine. The sandbox mounts the machine's system directories read-only and the Bot's own directory inside the Computer's Workspace as the only place where files persist; it has its own `/tmp` and process list, and it shares the machine's network. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace.
+- Hosted Computers run only in the Space process in this milestone. Starting, stopping, or deleting one on demand, and worker containers or a Supervisor, are not available.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet, and it does not ask before an action. [Approvals](approvals.md) covers the gate on a Local Computer.
 - An unattended run's approval does not expire yet.
 - One human joins a Space. Group Chats, Boards, and search arrive in later milestones.

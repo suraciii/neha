@@ -8,13 +8,13 @@ Owned by bot. A Bot depends on [Computer](../computer/product.md) for where it l
 
 1. A Bot has exactly one owner.
 2. A Bot's memory is its own and goes where the Bot goes.
-3. A new Bot starts on a Hosted Computer. Its owner can create it on a Local Computer they control instead.
+3. A new Bot starts on its owner's Space Computer. Its owner can create it on another Computer they own instead.
 
 ## Creating a Bot
 
 A new Space shows an empty sidebar with one action: create a Bot.
 
-A User creates a Bot with a name and a picture. The Bot starts on its Computer, and its Chat with the owner opens.
+A User creates a Bot with a name and a picture. The Bot starts on its owner's Space Computer unless the owner names another Computer they own, and its Chat with the owner opens.
 
 The owner gives the Bot its job and its rules in that Chat, and asks it to remember them.
 
@@ -40,7 +40,7 @@ A change to the Bot's Model or its thinking level leaves the Bot able to run: th
 
 ## Moving a Bot
 
-[Computer](../computer/product.md#assigning-a-computer) covers who can move a Bot and where. Its memory, its Chats, and the Files it delivered stay with it, and it starts in its own Workspace on the new Computer. Work it did not deliver stays on the old Computer.
+[Computer](../computer/product.md#assigning-a-computer) covers who can move a Bot and where. Its memory, its Chats, and the Files it delivered stay with it, and it starts in its own directory inside the new Computer's Workspace. Work it did not deliver stays on the old Computer.
 
 A move to a Computer that does not serve the access the Bot carries is refused, and the refusal names what to revoke or turn off first. A Bot that moves keeps its grants and its full access, and they mean the same on the new Computer.
 

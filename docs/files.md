@@ -1,6 +1,6 @@
 # Send and receive Files
 
-This guide shows a file going to a Bot and a result coming back: a User sends a file in a Chat, the Bot takes it into its Workspace, and the Bot delivers a result as a File. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist.
+This guide shows a file going to a Bot and a result coming back: a User sends a file in a Chat, the Bot takes it into its own directory inside its Computer's Workspace, and the Bot delivers a result as a File. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist.
 
 ## What a File is
 
@@ -83,8 +83,8 @@ When the file is over the limit or the upload fails, the Chat says so and keeps 
 
 The Bot works with Files through the `neha` command in its shell, not through File tools. A run's shell already has `NEHA_BOT_TOKEN`, `NEHA_SPACE_URL`, and `NEHA_CHAT`, so these commands work without a sign-in:
 
-- `neha file get <id>` writes a File of the Chat into the Workspace under the File's name; it writes there even when the shell runs in another directory. With `--out`, the shell runs the CLI with its usual write rights.
-- `neha chat send --file <path>` sends a Workspace file to the Chat as a Bot Message, alone or with text.
+- `neha file get <id>` writes a File of the Chat into the Bot's own directory under the File's name; it writes there even when the shell runs in another directory. With `--out`, the shell runs the CLI with its usual write rights.
+- `neha chat send --file <path>` sends a file of the Bot's directory to the Chat as a Bot Message, alone or with text.
 
 A Message that carries a File includes a `[File id=<uuid> ...]` line; the Bot passes that id to `neha file get`. The Bot never prints or stores its token.
 
@@ -95,7 +95,7 @@ printf 'a,b\n1,2\n' > rows.csv
 target/debug/neha chat send --file rows.csv "Count the rows in the attached file and send me the result as count.csv."
 ```
 
-The Bot gets `rows.csv` into its Workspace, writes `count.csv`, and sends it back with a Bot Message. The Chat then holds both Files; `neha chat files` lists them and `neha file get <file-id> --out count.csv` downloads the result.
+The Bot gets `rows.csv` into its own directory, writes `count.csv`, and sends it back with a Bot Message. The Chat then holds both Files; `neha chat files` lists them and `neha file get <file-id> --out count.csv` downloads the result.
 
 The shell commands go through the same approval gate as any other shell command, so a first use or an Ask rule for `shell` covers them. There is no separate File action to approve.
 
@@ -105,4 +105,4 @@ An action that breaks a limit returns an error to the Model instead of failing t
 
 - A File is at most 32 MiB. A larger file is refused before anything is recorded: the CLI stops with an error, the browser reports that the file was not sent, and a Bot's `chat send --file` fails.
 - A Bot reaches only the Files of its own Chat. A File of another Chat is not found.
-- `file get` without `--out` writes inside the Bot's Workspace, whatever the shell's current directory; `--out` and `chat send --file` use paths the shell can already reach, so the shell's own approval and sandbox rules apply. A Hosted shell reads the machine's system directories and its own Workspace, and writes only the Workspace and the sandbox's own temporary folders. A Local shell reads with the machine user's rights, except the Computer's configuration directory in granted mode, and writes only where its Workspace, its granted folders, the run's `--cwd` directory, or full access allow; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers that range.
+- `file get` without `--out` writes inside the Bot's own directory inside its Computer's Workspace, whatever the shell's current directory; `--out` and `chat send --file` use paths the shell can already reach, so the shell's own approval and sandbox rules apply. A Hosted shell reads the machine's system directories and its own directory, and writes only that directory and the sandbox's own temporary folders. A Local shell reads with the machine user's rights, except the Computer's configuration directory in granted mode, and writes only where its own directory, its granted folders, the run's `--cwd` directory, or full access allow; [Computers](computer.md#the-local-computers-workspace-and-the-write-fence) covers that range.

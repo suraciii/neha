@@ -16,6 +16,7 @@ import type {
   ActionStatus,
   ApprovalReason,
   Author,
+  ComputerSharing,
   Event as WireEvent,
   EventKind,
   RunStatus,
@@ -45,7 +46,7 @@ import type { Usage } from "./generated/usage";
 export type { Account };
 export type { CatalogRefresh as CatalogRefreshResult, CatalogStatus };
 export type { ErrorCode };
-export type { ActionStatus, ApprovalReason, Author, ChatStatus, EventKind, RunStatus };
+export type { ActionStatus, ApprovalReason, Author, ChatStatus, ComputerSharing, EventKind, RunStatus };
 export type { WireEvent as RecordEvent };
 export type { Undoability as Undoable };
 export type { ClientFrame, CommandCall, FileSummary, ServerFrame, ThinkingLevel };

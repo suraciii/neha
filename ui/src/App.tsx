@@ -814,8 +814,17 @@ export default function App() {
       event.kind === "neha.provider.added"
     ) {
       void loadWorkspace();
-      // A Computer another client paired is one the Settings surface lists.
+      // A Computer another client paired or created is one the Settings
+      // surface lists.
       if (event.kind === "neha.computer.created") void refreshComputers();
+      return;
+    }
+    // Another client changed who may use a Computer: the Settings list and an
+    // open Bot's page both show its sharing.
+    if (event.kind === "neha.computer.updated") {
+      void refreshComputers();
+      const opened = pageBotId();
+      if (opened) void reloadPageBot(opened);
       return;
     }
     // A Bot's page reads its own Bot, its Computers, and its rules again, so a
@@ -1623,6 +1632,7 @@ export default function App() {
     update({ managing: true, manageError: null });
     try {
       await commands.command("computer_reset", { computer });
+      await refreshComputers();
       update({ managing: false });
     } catch (reason) {
       update({ manageError: reason, managing: false });
@@ -1646,6 +1656,42 @@ export default function App() {
     update({ managing: true, manageError: null });
     try {
       await commands.command("computer_reset", { computer });
+      await refreshComputers();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // Creates a Hosted Computer from the Computers list. Its owner names it and
+  // chooses whether it takes any of their Bots or a single one.
+  async function createComputer(input: {
+    name: string;
+    sharing: Computer["sharing"];
+  }): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command<Computer>("computer_create", input);
+      await refreshComputers();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // Makes an exclusive Hosted Computer shared, so another of its owner's Bots
+  // may use it.
+  async function shareComputer(computer: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command<Computer>("computer_update", {
+        computer,
+        sharing: "shared",
+      });
       await refreshComputers();
       update({ managing: false });
       return true;
@@ -2030,6 +2076,8 @@ export default function App() {
                     busy={state.managing}
                     error={manageErrorText()}
                     onBack={closeManage}
+                    onCreate={(input) => createComputer(input)}
+                    onShare={(computer) => shareComputer(computer)}
                     onReset={(computer) => resetComputer(computer)}
                     onOpenBot={(bot) => openBotPage(bot)}
                     onConnect={(input) => connectVendor(input)}

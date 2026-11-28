@@ -9,11 +9,11 @@ use std::io::{BufRead, IsTerminal as _, Write};
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
-use neha::record::RuleEffect;
+use neha::record::{ComputerSharing, RuleEffect};
 use neha::seq::Seq;
 use neha::surface::{
-    BotComputer, BotCreate, BotUpdate, CommandCall, MessageSend, ModelSpec, ProviderAdd,
-    ProviderConnect, ProviderProtocol, ThinkingLevel,
+    BotComputer, BotCreate, BotUpdate, CommandCall, ComputerCreate, ComputerUpdate, MessageSend,
+    ModelSpec, ProviderAdd, ProviderConnect, ProviderProtocol, ThinkingLevel,
 };
 use neha_space::Home;
 use serde_json::Value;
@@ -206,7 +206,8 @@ enum BotCommand {
         name: String,
         /// Where the Bot works: local, hosted, or a Computer id.
         ///
-        /// A fresh Hosted Computer when omitted.
+        /// The owner's Space Computer when omitted; `hosted` creates a new
+        /// exclusive Hosted Computer, and an id names an existing Computer.
         #[arg(long, value_name = "LOCAL|HOSTED|ID")]
         computer: Option<String>,
         /// The Bot's thinking level: minimal, low, medium, high, max.
@@ -233,11 +234,11 @@ enum BotCommand {
         #[arg(long)]
         reset_thinking: bool,
     },
-    /// Move your Bot to another real Computer you own.
+    /// Move your Bot to another Computer you own.
     Move {
         /// The Bot identifier.
         bot: Id,
-        /// The real Computer it should work on.
+        /// The Computer it should work on.
         #[arg(long)]
         computer: Id,
     },
@@ -315,6 +316,26 @@ enum ComputerCommand {
     Add {
         /// The pairing code the machine printed.
         code: String,
+    },
+    /// Create a Hosted Computer you own.
+    Create {
+        /// The Computer's name for you.
+        #[arg(long)]
+        name: String,
+        /// Let more than one Bot use it.
+        #[arg(long)]
+        shared: bool,
+    },
+    /// Change who may use a Hosted Computer.
+    Update {
+        /// The Hosted Computer identifier.
+        computer: Id,
+        /// Let more than one Bot use it.
+        #[arg(long)]
+        shared: bool,
+        /// Keep it to one Bot.
+        #[arg(long)]
+        exclusive: bool,
     },
     /// Clear a Hosted Computer's Workspace.
     Reset {
@@ -1320,6 +1341,52 @@ async fn computer_command(command: ComputerCommand) -> Result<()> {
             println!("  Workspace: {}", text_of(&computer, "workspace")?);
             println!("Create a Bot on it with: neha bot create <name> --computer {id}");
         }
+        ComputerCommand::Create { name, shared } => {
+            let credential = Credential::load()?;
+            let sharing = if shared {
+                ComputerSharing::Shared
+            } else {
+                ComputerSharing::Exclusive
+            };
+            let result = client::command(
+                &credential,
+                CommandCall::ComputerCreate(ComputerCreate { name, sharing }),
+            )
+            .await?;
+            println!(
+                "Created Computer {} ({}, {}).",
+                id_of(&result, "id")?,
+                text_of(&result, "name")?,
+                text_of(&result, "sharing")?
+            );
+            println!("  Workspace: {}", text_of(&result, "workspace")?);
+        }
+        ComputerCommand::Update {
+            computer,
+            shared,
+            exclusive,
+        } => {
+            if shared == exclusive {
+                bail!("a Computer update names exactly one of --shared or --exclusive");
+            }
+            let credential = Credential::load()?;
+            let sharing = if shared {
+                ComputerSharing::Shared
+            } else {
+                ComputerSharing::Exclusive
+            };
+            let result = client::command(
+                &credential,
+                CommandCall::ComputerUpdate(ComputerUpdate { computer, sharing }),
+            )
+            .await?;
+            println!(
+                "Computer {} ({}) is now {}.",
+                id_of(&result, "id")?,
+                text_of(&result, "name")?,
+                text_of(&result, "sharing")?
+            );
+        }
         ComputerCommand::Reset { computer } => {
             let credential = Credential::load()?;
             let result =
@@ -1337,9 +1404,11 @@ async fn computer_command(command: ComputerCommand) -> Result<()> {
                     "offline"
                 };
                 println!(
-                    "{}  {}  {online}  {}",
+                    "{}  {}  {}  {}  {online}  {}",
                     id_of(computer, "id")?,
+                    text_of(computer, "name")?,
                     text_of(computer, "kind")?,
+                    text_of(computer, "sharing")?,
                     text_of(computer, "workspace")?
                 );
             }

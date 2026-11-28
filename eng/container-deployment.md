@@ -43,10 +43,10 @@ The Space and Caddy share one network namespace because the Space binds its loop
 
 | Process | Responsibility | Must not have |
 | --- | --- | --- |
-| Space | Record, command surface, UI, Bot loop, Model calls, approvals, notifications | bwrap, Docker socket, Computer workspaces |
+| Space | Record, command surface, UI, Bot loop, Model calls, approvals, notifications | bwrap, Docker socket, Hosted Computer Workspaces |
 | Caddy | TLS and the public origin | Computer access |
 | Supervisor | Create, start, stop, reset, and remove worker containers; inject the Computer token | Record, Vault, or provider keys |
-| Computer worker | Run one Hosted Computer's tools, files, and shell; answer the Computer channel | The record, the Vault, the Space home, or another worker's workspace |
+| Computer worker | Run one Hosted Computer's tools, files, and shell; answer the Computer channel | The record, the Vault, the Space home, or another Computer's Workspace |
 
 The Supervisor is a control-plane process, not a Computer. A worker is a Computer: it connects out to the Space over the Computer channel and listens on no network port.
 
@@ -60,10 +60,11 @@ data/
   secrets/             sealed Vault and provider keys
   blobs/               local File store, when used
   state/               private Space state
-  computers/<id>/workspace
+  workspaces/<computer-id>/        a Hosted Computer's Workspace root
+    <bot-id>/                      one Bot's directory
 ```
 
-Each worker mounts only `computers/<id>/workspace` at `/workspace`. It mounts no other part of the Space home. A backup of the data directory therefore contains the record, the secrets, and every Hosted Computer Workspace.
+Each worker mounts only `workspaces/<computer-id>` at `/workspace`. It mounts no other part of the Space home. The Bots assigned to one Hosted Computer share that mount, each working in its own `<bot-id>` directory, so several Bots can share one Computer and its worker. A backup of the data directory therefore contains the record, the secrets, and every Hosted Computer's Workspace root with each Bot's directory.
 
 SQLite stays on a local filesystem. Do not place the data directory on NFS, SMB, or a network filesystem.
 
@@ -76,10 +77,10 @@ A worker container runs with:
 - its own `/tmp` as a tmpfs;
 - no Linux capabilities and no privilege escalation;
 - CPU, memory, and process limits;
-- no public port and no host mounts outside its Workspace;
+- no public port and no host mounts outside the Computer's Workspace root;
 - the Computer token, which admits only its channel.
 
-The container is the Computer's isolation boundary. The worker starts no nested sandbox. A compromised Bot can reach its Workspace and its short-lived Bot credential, but not the Space's record, Vault, File store, or another Computer.
+The container is the Computer's isolation boundary. The worker starts no nested sandbox. A compromised Bot can reach its Computer's Workspace and its short-lived Bot credential, but not the Space's record, Vault, File store, or another Computer. Bots assigned to one Computer share its worker and are not isolated from each other.
 
 Workers share the host kernel. A deployment that serves untrusted Users on the same host needs a stronger boundary, such as a VM-per-worker or a gVisor/Kata sandbox, and is outside this design.
 
@@ -102,15 +103,15 @@ The whole stack belongs on a host dedicated to Neha. A host that also runs untru
 A new Hosted Computer is provisioned in this order:
 
 1. The Space creates the Computer id and a one-use token.
-2. The Supervisor creates a worker container with the Space origin, the token, and its Workspace mount.
-3. The Space records the Computer and the Bot.
+2. The Supervisor creates a worker container with the Space origin, the token, and the Computer's Workspace root mount.
+3. The Space records the Hosted Computer and any Bot it was created for.
 4. The Supervisor starts the worker; the worker connects out and the Space marks the Computer online.
 
 A failure before step 4 removes the worker and leaves no recorded Bot without a Computer. A failure after step 3 leaves an offline Computer that the Supervisor restarts.
 
 A worker that stops reconnects while it runs. The Space marks the Computer offline when its channel is down. A run already in flight follows the Computer contract: its actions become unknown and the Space records the failure.
 
-Reset clears the Workspace only when the Computer has no queued, running, or waiting run. Removing a Bot removes its worker and Workspace idempotently.
+Reset clears every Bot's directory in the Computer's Workspace, and only when the Computer has no queued, running, or waiting run. Removing a Bot removes its directory; the Computer's worker and Workspace root stay while another Bot uses them. Removing the last Bot removes the worker and the Workspace root idempotently.
 
 Space, Supervisor, and worker images ship as one version. A worker with a mismatched channel version refuses to serve; a mixed-version deployment is not supported.
 

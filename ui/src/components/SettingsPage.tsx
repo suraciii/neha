@@ -44,6 +44,10 @@ interface SettingsPageProps {
   busy: boolean;
   error: string | null;
   onBack: () => void;
+  // Creates a Hosted Computer with the name and sharing the User chooses.
+  onCreate: (input: { name: string; sharing: Computer["sharing"] }) => Promise<boolean>;
+  // Makes an exclusive Hosted Computer shared, so another Bot may use it.
+  onShare: (computer: string) => Promise<boolean>;
   // Clears a Hosted Computer's Workspace, once the Admin confirms it.
   onReset: (computer: string) => Promise<boolean>;
   // Opens one Bot's page from a Computer that has Bots on it.
@@ -68,6 +72,13 @@ function baseUrlOf(providers: Provider[], model: Model): string {
 // What a Computer is called in the User's words.
 function kindOf(computer: Computer): string {
   return computer.kind === "local" ? t("chat.localComputer") : t("chat.hostedComputer");
+}
+
+// Who may use a Computer, in the User's words.
+function sharingOf(computer: Computer): string {
+  return computer.sharing === "exclusive"
+    ? t("computer.sharing.exclusive")
+    : t("computer.sharing.shared");
 }
 
 // One Model, with what it can do and the offer to make it the default. A Model
@@ -228,6 +239,30 @@ export default function SettingsPage(props: SettingsPageProps) {
   // The Computer whose reset the Admin armed with a first press. Clearing a
   // Workspace deletes its files, so it asks twice wherever it is asked from.
   const [armedReset, setArmedReset] = createSignal<string | null>(null);
+  // The Hosted Computer the User is naming, and who may use it. It starts
+  // exclusive, like the CLI's default, and can be made shared in the list.
+  const [computerName, setComputerName] = createSignal("");
+  const [computerSharing, setComputerSharing] =
+    createSignal<Computer["sharing"]>("exclusive");
+
+  async function createComputer() {
+    const name = computerName().trim();
+    if (name === "" || props.busy) return;
+    setNote(null);
+    if (await props.onCreate({ name, sharing: computerSharing() })) {
+      setComputerName("");
+      setComputerSharing("exclusive");
+      setNote(t("settings.computers.create.done"));
+    }
+  }
+
+  // An exclusive Computer refuses a second Bot, so making it shared is how its
+  // owner lets another one use it.
+  async function shareComputer(computer: string) {
+    if (props.busy) return;
+    setNote(null);
+    if (await props.onShare(computer)) setNote(t("settings.computers.share.done"));
+  }
 
   async function reset(computer: string) {
     if (props.busy) return;
@@ -565,12 +600,16 @@ export default function SettingsPage(props: SettingsPageProps) {
                     {(computer) => (
                       <div class="row">
                         <span class="row__text">
-                          <span class="row__name mono">{computer.workspace}</span>
+                          <span class="row__name">{computer.name}</span>
                           <span class="row__meta">
-                            {kindOf(computer)} ·{" "}
+                            {kindOf(computer)} · {sharingOf(computer)} ·{" "}
                             {computer.online ? t("chat.online") : t("chat.offline")}
                           </span>
+                          <span class="row__meta mono">{computer.workspace}</span>
                           <span class="chips">
+                            <Show when={computer.space}>
+                              <span class="chip chip--default">{t("computer.space")}</span>
+                            </Show>
                             <Show
                               when={botsOn(computer).length > 0}
                               fallback={
@@ -591,6 +630,20 @@ export default function SettingsPage(props: SettingsPageProps) {
                             </Show>
                           </span>
                         </span>
+                        {/* An exclusive Computer takes one Bot, so its owner
+                            makes it shared before another may use it. */}
+                        <Show
+                          when={computer.kind === "hosted" && computer.sharing === "exclusive"}
+                        >
+                          <button
+                            class="btn btn--quiet"
+                            type="button"
+                            disabled={props.busy}
+                            onClick={() => void shareComputer(computer.id)}
+                          >
+                            {t("settings.computers.share")}
+                          </button>
+                        </Show>
                         {/* A reset clears a Hosted Workspace's files, and only a
                             Hosted Computer can be reset. */}
                         <Show when={computer.kind === "hosted"}>
@@ -614,6 +667,54 @@ export default function SettingsPage(props: SettingsPageProps) {
                 </div>
                 <p class="panel__note">{t("bot.computer.reset.hint")}</p>
               </Show>
+
+              <form
+                class="panel__form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void createComputer();
+                }}
+              >
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field__label">{t("settings.computers.create.name")}</span>
+                    <input
+                      class="input"
+                      name="computer_name"
+                      maxlength={64}
+                      value={computerName()}
+                      onInput={(event) => setComputerName(event.currentTarget.value)}
+                    />
+                  </label>
+                  <label class="field">
+                    <span class="field__label">{t("settings.computers.create.sharing")}</span>
+                    <select
+                      class="input"
+                      name="computer_sharing"
+                      value={computerSharing()}
+                      onChange={(event) =>
+                        setComputerSharing(event.currentTarget.value as Computer["sharing"])
+                      }
+                    >
+                      <option value="shared">{t("computer.sharing.shared")}</option>
+                      <option value="exclusive">{t("computer.sharing.exclusive")}</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="panel__foot panel__foot--end">
+                  <button
+                    class="btn btn--primary"
+                    type="submit"
+                    disabled={props.busy || computerName().trim() === ""}
+                  >
+                    {props.busy
+                      ? t("settings.computers.create.creating")
+                      : t("settings.computers.create.action")}
+                    <Icon name="arrow-right" size="sm" />
+                  </button>
+                </div>
+                <span class="field__hint">{t("settings.computers.create.hint")}</span>
+              </form>
             </div>
           </section>
         </Show>

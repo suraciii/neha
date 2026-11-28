@@ -4030,11 +4030,11 @@ mod tests {
     use neha::error::ErrorCode;
     use neha::file::MAX_FILE_BYTES;
     use neha::id::Id;
-    use neha::record::{Author, EventDraft, EventKind};
+    use neha::record::{Author, ComputerSharing, EventDraft, EventKind};
     use neha::seq::Seq;
     use neha::surface::{
-        BotComputer, BotCreate, BotUpdate, CommandCall, MessageSend, ModelSpec, ProviderAdd,
-        ProviderConnect, ProviderProtocol, ThinkingLevel,
+        BotComputer, BotCreate, BotUpdate, CommandCall, ComputerCreate, ComputerUpdate,
+        MessageSend, ModelSpec, ProviderAdd, ProviderConnect, ProviderProtocol, ThinkingLevel,
     };
     use serde_json::Value;
     use tokio::net::TcpStream;
@@ -5592,7 +5592,7 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
             .count();
         assert_eq!(keys, 1, "a replay must not leave an orphan Provider key");
-        let computers = std::fs::read_dir(home.join("computers")).unwrap().count();
+        let computers = std::fs::read_dir(home.join("workspaces")).unwrap().count();
         assert_eq!(computers, 1, "a replay must not leave an orphan workspace");
         socket.close(None).await.unwrap();
         provider_task.abort();
@@ -6149,6 +6149,8 @@ mod tests {
             }),
         )
         .await;
+        // The first create also records the owner's Space Computer; a later
+        // create joins it and writes only the Bot and its Chat.
         let history = 1 + 259 + 3;
 
         socket
@@ -6183,7 +6185,7 @@ mod tests {
 
         let mut seen = std::collections::BTreeSet::new();
         let mut snapshots = 0;
-        let last = history + 3;
+        let last = history + 2;
         while seen.last().copied().unwrap_or(0) < last {
             let frame =
                 tokio::time::timeout(std::time::Duration::from_secs(10), next_frame(&mut socket))
@@ -6711,11 +6713,7 @@ mod tests {
 
         assert_eq!(result["status"], "succeeded");
         assert!(result["text"].as_str().unwrap().contains("hello neha"));
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
+        let workspace = hosted_workspace(&running, computer, bot);
         assert_eq!(
             std::fs::read_to_string(workspace.join("hello.txt")).unwrap(),
             "hello neha"
@@ -6977,7 +6975,7 @@ mod tests {
         let run = Id::new();
         let command = Id::new();
         let action = Id::new();
-        let workspace = home.workspace_dir(computer);
+        let workspace = std::path::PathBuf::from(&home.bot_workspace_dir(computer, bot));
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("note.txt"), "hello").unwrap();
         let continuation = neha_loop::Continuation {
@@ -7248,7 +7246,7 @@ mod tests {
             vec![responses_write_file_reply(), responses_text_reply()],
         )
         .await;
-        let (_bot, chat, computer) = tool_bot_on(
+        let (bot, chat, computer) = tool_bot_on(
             &mut socket,
             base,
             ProviderProtocol::OpenAiResponses,
@@ -7269,11 +7267,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0]["tool"], "write_file");
         assert_eq!(actions[0]["status"], "succeeded");
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
+        let workspace = hosted_workspace(&running, computer, bot);
         assert_eq!(
             std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
             "hello"
@@ -7482,7 +7476,7 @@ mod tests {
             vec![anthropic_write_file_reply(), anthropic_text_reply()],
         )
         .await;
-        let (_bot, chat, computer) = tool_bot_on(
+        let (bot, chat, computer) = tool_bot_on(
             &mut socket,
             base,
             ProviderProtocol::AnthropicMessages,
@@ -7503,11 +7497,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0]["tool"], "write_file");
         assert_eq!(actions[0]["status"], "succeeded");
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
+        let workspace = hosted_workspace(&running, computer, bot);
         assert_eq!(
             std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
             "hello"
@@ -9853,7 +9843,7 @@ mod tests {
             .unwrap()
             .store_provider_key(provider, "sk-test")
             .unwrap();
-        std::fs::create_dir_all(home.workspace_dir(computer)).unwrap();
+        std::fs::create_dir_all(home.bot_workspace_dir(computer, bot)).unwrap();
         let store = Store::open(&home).await.unwrap();
         let drafts = vec![
             EventDraft::new(
@@ -10064,16 +10054,11 @@ mod tests {
         let (_dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
         let (base, provider_task) = scripted_provider(vec![text("unused")]).await;
-        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
-        // A Hosted workspace already has a `.tmp` directory, so replace it with
-        // a file: the runtime cannot create its working folder and must fail
-        // the run instead of starting on a half-prepared Computer.
-        std::fs::remove_dir_all(workspace.join(".tmp")).unwrap();
+        let (bot, chat, computer) = tool_bot(&mut socket, base).await;
+        let workspace = hosted_workspace(&running, computer, bot);
+        std::fs::create_dir_all(&workspace).unwrap();
+        // The runtime creates `.tmp` in the Bot's directory; a file in its
+        // place makes the run fail instead of starting half-prepared.
         std::fs::write(workspace.join(".tmp"), "not a directory").unwrap();
 
         let result = send(&mut socket, chat, "hello").await;
@@ -10121,7 +10106,7 @@ mod tests {
             text("unused"),
         ])
         .await;
-        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
+        let (bot, chat, computer) = tool_bot(&mut socket, base).await;
 
         let result = send(&mut socket, chat, "write a file").await;
 
@@ -10136,11 +10121,7 @@ mod tests {
         assert_eq!(shown["status"], "failed");
         assert_eq!(shown["usage"]["uncached_input"], 40);
         assert_eq!(shown["usage"]["output"], 12);
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
+        let workspace = hosted_workspace(&running, computer, bot);
         assert!(!workspace.join("truncated.txt").exists());
         socket.close(None).await.unwrap();
         provider_task.abort();
@@ -10169,16 +10150,12 @@ mod tests {
             text("I wrote the unicode file."),
         ])
         .await;
-        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
+        let (bot, chat, computer) = tool_bot(&mut socket, base).await;
 
         let result = send(&mut socket, chat, "write unicode text").await;
 
         assert_eq!(result["status"], "succeeded");
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
+        let workspace = hosted_workspace(&running, computer, bot);
         assert_eq!(
             std::fs::read(workspace.join("unicode.txt")).unwrap().len(),
             65_400
@@ -10425,7 +10402,7 @@ mod tests {
             },
         ])
         .await;
-        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
+        let (bot, chat, computer) = tool_bot(&mut socket, base).await;
 
         let result = send(&mut socket, chat, "answer me").await;
 
@@ -10435,11 +10412,7 @@ mod tests {
         assert_eq!(shown["status"], "failed");
         assert_eq!(shown["usage"]["uncached_input"], 48);
         assert_eq!(shown["usage"]["output"], 14);
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
+        let workspace = hosted_workspace(&running, computer, bot);
         assert!(!workspace.join("never.txt").exists());
         socket.close(None).await.unwrap();
         provider_task.abort();
@@ -11493,6 +11466,15 @@ mod tests {
 
     /// The workspace a fake real Computer reports.
     const MACHINE_WORKSPACE: &str = "/home/ada/.neha/workspace";
+
+    /// Returns one Bot's directory inside its Hosted Computer's Workspace.
+    fn hosted_workspace(running: &Running, computer: Id, bot: Id) -> std::path::PathBuf {
+        running
+            .server_home()
+            .join("workspaces")
+            .join(computer.to_string())
+            .join(bot.to_string())
+    }
 
     fn machine_token() -> String {
         URL_SAFE_NO_PAD.encode([7_u8; 32])
@@ -13826,7 +13808,7 @@ mod tests {
         .await;
         assert!(matches!(unknown_bot, Err((ErrorCode::NotFound, _))));
 
-        let managed_target = try_command(
+        let exclusive_target = try_command(
             &mut socket,
             Id::new(),
             CommandCall::BotMove {
@@ -13835,17 +13817,17 @@ mod tests {
             },
         )
         .await;
-        match managed_target {
+        match exclusive_target {
             Err((ErrorCode::InvalidArgument, message)) => {
                 assert!(
-                    message.contains("a Bot moves to a Local Computer"),
+                    message.contains("exclusive and already has a Bot"),
                     "{message}"
                 );
             }
-            other => panic!("a managed target is refused: {other:?}"),
+            other => panic!("an occupied exclusive Computer is refused: {other:?}"),
         }
 
-        let managed_source = try_command(
+        let moved_from_hosted = command(
             &mut socket,
             Id::new(),
             CommandCall::BotMove {
@@ -13854,13 +13836,8 @@ mod tests {
             },
         )
         .await;
-        match managed_source {
-            Err((ErrorCode::InvalidArgument, message)) => assert!(
-                message.contains("cannot move yet"),
-                "a managed source explains the gap: {message}"
-            ),
-            other => panic!("a Bot on a managed Computer cannot move: {other:?}"),
-        }
+        assert_eq!(moved_from_hosted["bot"]["id"], json!(managed_bot));
+        assert_eq!(moved_from_hosted["to"]["id"], json!(second));
 
         // Another User's Bot and Computer are not found, exactly like missing
         // ones: the caller learns nothing about them.
@@ -14777,12 +14754,13 @@ mod tests {
         let mut socket = admin_socket(&running, &invite).await;
         let (base, provider_task, gates, _recorded) =
             gated_provider(vec![hold("held answer")]).await;
-        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
-        let workspace = running
+        let (bot, chat, computer) = tool_bot(&mut socket, base).await;
+        let root = running
             .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
+            .join("workspaces")
+            .join(computer.to_string());
+        let workspace = hosted_workspace(&running, computer, bot);
+        std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("note.txt"), "keep me").unwrap();
         std::fs::create_dir(workspace.join("folder")).unwrap();
         std::fs::write(workspace.join("folder").join("inner.txt"), "also me").unwrap();
@@ -14804,14 +14782,15 @@ mod tests {
         assert_eq!(result["computer"], json!(computer));
         assert_eq!(result["kind"], "hosted");
         assert!(
-            std::fs::read_dir(&workspace).unwrap().next().is_none(),
-            "reset clears every entry of the workspace"
+            !workspace.exists(),
+            "reset clears every Bot directory in the workspace"
         );
-        assert!(workspace.is_dir(), "reset keeps the workspace directory");
+        assert!(root.is_dir(), "reset keeps the workspace root");
 
         // A repeated command id answers from the record instead of clearing
         // again: work written after the first reset must survive, even while a
         // new run holds the Computer.
+        std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("late.txt"), "after the reset").unwrap();
         let queued = submit(&mut socket, chat, "hold the next run", None).await;
         let run = run_of(&queued);
@@ -14850,9 +14829,8 @@ mod tests {
         let (_bot, _chat, computer) = tool_bot(&mut socket, base).await;
         let workspace = running
             .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
+            .join("workspaces")
+            .join(computer.to_string());
         let target = running.server_home().join("not-a-workspace");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("keep.txt"), "do not delete").unwrap();
@@ -14898,11 +14876,13 @@ mod tests {
         .await;
         let first_computer: Id = serde_json::from_value(first["computer"]["id"].clone()).unwrap();
         let second_computer: Id = serde_json::from_value(second["computer"]["id"].clone()).unwrap();
+        let second_bot: Id = serde_json::from_value(second["bot"]["id"].clone()).unwrap();
         let second_workspace = running
             .server_home()
-            .join("computers")
+            .join("workspaces")
             .join(second_computer.to_string())
-            .join("workspace");
+            .join(second_bot.to_string());
+        std::fs::create_dir_all(&second_workspace).unwrap();
         std::fs::write(second_workspace.join("keep.txt"), "keep").unwrap();
 
         let command_id = Id::new();
@@ -15021,12 +15001,19 @@ mod tests {
             other => panic!("a missing Local Computer is named: {other:?}"),
         }
 
-        // Pairing a machine does not change the default: an unnamed Bot still
-        // gets its own Hosted Computer. Choosing Local stays explicit.
+        // Pairing a machine does not change the default: an unnamed Bot
+        // joins the owner's shared Space Computer. Choosing Local stays
+        // explicit.
         let (computer, _machine) = paired_computer(&mut socket, &running).await;
         let default = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
         assert_eq!(default["computer"]["kind"], "hosted");
+        assert_eq!(default["computer"]["space"], true);
         assert_ne!(default["computer"]["id"], json!(computer));
+        let second_default = command(&mut socket, Id::new(), add_bot("Second", None)).await;
+        assert_eq!(
+            second_default["computer"]["id"], default["computer"]["id"],
+            "default Hosted Bots share the Space Computer"
+        );
         let explicit = command(
             &mut socket,
             Id::new(),
@@ -15037,7 +15024,7 @@ mod tests {
         let named = command(&mut socket, Id::new(), add_bot("Named", Some(computer))).await;
         assert_eq!(named["computer"]["id"], json!(computer));
 
-        // An explicit Hosted Computer is one Bot's own.
+        // An explicit Hosted Computer is exclusive to one Bot.
         let own = command(
             &mut socket,
             Id::new(),
@@ -15045,14 +15032,15 @@ mod tests {
         )
         .await;
         assert_eq!(own["computer"]["kind"], "hosted");
+        assert_eq!(own["computer"]["sharing"], "exclusive");
         let hosted_id: Id = serde_json::from_value(own["computer"]["id"].clone()).unwrap();
         let rejected = try_command(&mut socket, Id::new(), add_bot("Join", Some(hosted_id))).await;
         match rejected {
             Err((ErrorCode::InvalidArgument, message)) => assert!(
-                message.contains("leave the Computer out for Hosted"),
+                message.contains("exclusive and already has a Bot"),
                 "{message}"
             ),
-            other => panic!("a Bot cannot join a Hosted Computer: {other:?}"),
+            other => panic!("a Bot cannot join an exclusive Computer: {other:?}"),
         }
 
         let views = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
@@ -15061,6 +15049,194 @@ mod tests {
         assert!(views.iter().any(|view| view["kind"] == "hosted"));
         socket.close(None).await.unwrap();
         running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shared_computer_takes_several_bots() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerCreate(ComputerCreate {
+                name: "Build Box".to_owned(),
+                sharing: ComputerSharing::Shared,
+            }),
+        )
+        .await;
+        let computer: Id = serde_json::from_value(created["id"].clone()).unwrap();
+        assert_eq!(created["sharing"], "shared");
+
+        let first = command(&mut socket, Id::new(), add_bot("First", Some(computer))).await;
+        let second = command(&mut socket, Id::new(), add_bot("Second", Some(computer))).await;
+        assert_eq!(first["computer"]["id"], json!(computer));
+        assert_eq!(second["computer"]["id"], json!(computer));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exclusive_computer_can_be_made_shared() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerCreate(ComputerCreate {
+                name: "Private Box".to_owned(),
+                sharing: ComputerSharing::Exclusive,
+            }),
+        )
+        .await;
+        let computer: Id = serde_json::from_value(created["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), add_bot("First", Some(computer))).await;
+        let refused = try_command(&mut socket, Id::new(), add_bot("Second", Some(computer))).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+            "an exclusive Computer refuses a second Bot: {refused:?}"
+        );
+
+        let shared = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerUpdate(ComputerUpdate {
+                computer,
+                sharing: ComputerSharing::Shared,
+            }),
+        )
+        .await;
+        assert_eq!(shared["sharing"], "shared");
+        command(&mut socket, Id::new(), add_bot("Second", Some(computer))).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_space_computer_stays_shared() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let computer: Id = serde_json::from_value(created["computer"]["id"].clone()).unwrap();
+        assert_eq!(created["computer"]["space"], true);
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerUpdate(ComputerUpdate {
+                computer,
+                sharing: ComputerSharing::Exclusive,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+            "the Space Computer cannot be made exclusive: {refused:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_clears_every_bot_on_a_shared_computer() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerCreate(ComputerCreate {
+                name: "Shared Box".to_owned(),
+                sharing: ComputerSharing::Shared,
+            }),
+        )
+        .await;
+        let computer: Id = serde_json::from_value(created["id"].clone()).unwrap();
+        let first = command(&mut socket, Id::new(), add_bot("First", Some(computer))).await;
+        let second = command(&mut socket, Id::new(), add_bot("Second", Some(computer))).await;
+        let first_id: Id = serde_json::from_value(first["bot"]["id"].clone()).unwrap();
+        let second_id: Id = serde_json::from_value(second["bot"]["id"].clone()).unwrap();
+        let first_dir = hosted_workspace(&running, computer, first_id);
+        let second_dir = hosted_workspace(&running, computer, second_id);
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        std::fs::write(first_dir.join("first.txt"), "first").unwrap();
+        std::fs::write(second_dir.join("second.txt"), "second").unwrap();
+
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerReset { computer },
+        )
+        .await;
+
+        assert!(!first_dir.exists());
+        assert!(!second_dir.exists());
+        assert!(
+            running
+                .server_home()
+                .join("workspaces")
+                .join(computer.to_string())
+                .is_dir()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosted_bot_moves_to_another_hosted_computer() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let first = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("First", Some(BotComputer::Hosted)),
+        )
+        .await;
+        let bot: Id = serde_json::from_value(first["bot"]["id"].clone()).unwrap();
+        let target = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerCreate(ComputerCreate {
+                name: "Move Target".to_owned(),
+                sharing: ComputerSharing::Shared,
+            }),
+        )
+        .await;
+        let target: Id = serde_json::from_value(target["id"].clone()).unwrap();
+
+        let moved = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: target,
+            },
+        )
+        .await;
+        assert_eq!(moved["bot"]["id"], json!(bot));
+        assert_eq!(moved["to"]["id"], json!(target));
+        assert_eq!(moved["from"]["id"], first["computer"]["id"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shared_computer_with_two_bots_cannot_become_exclusive() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerCreate(ComputerCreate {
+                name: "Shared Box".to_owned(),
+                sharing: ComputerSharing::Shared,
+            }),
+        )
+        .await;
+        let computer: Id = serde_json::from_value(created["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), add_bot("First", Some(computer))).await;
+        command(&mut socket, Id::new(), add_bot("Second", Some(computer))).await;
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerUpdate(ComputerUpdate {
+                computer,
+                sharing: ComputerSharing::Exclusive,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+            "a shared Computer with two Bots cannot become exclusive: {refused:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

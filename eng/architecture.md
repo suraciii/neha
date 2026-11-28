@@ -59,7 +59,11 @@ The built-in loop's Model calls leave from the Space, never from a Computer. One
 
 ## Record and storage
 
-SQLite is the source of truth. The record is an append-only log plus projections, and each Space has one local home directory. File bytes live in a store the operator configures: a directory in that home, or one prefix of an S3-compatible bucket. A containerized Hosted Space mounts that home from the host; each Hosted Computer worker mounts only its Workspace from it. [Space](../specs/space/design.md) states the invariants and [Container deployment](container-deployment.md) states the mount layout.
+SQLite is the source of truth. The record is an append-only log plus projections, and each Space has one local home directory. File bytes live in a store the operator configures: a directory in that home, or one prefix of an S3-compatible bucket.
+
+Each Hosted Computer keeps one Workspace root in the home at `workspaces/<computer-id>`, and each Bot works in its own directory at `workspaces/<computer-id>/<bot-id>`. Several Bots may share one Hosted Computer, each in its own directory.
+
+A containerized Hosted Space mounts that home from the host. Each Hosted Computer worker mounts only the Workspace root it serves, and the Bots that share the Computer share that root. [Space](../specs/space/design.md) states the invariants and [Container deployment](container-deployment.md) states the mount layout.
 
 ## Plugin kernel
 
@@ -114,7 +118,7 @@ A Hosted Space can run in a container instead of directly on its machine. The Sp
 - Diagnostics do not leave the Space's machine by default.
 - Design scale is one machine, one Space process, and the Hosted Computer workers on it; a Space serves hundreds of Users and Bots.
 - An upgrade runs versioned migrations after an automatic backup and promises an upgrade from the previous release only.
-- A backup copies the Space home, the Hosted Computer Workspaces, and the objects of its File store, starting from a consistent database snapshot. A restore on another machine also takes the Vault's master key.
+- A backup copies the Space home, including each Hosted Computer's Workspace root under `workspaces/<computer-id>`, and the objects of its File store, starting from a consistent database snapshot. A restore on another machine also takes the Vault's master key.
 
 ## Where a rule lives
 

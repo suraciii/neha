@@ -91,7 +91,7 @@ A new Space has no Provider and no Bot. The main area then shows two steps.
 The shell remains during first run. On a viewport 900 CSS pixels or narrower, the steps fill the main area.
 
 1. The Admin connects an OpenAI-compatible Provider with a base URL, an API key, and one Model name. The API key is never displayed again.
-2. The User creates a Bot with a name. A new Bot has one owned Chat and one Hosted Computer.
+2. The User creates a Bot with a name. A new Bot has one owned Chat and starts on its owner's Space Computer.
 
 A User who is not the Admin sees that an Admin MUST connect the Provider. The client creates no Bot before a Provider exists.
 
@@ -135,7 +135,7 @@ The Bots entry lists the User's Bots. Selecting one opens that Bot's page.
 
 The page shows the Bot's name, its picture, its Computer, its Model, and its access. [Bot](../bot/product.md#the-bots-page) owns each field and who changes it.
 
-The owner changes the Bot's name on the page. The page shows the Computer's kind and whether it is online, and the owner moves a Local Bot to another Local Computer they own. A Hosted Bot does not move.
+The owner changes the Bot's name on the page. The page shows the Computer's kind and whether it is online, and the owner moves the Bot to another Computer they own. A Hosted Computer is not special.
 
 The owner chooses the Bot's Model and thinking level on the page, and clears each back to the Space's default. Without one of its own, the Bot uses the Space's default, which the Admin sets in Settings. [Model](../model/product.md#choosing) covers the choice.
 
@@ -161,11 +161,13 @@ A Space with no Provider shows that empty state with the action that connects on
 
 ## Computers
 
-The settings list every Computer the User owns, Local and Hosted, with its kind and whether it is online. Each Computer says what a Bot's shell runs as on it, and one that has not answered the Space yet says it waits. [Computer](../computer/product.md) owns what a Computer is.
+The settings list every Computer the User owns, Local and Hosted, with its name, kind, sharing, and whether it is online. Each Computer says what a Bot's shell runs as on it, and one that has not answered the Space yet says it waits. [Computer](../computer/product.md) owns what a Computer is.
+
+The owner creates a Hosted Computer from that list, choosing a name and whether it is shared or exclusive. The owner makes an exclusive Computer shared there.
 
 The owner resets a Hosted Computer from that list. The reset asks for confirmation and names what it deletes. [Computer](../computer/product.md#keeping-files) covers the reset.
 
-A Bot moves on its own page, between the Local Computers its owner owns.
+A Bot moves on its own page, between the Computers its owner owns.
 
 ## Language
 

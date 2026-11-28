@@ -340,7 +340,40 @@ kind: string,
 /**
  * The Computer's workspace directory.
  */
-workspace: string, };
+workspace: string, 
+/**
+ * Its name for its owner.
+ */
+name: string, 
+/**
+ * Who may use it.
+ *
+ * Absent in a record written before sharing was recorded. Such a record
+ * replays as exclusive for a Hosted Computer and shared for a Local one.
+ */
+sharing: ComputerSharing | null, 
+/**
+ * Whether it is its owner's Space Computer.
+ */
+space: boolean, };
+
+/**
+ * Whether more than one Bot may use a Computer.
+ */
+export type ComputerSharing = "shared" | "exclusive";
+
+/**
+ * The data of `neha.computer.updated`.
+ */
+export type ComputerUpdated = { 
+/**
+ * The Computer.
+ */
+computer: string, 
+/**
+ * Who may use it now.
+ */
+sharing: ComputerSharing, };
 
 /**
  * A recorded event.
@@ -382,7 +415,7 @@ data: Record<string, unknown>, };
 /**
  * The kinds of event the record carries.
  */
-export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed";
+export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.computer.updated" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed";
 
 /**
  * The data of `neha.file.added`.

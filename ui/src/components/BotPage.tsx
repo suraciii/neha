@@ -74,6 +74,13 @@ function inUse(models: Model[], model: string): Model | undefined {
   return defaultModel(models);
 }
 
+// Who may use a Computer, in the User's words.
+function sharingOf(computer: Computer): string {
+  return computer.sharing === "exclusive"
+    ? t("computer.sharing.exclusive")
+    : t("computer.sharing.shared");
+}
+
 function draftOf(bot: Bot | null, models: Model[]): Draft {
   const model = bot?.model ?? "";
   // A Bot that names no level follows the Space's, so the draft holds none too:
@@ -162,9 +169,11 @@ export default function BotPage(props: BotPageProps) {
   const moved = () => draft().model !== (props.bot?.model ?? "");
   const reThought = () => draft().thinking !== (props.bot?.thinking ?? "");
   const ruleReady = () => draft().tool !== "";
-  // The other Local Computers this Space knows, which is where a Bot may move.
+  // The other Computers this User owns, which is where a Bot may move. A move
+  // works between Hosted and Local Computers in either direction, so the list
+  // names every one of them.
   const targets = () =>
-    props.computers.filter((known) => known.kind === "local" && known.id !== props.computer?.id);
+    props.computers.filter((known) => known.id !== props.computer?.id);
   const chosen = () => inUse(props.models, draft().model);
   const levels = () => accepted(chosen());
 
@@ -349,8 +358,22 @@ export default function BotPage(props: BotPageProps) {
               <div class="panel__body">
                 <div class="facts">
                   <div class="fact">
-                    <span class="fact__label">{t("bot.section.computer")}</span>
+                    <span class="fact__label">{t("bot.computer.name")}</span>
+                    <span class="fact__value">
+                      {props.computer?.name ?? t("common.loading")}
+                    </span>
+                  </div>
+                  <div class="fact">
+                    <span class="fact__label">{t("bot.computer.kind")}</span>
                     <span class="fact__value">{computerKind()}</span>
+                  </div>
+                  <div class="fact">
+                    <span class="fact__label">{t("bot.computer.sharing")}</span>
+                    <span class="fact__value">
+                      {props.computer === null
+                        ? t("common.loading")
+                        : sharingOf(props.computer)}
+                    </span>
                   </div>
                   <div class="fact">
                     <span class="fact__label">{t("chat.online")}</span>
@@ -368,44 +391,48 @@ export default function BotPage(props: BotPageProps) {
                   </div>
                 </div>
 
+                <Show when={props.computer?.space}>
+                  <div class="chips">
+                    <span class="chip chip--default">{t("computer.space")}</span>
+                  </div>
+                </Show>
+
                 <Show when={hosted()}>
                   <p class="panel__note">{t("bot.computer.hostedNote")}</p>
                 </Show>
 
-                <Show when={!hosted()}>
-                  <div class="field">
-                    <span class="field__label">{t("bot.computer.move.choose")}</span>
-                    <div class="field-row">
-                      <select
-                        class="input"
-                        name="move_target"
-                        disabled={props.busy || targets().length === 0}
-                        value={draft().target}
-                        onChange={(event) => patch({ target: event.currentTarget.value, armedMove: false })}
-                      >
-                        <option value="">{t("bot.computer.move.choose")}</option>
-                        <For each={targets()}>
-                          {(target) => <option value={target.id}>{target.workspace}</option>}
-                        </For>
-                      </select>
-                      <button
-                        class={`btn ${draft().armedMove ? "btn--danger" : "btn--quiet"}`}
-                        type="button"
-                        disabled={props.busy || draft().target === ""}
-                        onClick={() => void move()}
-                      >
-                        <Icon name="repeat" size="sm" />
-                        {draft().armedMove ? t("bot.computer.move.armed") : t("bot.computer.move")}
-                      </button>
-                    </div>
-                    <Show
-                      when={targets().length > 0}
-                      fallback={<span class="field__hint">{t("bot.computer.move.none")}</span>}
+                <div class="field">
+                  <span class="field__label">{t("bot.computer.move.choose")}</span>
+                  <div class="field-row">
+                    <select
+                      class="input"
+                      name="move_target"
+                      disabled={props.busy || targets().length === 0}
+                      value={draft().target}
+                      onChange={(event) => patch({ target: event.currentTarget.value, armedMove: false })}
                     >
-                      <span class="field__hint">{t("bot.computer.move.hint")}</span>
-                    </Show>
+                      <option value="">{t("bot.computer.move.choose")}</option>
+                      <For each={targets()}>
+                        {(target) => <option value={target.id}>{target.name}</option>}
+                      </For>
+                    </select>
+                    <button
+                      class={`btn ${draft().armedMove ? "btn--danger" : "btn--quiet"}`}
+                      type="button"
+                      disabled={props.busy || draft().target === ""}
+                      onClick={() => void move()}
+                    >
+                      <Icon name="repeat" size="sm" />
+                      {draft().armedMove ? t("bot.computer.move.armed") : t("bot.computer.move")}
+                    </button>
                   </div>
-                </Show>
+                  <Show
+                    when={targets().length > 0}
+                    fallback={<span class="field__hint">{t("bot.computer.move.none")}</span>}
+                  >
+                    <span class="field__hint">{t("bot.computer.move.hint")}</span>
+                  </Show>
+                </div>
               </div>
               <Show when={props.computer?.kind === "hosted"}>
                 <div class="panel__foot">
@@ -421,7 +448,7 @@ export default function BotPage(props: BotPageProps) {
                   </button>
                 </div>
               </Show>
-              <Show when={!hosted() && draft().armedMove}>
+              <Show when={draft().armedMove}>
                 <p class="panel__note" role="status">
                   {t("bot.computer.move.armed")}
                 </p>
