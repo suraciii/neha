@@ -9,7 +9,7 @@ Owned by bot. A Bot's work depends on [Computer](../computer/product.md) for whe
 ## Laws
 
 1. A Bot's loop acts as the Bot and holds no record.
-2. Every action a Bot takes runs on its Computer or through an MCP server; a memory tool is a record operation.
+2. Every action a Bot takes runs on its Computer or through an MCP server; a memory or `plan` tool is a record operation.
 3. What a Bot has seen is reconstructible from the record.
 4. A Bot does only what Neha can enforce on its Computer, at an MCP server, or in the record.
 5. A run stops between two of its actions and never inside one.
@@ -41,6 +41,28 @@ The resumed step replays the results of the actions it already recorded, then co
 An action is recorded before it runs and after it returns. A started action never runs twice.
 
 An action whose result never returns is unknown. The loop checks its effect on the Computer, or asks the User, and does not run that started action again.
+
+## Plan
+
+The record holds a Plan as `neha.run.planned` events. Each event names the run, the step, and the call, and holds the whole `entries` list, where each entry is `{title, state}`.
+
+Every write replaces the whole list, so the last write wins and entries have no identity. An empty list clears the Plan.
+
+The projection keeps the newest event of one Run. A plan write answers one unrefused call of the run's recorded reply with the list that call asked for, and a finished run takes no write. A Plan is not a Message, and a compaction removes no Plan: it is the current state of the Run, not history.
+
+The event is a Presentation event: a reader that does not know it skips it. A Bot writes it acting for the User it acts for, as it writes a memory answer.
+
+The built-in loop offers a `plan` tool that takes `{ entries: [{ title, state }] }`. A `plan` call is a record operation, not an Action: it runs no Computer action, asks no approval, and no Ask or Allow rule covers it.
+
+Each entry names only `title` and `state`, and the states are the three a Plan entry defines. A `plan` call with another state or field is refused and records no Plan.
+
+The refusal is the tool result the Model reads, and a replay returns it.
+
+The bounds of a Plan and the no-change rule for a write that passes one follow [product](product.md#plan).
+
+The `plan` tool's description tells the Model to update an entry when it finishes, and that not every action needs an entry.
+
+Before each ordinary run step request, the current Plan enters the system prompt, rebuilt from the record. The prompt has a stable part and a per-request part; the Plan is the first line of the per-request part. A later capability adds per-step lines after it.
 
 ## Waiting and resuming
 
@@ -162,7 +184,7 @@ A `remember` result names the entry's id, kind, and scope, and the capacity left
 
 The system prompt is rebuilt for every request from the entries that apply to the acting User and the conversation. The same record and request give the same prompt.
 
-The prompt states the Bot's job first when the Bot has one, then the other `rule` entries, then the `note` entries under a label that marks them as data, then the skills, then the tool instructions. A Chat where the owner's entries do not apply, and a Group, get no job section.
+The prompt states the Bot's job first when it has one, then the other `rule` entries, then the `note` entries under a label that marks them as data, then the skills, then the tool instructions, then the current Plan. A Chat where the owner's entries do not apply, and a Group, get no job section.
 
 Before each ordinary run step request, the loop prunes a copy of the request, including its current and replayed tool results. Compaction changes only the projection the Model sees, and the record keeps every original Message. The projection prunes and compacts, and neither writes a Message.
 

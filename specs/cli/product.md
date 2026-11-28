@@ -133,6 +133,25 @@ The directory is that run's write root, is recorded with the run and shown on an
 
 The directory MUST exist and be a folder. In granted mode a directory inside a hidden root, or one that holds a hidden path, is refused. The shell mounts an external write root read-write only when its tree holds no link or special file and stays inside the Computer's scan limits; the file tools check every write path.
 
+## Runs
+
+`neha run show <run>` prints a Run's status, its steps, and its actions.
+
+`neha run plan <run>` prints the Run's [Plan](../bot/product.md#plan) and changes nothing.
+
+```text
+Plan for run <id>: 3 of 7 done
+  [done] Read last year's receipts
+  [done] Find the conference page
+  [done] Collect the travel dates
+  [doing] Buy the ticket
+  [pending] Email finance
+  [pending] File the receipt
+  [pending] Update the calendar
+```
+
+Each entry prints its state in brackets before its title, and a line break or a control character in a title prints escaped. A Run with no Plan prints `Plan for run <id>: no plan`.
+
 ## Chat
 
 `neha chat read <chat>` prints the Chat's Messages oldest first. Where a compacted span ends, it marks that earlier Messages were compacted and prints no summary.
@@ -155,7 +174,7 @@ The command prints each kind's total used size and its limit. With no entry, it 
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a built-in Computer tool the loop offers — `shell`, `read_file`, `write_file`, or `list_files` — a skill's script, or an MCP server's tool. A rule that names a memory tool or an unknown tool is refused.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a built-in Computer tool the loop offers — `shell`, `read_file`, `write_file`, or `list_files` — a skill's script, or an MCP server's tool. A rule that names a record tool, such as a memory tool or `plan`, or an unknown tool is refused.
 
 A rule that names a tool the loop does not offer MUST be offered by an MCP server enabled for the Bot and reachable by the acting User (the named server, when the rule names one). A name no such server lists is refused as unknown, so a misspelling is never recorded.
 

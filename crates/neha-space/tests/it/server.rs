@@ -460,6 +460,7 @@ async fn a_finished_run_reaches_its_subscribed_device() {
                 bot,
                 status: neha_space::state::ChatStatus::Idle,
                 active_run: None,
+                plan: None,
             },
         );
         state.runs.insert(
@@ -485,6 +486,7 @@ async fn a_finished_run_reaches_its_subscribed_device() {
                 access: None,
                 steps: Vec::new(),
                 actions: Vec::new(),
+                plan: Vec::new(),
             },
         );
     }
@@ -635,6 +637,7 @@ async fn a_mute_stops_the_next_device_in_the_same_event() {
                 bot,
                 status: neha_space::state::ChatStatus::Idle,
                 active_run: None,
+                plan: None,
             },
         );
         state.runs.insert(
@@ -660,6 +663,7 @@ async fn a_mute_stops_the_next_device_in_the_same_event() {
                 access: None,
                 steps: Vec::new(),
                 actions: Vec::new(),
+                plan: Vec::new(),
             },
         );
     }
@@ -6389,6 +6393,130 @@ async fn memory_events_reach_only_a_caller_that_names_the_capability() {
     assert!(
         capable_kinds.contains(&neha::record::EventKind::MemoryAnswered),
         "the capable reader receives the answer live: {capable_kinds:?}"
+    );
+
+    old.close(None).await.unwrap();
+    capable.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_keeps_one_plan_for_its_run() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![
+        tools(&[(
+            "plan",
+            json!({"entries": [
+                {"title": "Read the receipts", "state": "done"},
+                {"title": "Buy the pass", "state": "doing"},
+            ]}),
+        )]),
+        tools(&[(
+            "plan",
+            json!({"entries": [
+                {"title": "Read the receipts", "state": "done"},
+                {"title": "Buy the pass", "state": "done"},
+                {"title": "Email finance", "state": "pending"},
+            ]}),
+        )]),
+        text("Done."),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+    let sent = send(&mut socket, chat, "do the work").await;
+    assert_eq!(sent["status"], "succeeded", "{sent}");
+    let run = run_of(&sent);
+    let shown = show_run(&mut socket, run).await;
+
+    // A plan write is a record operation: the run records no action for it.
+    assert!(
+        shown["actions"].as_array().unwrap().is_empty(),
+        "a plan call runs no Computer action: {shown}"
+    );
+    // The projection keeps the newest write of the run.
+    let plan = shown["plan"].as_array().unwrap();
+    assert_eq!(plan.len(), 3, "{shown}");
+    assert_eq!(plan[0]["title"], "Read the receipts");
+    assert_eq!(plan[1]["state"], "done");
+    assert_eq!(plan[2]["title"], "Email finance");
+    assert_eq!(plan[2]["state"], "pending");
+
+    // The record holds both writes, oldest first.
+    let mut reader = open_socket_with(&running, &token, &[neha::surface::PLAN_CAPABILITY]).await;
+    let (_cursor, events) = snapshot_events(&mut reader).await;
+    let writes: Vec<&neha::record::Event> = events
+        .iter()
+        .filter(|event| event.kind == neha::record::EventKind::RunPlanned)
+        .collect();
+    assert_eq!(writes.len(), 2, "{events:?}");
+    assert_eq!(writes[0].data["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(writes[1].data["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(writes[1].data["run"], json!(run));
+
+    // The prompt is rebuilt for every request: the second step read the first
+    // plan and its tool answer, and the third read the second plan.
+    let (second, third) = {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 3, "two plan steps and the answer");
+        (requests[1].to_string(), requests[2].to_string())
+    };
+    assert!(
+        second.contains("Your plan for this request, oldest line first:"),
+        "{second}"
+    );
+    assert!(second.contains("- doing: Buy the pass"), "{second}");
+    assert!(second.contains("Plan updated: 1 of 2 done."), "{second}");
+    assert!(third.contains("- pending: Email finance"), "{third}");
+    assert!(third.contains("Plan updated: 2 of 3 done."), "{third}");
+
+    reader.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_events_reach_only_a_caller_that_names_the_capability() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, _recorded) = gated_provider(vec![
+        tools(&[(
+            "plan",
+            json!({"entries": [{"title": "Read the receipts", "state": "doing"}]}),
+        )]),
+        text("Done."),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let sent = send(&mut socket, chat, "do the work").await;
+    assert_eq!(sent["status"], "succeeded", "{sent}");
+
+    // A reader that names no capability reads no plan event.
+    let mut old = open_socket(&running, &token).await;
+    let (_cursor, old_events) = snapshot_events(&mut old).await;
+    assert!(
+        !old_events
+            .iter()
+            .any(|event| event.kind == neha::record::EventKind::RunPlanned),
+        "an old reader skips the plan event: {:?}",
+        old_events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>()
+    );
+
+    // A capable reader reads it.
+    let mut capable = open_socket_with(&running, &token, &[neha::surface::PLAN_CAPABILITY]).await;
+    let (_cursor, events) = snapshot_events(&mut capable).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == neha::record::EventKind::RunPlanned),
+        "a capable reader reads the plan"
     );
 
     old.close(None).await.unwrap();
@@ -22587,6 +22715,35 @@ async fn a_rule_add_asks_for_a_scripts_pair() {
     .unwrap_err();
     assert_eq!(code, ErrorCode::InvalidArgument);
     assert!(message.contains("no other tool"), "{message}");
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lasting_rule_never_names_a_record_tool() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (bot, _chat, _computer) = tool_bot(&mut socket, "http://127.0.0.1:9/v1".to_owned()).await;
+
+    // The plan and memory tools are record operations the rules never see, so
+    // a rule that names one is refused instead of kept and ignored.
+    for tool in ["plan", "remember", "forget", "list_memories"] {
+        let (code, message) = try_command(
+            &mut socket,
+            Id::new(),
+            add_rule(bot, neha::record::RuleEffect::Ask, tool, None, None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidArgument, "{tool}: {message}");
+        assert!(message.contains("record tool"), "{tool}: {message}");
+    }
+    let rules = approvals_of(&mut socket, bot).await;
+    assert!(
+        rules.is_empty(),
+        "a refused rule is not recorded: {rules:?}"
+    );
+
     socket.close(None).await.unwrap();
     running.shutdown().await;
 }

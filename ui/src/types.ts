@@ -20,6 +20,8 @@ import type {
   MemoryKind,
   MemoryScope,
   MemorySourceKind,
+  PlanEntry,
+  PlanState,
   RunStatus,
   Undoability,
   ApprovalReason as WireApprovalReason,
@@ -67,6 +69,8 @@ export type {
   MemorySourceKind,
   MemoryView as Memory,
   ModelView as Model,
+  PlanEntry,
+  PlanState,
   ProviderView as Provider,
   RunStatus,
   ServerFrame,
@@ -351,8 +355,8 @@ export interface ToolAction {
   error: string | null;
 }
 
-// The Run the page follows: its steps, its tool actions, and the Files it
-// produced, while it has any.
+// The Run the page follows: its steps, its tool actions, its plan, and the
+// Files it produced, while it has any.
 export interface RunActivity {
   // The Run this belongs to.
   run: string;
@@ -360,10 +364,29 @@ export interface RunActivity {
   step: number;
   // The actions the Run took, oldest first.
   actions: ToolAction[];
+  // The plan the Run holds now, oldest entry first; empty when it wrote none or
+  // cleared it.
+  plan: PlanEntry[];
   // The Files the Run produced, oldest first.
   files: string[];
   // Why the Run failed, when it did.
   error: string | null;
+}
+
+// How many entries of a Run's plan are done, out of all of them. A Chat list row
+// shows it beside its Working mark.
+export interface PlanProgress {
+  done: number;
+  total: number;
+}
+
+// One read of a Run's plan, and the plan word it was sent against. An answer
+// whose Run gained a newer word, or a newer read, while it was on the way must
+// not put an older list back.
+export interface PlanRead {
+  run: string;
+  read: number;
+  word: number;
 }
 
 export type Preview = { text: string; file: boolean; card?: boolean } | { error: true } | null;
@@ -396,6 +419,9 @@ export interface RunView {
   steps?: StepView[];
   // The actions the run recorded, in order.
   actions?: RunActionView[];
+  // The plan the run holds now, oldest entry first; empty when it wrote none or
+  // cleared it.
+  plan: PlanEntry[];
   // Whether the answer was bounded; a bounded answer's actions may lack an
   // output or arguments.
   truncated?: boolean;

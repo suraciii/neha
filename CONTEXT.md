@@ -80,6 +80,14 @@ _Avoid_: turn, job, execution
 A checkpoint in a run: one Model call and the actions that call requests. A run resumes from a completed step.
 _Avoid_: iteration, cycle, phase
 
+**Plan**:
+The flat list of lines a Bot keeps for one Run, each naming a piece of the request's work. A Plan is not a Task and does not outlive its Run.
+_Avoid_: todo, task list, checklist, roadmap
+
+**Plan entry**:
+One line of a Plan: a title and a state, `pending`, `doing`, or `done`.
+_Avoid_: item, subtask
+
 **Action**:
 A Computer action: one thing a Bot does on its Computer. The record holds an action before it runs. A memory operation is not an Action.
 _Avoid_: call, command, tool call

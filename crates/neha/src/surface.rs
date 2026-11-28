@@ -25,6 +25,9 @@ pub const MEMORY_CAPABILITY: &str = "memory";
 /// The capability a caller names to receive the compaction event kind.
 pub const COMPACTION_CAPABILITY: &str = "compaction";
 
+/// The capability a caller names to receive the plan event kind.
+pub const PLAN_CAPABILITY: &str = "plan";
+
 /// Returns the capability a caller must name to read one event kind the
 /// protocol version does not already carry.
 ///
@@ -38,6 +41,7 @@ pub const fn event_capability(kind: crate::record::EventKind) -> Option<&'static
         | crate::record::EventKind::MemoryRemoved
         | crate::record::EventKind::MemoryAnswered => Some(MEMORY_CAPABILITY),
         crate::record::EventKind::ChatCompacted => Some(COMPACTION_CAPABILITY),
+        crate::record::EventKind::RunPlanned => Some(PLAN_CAPABILITY),
         _ => None,
     }
 }
@@ -764,8 +768,9 @@ pub enum ServerFrame {
 mod tests {
     use super::{
         BotComputer, BotCreate, BotUpdate, COMPACTION_CAPABILITY, ClientFrame, CommandCall,
-        MEMORY_CAPABILITY, McpSignInStart, MessageSend, ModelSpec, PROTOCOL_VERSION, ProviderAdd,
-        ProviderConnect, ProviderProtocol, ServerFrame, ThinkingLevel, event_capability,
+        MEMORY_CAPABILITY, McpSignInStart, MessageSend, ModelSpec, PLAN_CAPABILITY,
+        PROTOCOL_VERSION, ProviderAdd, ProviderConnect, ProviderProtocol, ServerFrame,
+        ThinkingLevel, event_capability,
     };
     use crate::error::ErrorCode;
     use crate::id::Id;
@@ -1429,6 +1434,10 @@ mod tests {
         assert_eq!(
             event_capability(crate::record::EventKind::ChatCompacted),
             Some(COMPACTION_CAPABILITY)
+        );
+        assert_eq!(
+            event_capability(crate::record::EventKind::RunPlanned),
+            Some(PLAN_CAPABILITY)
         );
         for kind in [
             crate::record::EventKind::MessageAdded,

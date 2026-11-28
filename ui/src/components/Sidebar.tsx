@@ -2,7 +2,16 @@ import { createMemo, createSignal, For, Show } from "solid-js";
 
 import { computerLabel } from "../computer";
 import { t } from "../i18n";
-import type { Account, AttentionEntry, Bot, Chat, ChatStatus, Computer, Preview } from "../types";
+import type {
+  Account,
+  AttentionEntry,
+  Bot,
+  Chat,
+  ChatStatus,
+  Computer,
+  PlanProgress,
+  Preview,
+} from "../types";
 import Avatar from "./Avatar";
 import Brand from "./Brand";
 import Icon from "./Icon";
@@ -22,6 +31,9 @@ interface SidebarProps {
   previews: Record<string, Preview>;
   // What each Chat is doing right now, from the Space and the record's events.
   statuses: Record<string, ChatStatus>;
+  // How many entries of each working Chat's plan are done, when the page knows
+  // the plan: the Working mark carries the count, so the row keeps one mark.
+  progress: Record<string, PlanProgress>;
   // The Chats that received a Bot Message while another Chat was on screen.
   unread: Record<string, boolean>;
   // Every approval that waits for the User, one entry per approval.
@@ -327,13 +339,22 @@ export default function Sidebar(props: SidebarProps) {
                     const bot = createMemo(() => botFor(chat));
                     const line = createMemo(() => preview(chat));
                     // One mark per Chat: waiting comes first, then working, then the
-                    // activity a User has not opened yet.
+                    // activity a User has not opened yet. A working Chat whose plan
+                    // the page knows names its done count in the same mark.
                     const mark = () => {
                       const status = props.statuses[chat.id] ?? "idle";
                       if (status === "waiting")
                         return { kind: "waiting", label: t("chat.waiting.short") };
-                      if (status === "working")
-                        return { kind: "working", label: t("chat.working") };
+                      if (status === "working") {
+                        const progress = props.progress[chat.id];
+                        const label = progress
+                          ? t("chat.working.plan", {
+                              done: progress.done,
+                              total: progress.total,
+                            })
+                          : t("chat.working");
+                        return { kind: "working", label };
+                      }
                       if (props.unread[chat.id])
                         return { kind: "new", label: t("chat.newActivity") };
                       return null;

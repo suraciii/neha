@@ -16,11 +16,12 @@ use neha::id::Id;
 use neha::memory::{MemoryKind, MemoryScope, MemorySourceKind};
 use neha::record::{
     ActionStatus, ApprovalReason, Author, CardData, ComputerSharing, Event, EventData,
-    FULL_ACCESS_CONSENT_VERSION, McpScope, McpTransport, RuleEffect, RunReply, SkillLibrary,
-    Undoability,
+    FULL_ACCESS_CONSENT_VERSION, McpScope, McpTransport, PlanEntry, PlanState, RuleEffect,
+    RunReply, SkillLibrary, Undoability,
 };
 use neha::seq::Seq;
 use neha::time::Timestamp;
+use neha_loop::tools;
 use serde::{Deserialize, Serialize};
 
 pub use neha::record::RunStatus;
@@ -340,6 +341,36 @@ pub enum ChatStatus {
     Failed,
 }
 
+/// The plan entries one recorded call asked for, when the call is the loop's
+/// plan tool and its arguments hold a valid plan.
+///
+/// A plan write is the answer to that call: a write for a refused call, or one
+/// whose list its arguments do not name, is no plan the loop could have run.
+fn requested_plan(call: &neha::record::RecordedCall) -> Option<Vec<PlanEntry>> {
+    if call.server.is_some() || call.refused.is_some() {
+        return None;
+    }
+    let arguments = serde_json::to_string(&call.arguments).ok()?;
+    match tools::parse(&call.tool, &arguments).ok()? {
+        tools::Call::Plan(plan) => Some(plan.entries),
+        _ => None,
+    }
+}
+
+/// How far one Run's plan has come.
+///
+/// The Chat list carries it for the Run a Chat works on, so a page that opens
+/// after the plan was written shows the progress its list row names without
+/// reading the Run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
+pub struct PlanProgress {
+    /// How many entries are done.
+    pub done: usize,
+    /// How many entries the plan holds.
+    pub total: usize,
+}
+
 /// A Chat.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export_to = "state.ts")]
@@ -362,6 +393,12 @@ pub struct ChatView {
     /// An idle or failed Chat follows no run.
     #[serde(default)]
     pub active_run: Option<Id>,
+    /// How far the plan of the followed run has come, when it holds one.
+    ///
+    /// A ChatView from an older Space has no plan, and the Chat list shows
+    /// only the run's state.
+    #[serde(default)]
+    pub plan: Option<PlanProgress>,
 }
 
 /// The runs one Chat follows, for the state the projection shows.
@@ -593,6 +630,10 @@ pub struct RunView {
     pub steps: Vec<StepView>,
     /// The actions, in order.
     pub actions: Vec<ActionView>,
+    /// The plan the Run holds now, oldest line first; empty when it wrote none
+    /// or cleared it.
+    #[serde(default)]
+    pub plan: Vec<PlanEntry>,
 }
 
 /// An action a run waits to run until its acting User answers.
@@ -820,6 +861,10 @@ pub struct State {
     /// The answers memory tool calls gave, by run, step, and call. A replay
     /// returns the answer instead of running the call again.
     pub memory_answers: HashMap<(Id, u32, String), String>,
+    /// The plans the record holds, by run, step, and call. A plan write is the
+    /// tool result a replay returns, so the record's list is kept beside its
+    /// answer.
+    pub plan_writes: HashMap<(Id, u32, String), Vec<PlanEntry>>,
     /// The (Bot, acting User, Computer) triples whose first Local use a User
     /// allowed. A Bot moved to another machine asks again there.
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
@@ -1036,6 +1081,18 @@ impl State {
             .map(String::as_str)
     }
 
+    /// Returns the plan one plan call recorded, when the record kept it.
+    ///
+    /// The list is keyed by the run, the step, and the call's identifier, so a
+    /// replay returns the tool result the Model read instead of running the
+    /// call again.
+    #[must_use]
+    pub fn plan_write(&self, run: Id, step: u32, call: &str) -> Option<&[PlanEntry]> {
+        self.plan_writes
+            .get(&(run, step, call.to_owned()))
+            .map(Vec::as_slice)
+    }
+
     /// Returns whether a User reads a memory entry's text.
     ///
     /// The owner reads the entries of the owner's Chats; another User reads
@@ -1247,11 +1304,27 @@ impl State {
             }
             None => (ChatStatus::Idle, None),
         };
+        // The plan belongs to the Run the Chat follows, and only a plan the
+        // Run holds now counts: an empty list is a cleared plan.
+        let plan = active_run
+            .and_then(|run| self.runs.get(&run))
+            .and_then(|run| {
+                let total = run.plan.len();
+                (total > 0).then(|| PlanProgress {
+                    done: run
+                        .plan
+                        .iter()
+                        .filter(|entry| entry.state == PlanState::Done)
+                        .count(),
+                    total,
+                })
+            });
         let Some(view) = self.chats.get_mut(&chat) else {
             return;
         };
         view.status = status;
         view.active_run = active_run;
+        view.plan = plan;
     }
 
     /// Follows a run that just began; a new run clears the Chat's failure.
@@ -1619,6 +1692,7 @@ impl Projection for State {
                         bot: data.bot,
                         status: ChatStatus::Idle,
                         active_run: None,
+                        plan: None,
                     },
                 );
                 self.chat_runs.insert(data.chat, ChatRuns::default());
@@ -1700,6 +1774,7 @@ impl Projection for State {
                         access: None,
                         steps: Vec::new(),
                         actions: Vec::new(),
+                        plan: Vec::new(),
                     },
                 );
                 self.begin_run(data.run);
@@ -1737,6 +1812,7 @@ impl Projection for State {
                             access: None,
                             steps: Vec::new(),
                             actions: Vec::new(),
+                            plan: Vec::new(),
                         });
                     }
                 }
@@ -1775,6 +1851,10 @@ impl Projection for State {
                 self.final_recovered_runs.remove(&data.run);
                 // A token lives only while its run does.
                 self.bot_tokens.retain(|_, token| token.run != data.run);
+                // A finished run never resumes, so the per-call plan lists a
+                // replay would read are dead weight: the run keeps the newest
+                // list for `run_show`.
+                self.plan_writes.retain(|(run, _, _), _| *run != data.run);
                 let run = self
                     .runs
                     .get_mut(&data.run)
@@ -2466,6 +2546,55 @@ impl Projection for State {
                     },
                 );
             }
+            EventData::RunPlanned(data) => {
+                // Every check runs before anything changes: a refused event
+                // leaves the projection exactly as it was.
+                let run = self
+                    .runs
+                    .get(&data.run)
+                    .ok_or("a plan write must belong to an existing run")?;
+                let (bot, acting, status) = (run.bot, run.acting, run.status);
+                if status != RunStatus::Running {
+                    return Err("a plan write belongs to a running run".to_owned());
+                }
+                if !matches!(event.author, Author::Bot(author) if author == bot) {
+                    return Err("a plan write is written by the run's Bot".to_owned());
+                }
+                if event.acting != Some(acting) {
+                    return Err("a plan write names the User the run acts for".to_owned());
+                }
+                // The write answers one call the recorded reply asked for,
+                // and its list is the one that call asked for: a write for a
+                // call that never asked for a plan, a refused call, or a list
+                // its arguments do not name is no plan.
+                let asked = self.replies.get(&data.run).is_some_and(|replies| {
+                    replies.iter().any(|reply| {
+                        reply.step == data.step
+                            && reply.calls.iter().any(|call| {
+                                call.call == data.call
+                                    && requested_plan(call)
+                                        .is_some_and(|entries| entries == data.entries)
+                            })
+                    })
+                });
+                if !asked {
+                    return Err("a plan write answers a recorded plan call".to_owned());
+                }
+                if self
+                    .plan_writes
+                    .contains_key(&(data.run, data.step, data.call.clone()))
+                {
+                    return Err("a plan write is recorded once".to_owned());
+                }
+                self.plan_writes
+                    .insert((data.run, data.step, data.call), data.entries.clone());
+                let Some(run) = self.runs.get_mut(&data.run) else {
+                    return Err("a plan write must belong to an existing run".to_owned());
+                };
+                run.plan = data.entries;
+                let chat = run.chat;
+                self.project_chat_view(chat);
+            }
         }
 
         Ok(())
@@ -2483,7 +2612,10 @@ mod tests {
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
-    use super::{AccessView, ChatStatus, ChatView, FULL_ACCESS_CONSENT_VERSION, RunStatus, State};
+    use super::{
+        AccessView, ChatStatus, ChatView, FULL_ACCESS_CONSENT_VERSION, PlanProgress, RunStatus,
+        State,
+    };
     use crate::store::Projection as _;
 
     fn event(kind: EventKind, author: Author, data: serde_json::Value, seq: i64) -> Event {
@@ -4176,11 +4308,22 @@ mod tests {
             bot: Id::new(),
             status: ChatStatus::Working,
             active_run: Some(run),
+            plan: Some(PlanProgress { done: 2, total: 5 }),
         };
         let value = serde_json::to_value(&view).unwrap();
         assert_eq!(value["id"], serde_json::json!(id));
         assert_eq!(value["status"], "working");
         assert_eq!(value["active_run"], serde_json::json!(run));
+        assert_eq!(value["plan"], serde_json::json!({"done": 2, "total": 5}));
+        // An old answer with no plan reads as a run that holds none.
+        let old = serde_json::json!({
+            "id": id,
+            "owner": Id::new(),
+            "bot": Id::new(),
+            "status": "working",
+            "active_run": run,
+        });
+        assert_eq!(serde_json::from_value::<ChatView>(old).unwrap().plan, None);
     }
 
     #[test]
@@ -5664,6 +5807,287 @@ mod tests {
                 ))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_plan_write_projects_and_reads_by_its_call() {
+        let (mut state, owner, bot, chat) = bot_state(1);
+        let run = Id::new();
+        for (kind, seq) in [(EventKind::RunQueued, 4), (EventKind::RunStarted, 5)] {
+            state
+                .apply(&acted_event(
+                    kind,
+                    Author::Bot(bot),
+                    owner,
+                    serde_json::json!({
+                        "run": run,
+                        "chat": chat,
+                        "bot": bot,
+                        "command": Id::new(),
+                        "message": Id::new(),
+                    }),
+                    seq,
+                ))
+                .unwrap();
+        }
+        // Each reply asks for a plan write, and keeps the list it asked for so
+        // the projection can check the write against it.
+        let reply = |step: u32, call: &str, entries: serde_json::Value, refused: Option<&str>| {
+            acted_event(
+                EventKind::RunReply,
+                Author::Bot(bot),
+                owner,
+                serde_json::json!({
+                    "run": run,
+                    "step": step,
+                    "content": null,
+                    "calls": [{
+                        "call": call,
+                        "tool": "plan",
+                        "arguments": {"entries": entries},
+                        "refused": refused,
+                    }],
+                    "usage": null,
+                }),
+                6,
+            )
+        };
+        state
+            .apply(&reply(
+                1,
+                "call-1",
+                serde_json::json!([
+                    {"title": "Read the receipts", "state": "done"},
+                    {"title": "Buy the pass", "state": "doing"},
+                ]),
+                None,
+            ))
+            .unwrap();
+        state
+            .apply(&reply(
+                2,
+                "call-2",
+                serde_json::json!([{"title": "Email finance", "state": "pending"}]),
+                None,
+            ))
+            .unwrap();
+        state
+            .apply(&reply(2, "call-5", serde_json::json!([]), None))
+            .unwrap();
+        // A server's tool may share the name; its call is no record operation.
+        let server = Id::new();
+        state
+            .apply(&acted_event(
+                EventKind::RunReply,
+                Author::Bot(bot),
+                owner,
+                serde_json::json!({
+                    "run": run,
+                    "step": 3,
+                    "content": null,
+                    "calls": [{
+                        "call": "call-3",
+                        "tool": "plan",
+                        "arguments": {"entries": []},
+                        "refused": null,
+                        "server": server,
+                        "model_name": "mcp__docs__plan",
+                    }],
+                    "usage": null,
+                }),
+                7,
+            ))
+            .unwrap();
+        // A refused call never wrote a plan, whatever its arguments name.
+        state
+            .apply(&reply(
+                4,
+                "call-6",
+                serde_json::json!([]),
+                Some("the tool is not offered"),
+            ))
+            .unwrap();
+        // A call whose reply asks for one list, so a write that names another
+        // is refused for the list alone and not for being a duplicate.
+        state
+            .apply(&reply(
+                5,
+                "call-8",
+                serde_json::json!([{"title": "Email finance", "state": "pending"}]),
+                None,
+            ))
+            .unwrap();
+
+        let plan = |step: u32, call: &str, entries: serde_json::Value| {
+            acted_event(
+                EventKind::RunPlanned,
+                Author::Bot(bot),
+                owner,
+                serde_json::json!({
+                    "run": run,
+                    "step": step,
+                    "call": call,
+                    "entries": entries,
+                }),
+                8,
+            )
+        };
+        // The first write puts the whole list on the run.
+        assert!(
+            state
+                .apply(&plan(
+                    1,
+                    "call-1",
+                    serde_json::json!([
+                        {"title": "Read the receipts", "state": "done"},
+                        {"title": "Buy the pass", "state": "doing"},
+                    ]),
+                ))
+                .is_ok()
+        );
+        let write = state.plan_write(run, 1, "call-1").expect("the call wrote");
+        assert_eq!(write.len(), 2);
+        assert_eq!(write[0].title, "Read the receipts");
+        assert_eq!(
+            state.runs.get(&run).unwrap().plan,
+            write,
+            "the run shows the plan it holds now"
+        );
+        // The Chat list carries the followed Run's progress, so a page that
+        // opens later shows it without reading the Run.
+        assert_eq!(
+            state.chats.get(&chat).unwrap().plan,
+            Some(PlanProgress { done: 1, total: 2 })
+        );
+        assert_eq!(state.plan_write(run, 1, "call-2"), None);
+
+        // A later write replaces the whole list; the earlier one still
+        // replays for its own call.
+        assert!(
+            state
+                .apply(&plan(
+                    2,
+                    "call-2",
+                    serde_json::json!([{"title": "Email finance", "state": "pending"}]),
+                ))
+                .is_ok()
+        );
+        assert_eq!(state.runs.get(&run).unwrap().plan.len(), 1);
+        assert_eq!(state.plan_write(run, 1, "call-1").unwrap().len(), 2);
+        assert_eq!(state.plan_write(run, 2, "call-2").unwrap().len(), 1);
+
+        // A write the call's arguments do not name, a write for a call owned
+        // by a server, a write for a refused call, and a write for a step
+        // whose reply never asked are all refused, and change nothing.
+        for (step, call, entries) in [
+            (
+                5,
+                "call-8",
+                serde_json::json!([{"title": "Other", "state": "done"}]),
+            ),
+            (3, "call-3", serde_json::json!([])),
+            (4, "call-6", serde_json::json!([])),
+            (6, "call-7", serde_json::json!([])),
+        ] {
+            let before = state.runs.get(&run).unwrap().plan.clone();
+            assert!(state.apply(&plan(step, call, entries)).is_err());
+            assert_eq!(state.runs.get(&run).unwrap().plan, before);
+        }
+        assert_eq!(state.plan_write(run, 2, "call-2").unwrap().len(), 1);
+        assert_eq!(state.plan_write(run, 3, "call-3"), None);
+        assert_eq!(state.plan_write(run, 4, "call-6"), None);
+        assert_eq!(
+            state.plan_write(run, 5, "call-8"),
+            None,
+            "a write that names another list than its call asked for changes nothing"
+        );
+
+        // A duplicate changes neither the replay list nor the run's plan.
+        assert!(
+            state
+                .apply(&plan(
+                    1,
+                    "call-1",
+                    serde_json::json!([
+                        {"title": "Read the receipts", "state": "done"},
+                        {"title": "Buy the pass", "state": "doing"},
+                    ]),
+                ))
+                .is_err()
+        );
+        assert_eq!(state.plan_write(run, 1, "call-1").unwrap().len(), 2);
+        assert_eq!(state.runs.get(&run).unwrap().plan.len(), 1);
+
+        // An empty list clears the plan the run shows now.
+        assert!(
+            state
+                .apply(&plan(2, "call-5", serde_json::json!([])))
+                .is_ok()
+        );
+        assert!(state.runs.get(&run).unwrap().plan.is_empty());
+        assert_eq!(state.chats.get(&chat).unwrap().plan, None);
+        assert_eq!(state.plan_write(run, 2, "call-5"), Some([].as_slice()));
+
+        // The run's Bot writes its plan, for the User the run acts for.
+        let other = Id::new();
+        let write = |author: Author, acting: Id| {
+            acted_event(
+                EventKind::RunPlanned,
+                author,
+                acting,
+                serde_json::json!({
+                    "run": run,
+                    "step": 2,
+                    "call": "call-5",
+                    "entries": [],
+                }),
+                9,
+            )
+        };
+        assert!(state.apply(&write(Author::User(owner), owner)).is_err());
+        assert!(state.apply(&write(Author::Bot(other), other)).is_err());
+        assert!(state.apply(&write(Author::Bot(bot), other)).is_err());
+
+        // A plan belongs to a run the record holds.
+        let missing = acted_event(
+            EventKind::RunPlanned,
+            Author::Bot(bot),
+            owner,
+            serde_json::json!({
+                "run": Id::new(),
+                "step": 1,
+                "call": "call-1",
+                "entries": [],
+            }),
+            10,
+        );
+        assert!(state.apply(&missing).is_err());
+
+        // A finished run takes no plan write, and its per-call replay lists
+        // are released while the run keeps the newest.
+        let finished = acted_event(
+            EventKind::RunFinished,
+            Author::Bot(bot),
+            owner,
+            serde_json::json!({"run": run, "status": "succeeded", "reply": null, "usage": null}),
+            11,
+        );
+        state.apply(&finished).unwrap();
+        assert!(
+            state
+                .apply(&plan(2, "call-5", serde_json::json!([])))
+                .is_err()
+        );
+        assert_eq!(
+            state.plan_write(run, 2, "call-5"),
+            None,
+            "a finished run releases the per-call lists"
+        );
+        assert!(
+            state.runs.get(&run).unwrap().plan.is_empty(),
+            "the run keeps the plan `run_show` reads"
+        );
+        assert_eq!(state.chats.get(&chat).unwrap().plan, None);
     }
 
     #[test]
