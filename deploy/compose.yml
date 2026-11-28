@@ -30,7 +30,7 @@ services:
         # The Space resolves `caddy` once, at start. Caddy shares only the
         # internal network with the Space, and its fixed address sits outside
         # the dynamic range, so that resolution survives a proxy-only restart.
-        ipv4_address: 172.28.128.2
+        ipv4_address: 172.28.0.200
 
   space:
     image: neha-space:dev
