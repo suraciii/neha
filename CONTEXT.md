@@ -45,7 +45,7 @@ A checkpoint in a run: one Model call and the actions that call requests. A run 
 _Avoid_: iteration, cycle, phase
 
 **Action**:
-One thing a Bot does on its Computer or with a tool. The record holds an action before it runs.
+A Computer action: one thing a Bot does on its Computer. The record holds an action before it runs. A memory operation is not an Action.
 _Avoid_: call, command, tool call
 
 **Approval**:
@@ -53,8 +53,20 @@ A request from a Bot's loop to the User it acts for, asking whether one Computer
 _Avoid_: permission, consent, confirmation (as the term)
 
 **Rule**:
-A lasting choice by a User that a kind of action always asks (Ask) or allows (Allow).
+A lasting choice by a User that a kind of action always asks (Ask) or allows (Allow). Also called an Ask rule or an Allow rule, to tell it from a memory rule.
 _Avoid_: policy, permission, setting, mode
+
+**Memory entry**:
+What a Bot keeps from a conversation: a memory rule or a note.
+_Avoid_: memory item, fact, memory
+
+**Memory rule**:
+A lasting instruction a User gave a Bot, kept in its memory; the Bot's job is one.
+_Avoid_: instruction, preference, rule
+
+**Note**:
+Data a Bot wrote for itself in its memory.
+_Avoid_: memory, fact, snippet
 
 **Vault**:
 The Space's store of passwords and keys that a Bot uses without seeing.
