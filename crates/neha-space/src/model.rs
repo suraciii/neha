@@ -217,7 +217,32 @@ impl ModelClient {
         );
         let started = std::time::Instant::now();
         let result = self.chat_inner(&request).instrument(span.clone()).await;
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let elapsed = started.elapsed();
+        let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let protocol = protocol_label(request.protocol);
+        let metrics = crate::metrics::install();
+        match &result {
+            Ok(reply) => {
+                metrics.model_call(protocol, "ok", elapsed.as_secs_f64());
+                metrics.tokens("uncached_input", reply.usage.uncached_input);
+                metrics.tokens("cache_read", reply.usage.cache_read);
+                metrics.tokens("cache_write", reply.usage.cache_write);
+                metrics.tokens("output", reply.usage.output);
+                metrics.tokens("reasoning", reply.usage.reasoning);
+            }
+            Err(error) => {
+                let kind = model_error_kind(error);
+                metrics.model_call(protocol, "failed", elapsed.as_secs_f64());
+                metrics.model_failure(kind);
+                if let Some(usage) = error.usage() {
+                    metrics.tokens("uncached_input", usage.uncached_input);
+                    metrics.tokens("cache_read", usage.cache_read);
+                    metrics.tokens("cache_write", usage.cache_write);
+                    metrics.tokens("output", usage.output);
+                    metrics.tokens("reasoning", usage.reasoning);
+                }
+            }
+        }
         span.in_scope(|| match &result {
             Ok(reply) => tracing::info!(
                 target: "neha::model",
@@ -252,6 +277,8 @@ impl ModelClient {
                     return Ok(reply);
                 }
                 Err(error) if error.retryable() && attempt + 1 < self.policy.max_attempts => {
+                    crate::metrics::install()
+                        .model_retry(protocol_label(request.protocol), model_error_kind(&error));
                     reported += error.usage().unwrap_or_default();
                     let delay = error.retry_after().unwrap_or_else(|| self.backoff(attempt));
                     tokio::time::sleep(delay.min(self.policy.max_delay)).await;
@@ -1805,6 +1832,15 @@ impl ReportedUsage {
 }
 
 /// A Model call failed.
+/// Names a Provider protocol for a metric label.
+fn protocol_label(protocol: ProviderProtocol) -> &'static str {
+    match protocol {
+        ProviderProtocol::ChatCompletions => "chat_completions",
+        ProviderProtocol::OpenAiResponses => "openai_responses",
+        ProviderProtocol::AnthropicMessages => "anthropic_messages",
+    }
+}
+
 /// Names a Model failure without its display text, which can quote a
 /// Provider body.
 fn model_error_kind(error: &ModelError) -> &'static str {

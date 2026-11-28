@@ -77,6 +77,47 @@ Computer and MCP server calls, so `grep` for the id connects the lines.
 | `run.fail` | a run could not finish |
 | `computer.connect.failed` | a Local Computer lost its channel and reconnects |
 
+## Metrics
+
+`GET /metrics` is closed by default (404). Set a token of 32 or more
+characters with no whitespace to enable it:
+
+```sh
+export NEHA_METRICS_TOKEN="$(openssl rand -hex 32)"   # 64 characters
+neha serve &                                         # listens on 127.0.0.1:7337
+curl -H "Authorization: Bearer $NEHA_METRICS_TOKEN" http://127.0.0.1:7337/metrics
+```
+
+The response is Prometheus text (`text/plain; version=0.0.4`). A missing or
+wrong token answers 401; a malformed token keeps the endpoint closed and logs
+`metrics.disabled` at start. Do not expose the endpoint without a proxy rule
+that limits who can reach it.
+
+Useful queries:
+
+```promql
+# Run failure rate over five minutes
+sum(rate(neha_runs_finished_total{status="failed"}[5m]))
+  / sum(rate(neha_runs_finished_total[5m])) > 0.2
+
+# Model retries
+sum(rate(neha_model_retries_total[5m])) > 1
+
+# Queue backlog
+max_over_time(neha_runs_queued[10m]) > 5
+
+# A Computer is offline while work waits
+neha_computers_connected < 1 and neha_runs_queued > 0
+
+# Record growth over an hour
+delta(neha_record_bytes[1h]) > 1e9
+```
+
+`GET /readyz` answers 200 `{"status":"ready"}` while the Space accepts new
+work and 503 `{"status":"shutting_down"}` once shutdown starts. It reports
+whether new work is accepted, not whether a dependency is healthy; `/healthz`
+remains the liveness check.
+
 ## A failed start
 
 A `neha serve` that fails before it serves writes one private report under the

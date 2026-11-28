@@ -96,6 +96,7 @@ credential, a path, or an unbounded identity.
 | `neha::model` | Provider Model calls |
 | `neha::mcp` | MCP server calls |
 | `neha::security` | refused requests and sign-in limits |
+| `neha::metrics` | the metrics endpoint |
 | `neha::store` | record reads, appends, and recovery |
 | `neha::blob` | File bytes storage |
 | `neha::catalog` | model catalog refresh |
@@ -137,6 +138,7 @@ identifiers that connect it to the record, and no content.
 | `security.reject` | warn | `reason` | the Host/Origin guard refused a request |
 | `security.rate_limited` | warn | `operation`, `ip` | sign-in attempts were limited |
 | `security.login_failed` | warn | `ip` | a sign-in credential was wrong |
+| `metrics.disabled` | warn | `reason` | `NEHA_METRICS_TOKEN` is too short or has whitespace |
 | `store.fail` | error or warn | `operation`, `error_message`, and `run_id` when a run owns it | a record operation fails |
 | `blob.fail` | debug | `operation`, `error_kind` | a File store operation fails; the correlated `http.failed` carries the 5xx |
 | `catalog.refresh` | warn | `outcome`, `error_kind` | a background refresh fails |
@@ -190,6 +192,35 @@ Only boundary spans are created: one per request, connection, command, run,
 Model call, action, worker operation, MCP call, or push delivery, never inside
 a loop. Access `http.request` is debug; failures are one `http.failed` error
 per 5xx response, with the span's ids attached by the JSON formatter.
+
+## Metrics
+
+`GET /metrics` serves Prometheus text (`text/plain; version=0.0.4`), never
+cached. Without `NEHA_METRICS_TOKEN` it answers 404. With a token it requires
+`Authorization: Bearer <token>`; a missing or wrong value answers 401 and a
+non-GET answers 405. A token shorter than 32 characters or containing
+whitespace disables the endpoint and records `metrics.disabled` at start.
+
+Instruments use OpenTelemetry counters, gauges, and histograms and the official
+`opentelemetry-prometheus` exporter into one registry; a scrape renders the
+registry directly, with no listener. Gauges that describe the moment
+(`neha_runs_queued`, `neha_runs_running`, `neha_runs_waiting`,
+`neha_ws_clients`, `neha_computers_connected`, `neha_record_seq`,
+`neha_record_bytes`) are recorded from the Space's state at scrape time; the
+rest are recorded where the event happens.
+
+Labels are fixed enums: `route` (the matched template or `unmatched`),
+`method` (or `OTHER`), `status_class`, `protocol`, `outcome`, `status`,
+`operation`, `component`, `error_kind`, `code`, `kind`. A run, bot, account,
+computer, message, file, tool name, URL, or raw error is never a label.
+
+Histogram boundaries are fixed in code: HTTP, Model, run, and action/MCP
+buckets. Counter names end in `_total`, time uses `_seconds`, and bytes use
+`_bytes`.
+
+`GET /readyz` is public: 200 `{"status":"ready"}` before `Running::shutdown`
+starts, then 503 `{"status":"shutting_down"}`. It reports whether the Space
+accepts new work, not the health of a dependency.
 
 ## Panics
 

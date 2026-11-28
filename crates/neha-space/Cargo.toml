@@ -40,6 +40,8 @@ toml.workspace = true
 tracing.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+opentelemetry-prometheus.workspace = true
+prometheus.workspace = true
 tracing-opentelemetry.workspace = true
 sad-web-push = { version = "0.12", default-features = false }
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }

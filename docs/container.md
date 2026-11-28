@@ -60,6 +60,7 @@ Edit `.env`:
 | `NEHA_LOG` | The JSON diagnostics level; `info` by default, `debug` for more detail |
 | `NEHA_LOG_FORMAT` | `json` by default; `text` for a person reading the container output |
 | `NEHA_ENV` | The `deployment_environment` value on each line; `production` by default |
+| `NEHA_METRICS_TOKEN` | A 32+ character token that enables `GET /metrics`; empty keeps it closed |
 
 Change `deploy/Caddyfile` if the public host is not the `NEHA_DOMAIN` value; the file uses `{$NEHA_DOMAIN:localhost}`.
 

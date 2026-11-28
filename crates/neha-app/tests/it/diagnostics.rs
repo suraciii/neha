@@ -196,6 +196,56 @@ fn run(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     }
 }
 
+/// Sends one HTTP/1.1 GET and returns the whole response text.
+fn http_get(address: &str, path: &str, token: &str) -> String {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(address).expect("connect");
+    stream.set_read_timeout(Some(WAIT)).expect("read timeout");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read");
+    response
+}
+
+#[cfg(unix)]
+#[test]
+fn metrics_export_no_environment_resource_attributes() {
+    let home = tempfile::tempdir().expect("home");
+    let token = "metrics-canary-test-token-0123456789";
+    let served = spawn_serve(
+        home.path(),
+        &[
+            ("NEHA_LOG", "off"),
+            ("NEHA_METRICS_TOKEN", token),
+            (
+                "OTEL_RESOURCE_ATTRIBUTES",
+                "private.customer=CANARY_RESOURCE",
+            ),
+        ],
+    )
+    .start();
+    let address = served
+        .stdout_lines
+        .iter()
+        .find_map(|line| line.strip_prefix("Neha is listening on http://"))
+        .expect("the listening line")
+        .to_owned();
+
+    let response = http_get(&address, "/metrics", token);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        !response.contains("CANARY_RESOURCE"),
+        "an environment resource attribute reached the scrape: {response}"
+    );
+    assert!(!response.contains("target_info"), "{response}");
+
+    let stopped = served.stop();
+    assert!(stopped.1.success());
+}
+
 #[cfg(unix)]
 #[test]
 fn serve_emits_json_start_and_stop_events_after_sigterm() {

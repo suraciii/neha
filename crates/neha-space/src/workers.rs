@@ -180,6 +180,7 @@ pub fn spawn(server: Arc<SpaceServer>, config: WorkerConfig) -> tokio::task::Joi
             }
         };
         let mut provisioned: HashSet<Id> = HashSet::new();
+        let mut running: HashSet<Id> = HashSet::new();
         let mut last_active: HashMap<Id, Instant> = HashMap::new();
         let mut stopped: HashSet<Id> = HashSet::new();
         let mut warned: HashSet<Id> = HashSet::new();
@@ -213,14 +214,19 @@ pub fn spawn(server: Arc<SpaceServer>, config: WorkerConfig) -> tokio::task::Joi
                 if config.always_on || active.contains(&computer) {
                     last_active.insert(computer, now);
                     stopped.remove(&computer);
-                    if let Err(error) = supervised(computer, "start", client.start(computer)).await
-                    {
-                        // The container may have been removed outside this
-                        // manager. Forget the provisioning so the next tick
-                        // asks the Supervisor to create it again.
-                        provisioned.remove(&computer);
-                        stopped.remove(&computer);
-                        warn_once(&mut warned, computer, &error);
+                    match supervised(computer, "start", client.start(computer)).await {
+                        Ok(()) => {
+                            running.insert(computer);
+                        }
+                        Err(error) => {
+                            // The container may have been removed outside this
+                            // manager. Forget the provisioning so the next tick
+                            // asks the Supervisor to create it again.
+                            provisioned.remove(&computer);
+                            running.remove(&computer);
+                            stopped.remove(&computer);
+                            warn_once(&mut warned, computer, &error);
+                        }
                     }
                 } else {
                     let since = *last_active.entry(computer).or_insert(now);
@@ -228,9 +234,11 @@ pub fn spawn(server: Arc<SpaceServer>, config: WorkerConfig) -> tokio::task::Joi
                         match supervised(computer, "stop", client.stop(computer)).await {
                             Ok(()) => {
                                 stopped.insert(computer);
+                                running.remove(&computer);
                             }
                             Err(error) => {
                                 provisioned.remove(&computer);
+                                running.remove(&computer);
                                 stopped.remove(&computer);
                                 warn_once(&mut warned, computer, &error);
                             }
@@ -238,6 +246,9 @@ pub fn spawn(server: Arc<SpaceServer>, config: WorkerConfig) -> tokio::task::Joi
                     }
                 }
             }
+            server
+                .workers_running
+                .store(running.len() as u64, std::sync::atomic::Ordering::Relaxed);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     })
@@ -367,6 +378,8 @@ where
         otel.kind = "client",
     );
     let result = future.instrument(span.clone()).await;
+    crate::metrics::install()
+        .worker_operation(operation, if result.is_ok() { "ok" } else { "failed" });
     span.in_scope(|| match &result {
         Ok(()) => tracing::debug!(
             target: "neha::worker",

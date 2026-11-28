@@ -11433,7 +11433,10 @@ async fn offered_tools(
                 .await;
                 match listed {
                     Ok(Ok(list)) => (server, list, credential),
-                    Ok(Err(_)) | Err(_) => (server, Vec::new(), None),
+                    Ok(Err(_)) | Err(_) => {
+                        crate::metrics::install().mcp_discovery_failure("http");
+                        (server, Vec::new(), None)
+                    }
                 }
             }
             McpTransport::Stdio => {
@@ -11461,7 +11464,10 @@ async fn offered_tools(
                 // show a Model.
                 match listed {
                     Ok(Ok(list)) => (server, list, credential),
-                    Ok(Err(_)) | Err(_) => (server, Vec::new(), None),
+                    Ok(Err(_)) | Err(_) => {
+                        crate::metrics::install().mcp_discovery_failure("stdio");
+                        (server, Vec::new(), None)
+                    }
                 }
             }
         }
@@ -11561,10 +11567,16 @@ impl ComputerRuntime for RunRuntime {
     #[allow(clippy::manual_async_fn)]
     fn execute(&self, action: Action) -> impl std::future::Future<Output = ActionResult> + Send {
         async move {
-            match self {
+            let started = std::time::Instant::now();
+            let result = match self {
                 Self::Managed(runtime) => runtime.execute(action).await,
                 Self::Remote(runtime) => runtime.execute(action).await,
-            }
+            };
+            crate::metrics::install().action(
+                &format!("{:?}", result.status).to_lowercase(),
+                started.elapsed().as_secs_f64(),
+            );
+            result
         }
     }
 

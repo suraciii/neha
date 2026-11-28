@@ -511,6 +511,10 @@ impl McpClient {
     /// server's answer does not fit the protocol, and the transport failures
     /// [`McpClient::open`] reports.
     pub async fn tools(&mut self) -> Result<Vec<McpTool>, McpError> {
+        self.tools_inner().await
+    }
+
+    async fn tools_inner(&mut self) -> Result<Vec<McpTool>, McpError> {
         self.require_open()?;
         let mut tools = Vec::new();
         let mut declared = 0_usize;
@@ -624,6 +628,7 @@ impl McpClient {
             Ok(answer) => answer,
             Err(_) => Err(unreachable_error("the server did not answer in time")),
         };
+        crate::metrics::install().mcp_call(if result.is_ok() { "ok" } else { "failed" });
         span.in_scope(|| match &result {
             Ok(_) => tracing::debug!(target: "neha::mcp", event = "mcp.call", outcome = "ok", "an MCP call answered"),
             Err(error) => tracing::warn!(target: "neha::mcp", event = "mcp.call", outcome = "failed", error_kind = mcp_error_kind(error), "an MCP call failed"),
