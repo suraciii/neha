@@ -27,7 +27,7 @@ opendal.workspace = true
 rand = "0.9"
 reqwest = { workspace = true, features = ["json", "query", "rustls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
-sha2 = "0.10"
+sha2 = "0.11"
 serde_json.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 subtle = "2"
@@ -38,7 +38,7 @@ sad-web-push = { version = "0.12", default-features = false }
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 
 [dev-dependencies]
-hkdf = "0.12"
+hkdf = "0.13"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = "0.30"

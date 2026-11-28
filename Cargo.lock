@@ -772,7 +772,7 @@ dependencies = [
  "digest 0.11.3",
  "ff",
  "group",
- "hkdf 0.13.0",
+ "hkdf",
  "hybrid-array",
  "pem-rfc7468",
  "pkcs8",
@@ -1131,29 +1131,11 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hkdf"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
-dependencies = [
- "hmac 0.12.1",
-]
-
-[[package]]
-name = "hkdf"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
 dependencies = [
- "hmac 0.13.0",
-]
-
-[[package]]
-name = "hmac"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
-dependencies = [
- "digest 0.10.7",
+ "hmac",
 ]
 
 [[package]]
@@ -1783,7 +1765,7 @@ dependencies = [
  "eventsource-stream",
  "flate2",
  "futures-util",
- "hkdf 0.12.4",
+ "hkdf",
  "neha",
  "neha-computer",
  "neha-loop",
@@ -1794,7 +1776,7 @@ dependencies = [
  "sad-web-push",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "sqlx",
  "subtle",
  "tempfile",
@@ -1964,7 +1946,7 @@ dependencies = [
  "elliptic-curve",
  "primefield",
  "primeorder",
- "sha2 0.11.2",
+ "sha2",
 ]
 
 [[package]]
@@ -2348,13 +2330,13 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "hex",
- "hmac 0.13.0",
+ "hmac",
  "http",
  "jiff 1.0.3",
  "log",
  "percent-encoding",
  "sha1 0.11.0",
- "sha2 0.11.2",
+ "sha2",
  "windows-sys 0.61.2",
 ]
 
@@ -2417,7 +2399,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
 dependencies = [
  "crypto-bigint",
- "hmac 0.13.0",
+ "hmac",
 ]
 
 [[package]]
@@ -2590,14 +2572,14 @@ dependencies = [
  "async-trait",
  "ct-codecs",
  "getrandom 0.4.3",
- "hkdf 0.13.0",
+ "hkdf",
  "http",
  "httpdate",
  "p256",
  "pem-rfc7468",
  "serde",
  "serde_json",
- "sha2 0.11.2",
+ "sha2",
  "zeroize",
 ]
 
@@ -2783,17 +2765,6 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha2"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b0e5c7d67bc53f435386b2130fdc900488c5703770f6d8a4633060e34288a27"
@@ -2933,7 +2904,7 @@ dependencies = [
  "memchr",
  "percent-encoding",
  "serde",
- "sha2 0.11.2",
+ "sha2",
  "smallvec",
  "thiserror",
  "tokio",
@@ -2970,7 +2941,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
- "sha2 0.11.2",
+ "sha2",
  "sqlx-core",
  "sqlx-sqlite",
  "syn 2.0.119",
