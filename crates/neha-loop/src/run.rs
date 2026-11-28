@@ -502,6 +502,7 @@ where
                             // is retried: the same text would be refused again.
                             if failure.context_too_large
                                 && !compacted
+                                && may_compact(context_window, max_output)
                                 && let Some(compaction) = recorder.compact(step, &messages).await?
                             {
                                 compacted = true;
@@ -517,9 +518,13 @@ where
                         }
                     }
                 };
+                // The anchor names the exact Messages the request sent: a
+                // projection that replaced old results with placeholders is
+                // fingerprinted as sent, so a later request with the original
+                // text is not mistaken for the same prefix.
                 anchor = Some(Anchor {
                     tokens: prompt_tokens(reply.usage),
-                    prefix: messages.len(),
+                    prefix: projection.messages.iter().map(fingerprinted).collect(),
                 });
                 usage += reply.usage;
                 if reply.tool_calls.is_empty() {
@@ -803,13 +808,73 @@ pub fn context_threshold(context_window: u32, max_output: u32) -> Option<u32> {
     Some(eighty_percent.min(context_window - headroom))
 }
 
-/// The Provider's own count of the last request, and the prefix it covered.
-#[derive(Clone, Copy)]
+/// Whether a run may compact at all in this window.
+///
+/// An unknown window may still be too small for the request the Provider
+/// refused, so the run makes one cut and compares the result. A known window
+/// that cannot hold its own maximum output has no input space to compact
+/// into: a Provider error then ends the run unchanged.
+fn may_compact(context_window: u32, max_output: u32) -> bool {
+    context_window == 0 || context_threshold(context_window, max_output).is_some()
+}
+
+/// The Provider's own count of the last request, and the exact prefix it sent.
+///
+/// The prefix is fingerprinted, not counted: the loop's raw Messages keep the
+/// original tool results while a request replaces the old ones with
+/// placeholders, so the same length can cover different text.
+#[derive(Clone)]
 struct Anchor {
     /// The input tokens the Provider reported for that request.
     tokens: u32,
-    /// The number of the loop's Messages that request sent the text of.
-    prefix: usize,
+    /// One fingerprint per Message that request sent, in order.
+    prefix: Vec<Fingerprint>,
+}
+
+/// One Message's identity in a request prefix: its role, size, and content.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Fingerprint {
+    role: u8,
+    chars: u64,
+    hash: u64,
+}
+
+/// Returns the identity of one Message as a request prefix entry.
+///
+/// A tool result is identified by its call identifier as well as its text, so
+/// an original result and the placeholder that replaces it never look alike.
+fn fingerprinted(message: &Message) -> Fingerprint {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let role = match message.role {
+        Role::System => 0,
+        Role::User => 1,
+        Role::Assistant => 2,
+        Role::Tool => 3,
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    message.content.hash(&mut hasher);
+    message.tool_call_id.hash(&mut hasher);
+    for call in &message.tool_calls {
+        call.id.hash(&mut hasher);
+        call.name.hash(&mut hasher);
+        call.arguments.hash(&mut hasher);
+    }
+
+    Fingerprint {
+        role,
+        chars: message_chars(message),
+        hash: hasher.finish(),
+    }
+}
+
+/// Whether one request prefix matches the fingerprinted prefix of the last one.
+fn prefix_matches(prefix: &[Fingerprint], messages: &[Message]) -> bool {
+    prefix.len() <= messages.len()
+        && prefix
+            .iter()
+            .zip(messages)
+            .all(|(fingerprint, message)| *fingerprint == fingerprinted(message))
 }
 
 /// The Messages one request sends, and the estimate that decided them.
@@ -840,11 +905,15 @@ fn project(
     max_output: u32,
 ) -> Projection {
     let mut projection = messages.to_vec();
-    let mut estimate = match anchor {
-        Some(anchor) if anchor.prefix <= messages.len() => anchor
+    // The Provider's count covers the request it saw, placeholders included.
+    // It is only reusable while the raw prefix is byte-for-byte what that
+    // request sent; otherwise the estimate starts from the current text.
+    let anchored = anchor.filter(|anchor| prefix_matches(&anchor.prefix, messages));
+    let mut estimate = match &anchored {
+        Some(anchor) => anchor
             .tokens
-            .saturating_add(tokens_of(chars_of(&messages[anchor.prefix..]))),
-        _ => estimate_tokens(&projection, tools),
+            .saturating_add(tokens_of(chars_of(&messages[anchor.prefix.len()..]))),
+        None => estimate_tokens(&projection, tools),
     };
     let Some(budget) = input_budget(context_window, max_output) else {
         return Projection {
@@ -1135,9 +1204,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Authorization, Compaction, Dispatched, LoopError, RecordedCall, Recorder, Resume,
+        Anchor, Authorization, Compaction, Dispatched, LoopError, RecordedCall, Recorder, Resume,
         RunOutcome, RunRequest, Runtime, WaitingApproval, call_id, chars_of, context_threshold,
-        estimate_tokens, message_chars, run,
+        estimate_tokens, fingerprinted, message_chars, project, run,
     };
     use crate::model::{
         Continuation, Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall,
@@ -2937,6 +3006,129 @@ mod tests {
             1,
             "the compaction threshold is smaller than the input budget"
         );
+    }
+
+    /// A tool schema small enough that the counts in the anchor probe stay
+    /// readable.
+    fn probe_tools() -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "shell".to_owned(),
+            description: "run".to_owned(),
+            parameters: json!({}),
+        }]
+    }
+
+    #[test]
+    fn an_anchor_covers_only_the_prefix_a_request_actually_sent() {
+        // The first request trims a 12,000-character tool result to a
+        // placeholder and sends about 3,026 characters. The next request holds
+        // the same raw result again, so the Provider's 36-token count covers a
+        // prefix that is not this text: the estimate must count what the next
+        // trimmed request will actually send, and the result must be trimmed
+        // again.
+        let tools = probe_tools();
+        let mut messages = vec![
+            Message::system("system"),
+            Message::user("u".repeat(3_000)),
+            Message::tool_result("call-a", "A".repeat(12_000)),
+            Message::tool_result("call-b", "B".repeat(10)),
+            Message::tool_result("call-c", "C".repeat(10)),
+            Message::tool_result("call-d", "D".repeat(10)),
+        ];
+        // A window of 6,900 tokens with a 5,000-token output leaves 1,900 for
+        // input.
+        let (window, max_output) = (6_900, 5_000);
+        let first = project(&messages, &tools, None, window, max_output);
+        assert!(
+            first.messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("call call-a"),
+            "the first request trims the old result: {:?}",
+            first.messages[2].content
+        );
+        assert!(
+            first.messages[3..].iter().all(|message| {
+                message.content.as_deref().is_some_and(|content| {
+                    !content.starts_with("[tool result removed from context")
+                })
+            }),
+            "the three newest results stay raw"
+        );
+        assert_eq!(first.estimate, estimate_tokens(&first.messages, &tools));
+        let anchor = Anchor {
+            tokens: 36,
+            prefix: first.messages.iter().map(fingerprinted).collect(),
+        };
+
+        // Four characters are appended; the raw prefix keeps the original
+        // result, which is not the placeholder the anchored request sent.
+        messages.push(Message::assistant("done"));
+        let second = project(&messages, &tools, Some(anchor), window, max_output);
+        assert!(
+            second.messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("call call-a"),
+            "the second request trims the same result again: {:?}",
+            second.messages[2].content
+        );
+        assert_eq!(
+            second.estimate,
+            estimate_tokens(&second.messages, &tools),
+            "the estimate counts the request that will be sent, not the anchor"
+        );
+        assert!(
+            second.estimate > 100,
+            "36 anchored tokens do not cover the raw result: {}",
+            second.estimate
+        );
+    }
+
+    #[test]
+    fn an_anchor_counts_only_what_a_matching_prefix_added() {
+        let tools = probe_tools();
+        let messages = vec![Message::system("sys"), Message::user("hi")];
+        let first = project(&messages, &tools, None, 0, 100);
+        let anchor = Anchor {
+            tokens: 100,
+            prefix: messages.iter().map(fingerprinted).collect(),
+        };
+        let mut next = messages;
+        next.push(Message::user("more"));
+
+        let second = project(&next, &tools, Some(anchor), 0, 100);
+
+        assert_eq!(second.estimate, 101, "the anchor covers the prefix");
+        assert_ne!(second.estimate, estimate_tokens(&second.messages, &tools));
+        assert!(first.estimate < second.estimate - 1);
+    }
+
+    #[tokio::test]
+    async fn a_too_large_failure_in_a_window_with_no_input_space_does_not_compact() {
+        // A window smaller than the Model's own output leaves no input space:
+        // a Provider error ends the run instead of trying to compact into it.
+        let model = FakeModel::with(vec![too_large()]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder {
+            compactions: VecDeque::from([Some(compaction(vec![Message::user("s")]))]),
+            ..TestRecorder::default()
+        };
+        let request = RunRequest::new("system", vec![Message::user("x".repeat(400))], 200)
+            .with_context_window(100);
+
+        let (text, _, succeeded) =
+            reply_outcome(run(&runtime, &model, &mut recorder, request).await);
+
+        assert!(!succeeded);
+        assert!(text.contains("larger than the Model's context"), "{text}");
+        assert!(
+            recorder.compacted.is_empty(),
+            "a window with no input space is not compacted"
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
