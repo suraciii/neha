@@ -871,6 +871,7 @@ impl LocalRuntime {
         match &self.mode {
             Mode::Managed => {
                 let path = self.resolve_managed(input).map_err(ByteError::Failed)?;
+                #[cfg(unix)]
                 let relative = path
                     .strip_prefix(&self.root)
                     .map_err(|_| ByteError::Failed("the path escapes the workspace".to_owned()))?;
@@ -1532,8 +1533,8 @@ impl LocalRuntime {
                 }
             }
             process
-                .env("HOME", home)
-                .env("USERPROFILE", home)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
                 .env("TMP", &temporary)
                 .env("TEMP", &temporary)
                 .env("PATH", path);
