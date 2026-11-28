@@ -81,6 +81,7 @@ const ARGUMENT_COMMAND_NAMES = [
   "computer_reset",
   "computer_revoke",
   "computer_create",
+  "device_approve",
   "computer_update",
   "bot_create",
   "bot_update",

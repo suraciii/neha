@@ -129,6 +129,11 @@ pub enum CommandCall {
         /// The Local Computer to revoke.
         computer: Id,
     },
+    /// Approves a CLI's device code as the signed-in User.
+    DeviceApprove {
+        /// The device code the CLI showed.
+        code: String,
+    },
     /// Creates a Bot with its Computer and Chat.
     BotCreate(BotCreate),
     /// Changes a Bot's file access.
@@ -890,6 +895,16 @@ mod tests {
         let command = CommandCall::ComputerReset { computer };
         let text = serde_json::to_string(&command).unwrap();
         assert!(text.contains("\"computer_reset\""));
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+    }
+
+    #[test]
+    fn a_device_approval_round_trips() {
+        let command = CommandCall::DeviceApprove {
+            code: "ABCD2345".to_owned(),
+        };
+        let text = serde_json::to_string(&command).unwrap();
+        assert!(text.contains("\"device_approve\""));
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
     }
 

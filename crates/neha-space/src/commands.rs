@@ -299,6 +299,9 @@ pub async fn execute(
         CommandCall::ComputerRevoke { computer } => {
             computer_revoke(context, account, computer).await
         }
+        CommandCall::DeviceApprove { code } => {
+            device_approve(context, account, command_id, fingerprint, code).await
+        }
         CommandCall::BotCreate(arguments) => {
             bot_create(context, account, command_id, fingerprint, arguments).await
         }
@@ -8150,6 +8153,191 @@ async fn computer_reset(
         }),
         Err(error) => Err(store_error(error)),
     }
+}
+
+/// Approves a CLI's device code and binds the CLI's token to this account.
+///
+/// The approval is one identity transaction: a code is claimed once, its
+/// token hash is inserted once, and a retry of the same command id answers the
+/// account already bound instead of approving a second device.
+async fn device_approve(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    code: String,
+) -> Result<Outcome, ApiError> {
+    // A replay answers before taking a rate-limit place: the command already
+    // succeeded once, and a later throttle must not hide its answer.
+    if let Some(record) = context
+        .store
+        .command(command_id)
+        .await
+        .map_err(store_error)?
+    {
+        if record.fingerprint != fingerprint {
+            return Err(ApiError::idempotency_conflict(format!(
+                "command {command_id} was reused with different parameters"
+            )));
+        }
+        if let Some(result) = record.result {
+            // The stored result alone does not say who asked or which code it
+            // approved; the login row does, and it must match this request.
+            if context
+                .identity
+                .device_approval_for_command(command_id, &code, account.id)
+                .await
+                .map_err(identity_error)?
+                .is_none()
+            {
+                return Err(ApiError::forbidden(
+                    "a recorded device approval belongs to another User or code",
+                ));
+            }
+            return Ok(Outcome {
+                committed: None,
+                result,
+                queued: None,
+                events: Vec::new(),
+            });
+        }
+        if let Some(bound) = context
+            .identity
+            .device_approval_for_command(command_id, &code, account.id)
+            .await
+            .map_err(identity_error)?
+        {
+            return recorded_device_approval(context, command_id, fingerprint, bound).await;
+        }
+        return Err(ApiError::conflict(
+            "a previous device approval with this command id did not finish; use a new command id",
+        ));
+    }
+    // The approval transaction can commit before the command result does. Its
+    // row already names the account, so a retry records that result instead of
+    // approving the code again.
+    if let Some(bound) = context
+        .identity
+        .device_approval_for_command(command_id, &code, account.id)
+        .await
+        .map_err(identity_error)?
+    {
+        return recorded_device_approval(context, command_id, fingerprint, bound).await;
+    }
+    if !context.pairings.lock().await.reserve(account.id) {
+        return Err(rate_limited(
+            "too many pairing attempts; wait a minute and try again",
+        ));
+    }
+    let claimed = match context.store.claim_command(command_id, &fingerprint).await {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            // No effect ran, so the attempt's place must not stay taken.
+            context.pairings.lock().await.settle(account.id, false);
+            return Err(store_error(error));
+        }
+    };
+    if let Some(record) = claimed {
+        context.pairings.lock().await.settle(account.id, false);
+        if let Some(result) = record.result {
+            if context
+                .identity
+                .device_approval_for_command(command_id, &code, account.id)
+                .await
+                .map_err(identity_error)?
+                .is_none()
+            {
+                return Err(ApiError::forbidden(
+                    "a recorded device approval belongs to another User or code",
+                ));
+            }
+            return Ok(Outcome {
+                committed: None,
+                result,
+                queued: None,
+                events: Vec::new(),
+            });
+        }
+        if let Some(bound) = context
+            .identity
+            .device_approval_for_command(command_id, &code, account.id)
+            .await
+            .map_err(identity_error)?
+        {
+            return recorded_device_approval(context, command_id, fingerprint, bound).await;
+        }
+        return Err(ApiError::conflict(
+            "a previous device approval with this command id did not finish; use a new command id",
+        ));
+    }
+    let approved = context
+        .identity
+        .approve_device_login(&code, account.id, command_id)
+        .await;
+    match approved {
+        Ok(bound) => {
+            context.pairings.lock().await.settle(account.id, false);
+            let result = json!({"account": bound});
+            context
+                .store
+                .settle_command(command_id, result.clone())
+                .await
+                .map_err(store_error)?;
+            Ok(Outcome {
+                committed: None,
+                result,
+                queued: None,
+                events: Vec::new(),
+            })
+        }
+        Err(error) => {
+            let failed = matches!(error, crate::identity::IdentityError::InvalidDeviceCode);
+            context.pairings.lock().await.settle(account.id, failed);
+            Err(match error {
+                crate::identity::IdentityError::InvalidDeviceCode => {
+                    ApiError::invalid_argument("the device code is not usable")
+                }
+                crate::identity::IdentityError::TokenTaken => {
+                    ApiError::conflict("that login token is already in use")
+                }
+                other => identity_error(other),
+            })
+        }
+    }
+}
+
+/// Records and answers a device approval that committed without a result.
+async fn recorded_device_approval(
+    context: &CommandContext<'_>,
+    command_id: Id,
+    fingerprint: String,
+    account: Account,
+) -> Result<Outcome, ApiError> {
+    let result = json!({"account": account});
+    // The row may exist with no result (the usual crash window), or it may be
+    // missing entirely when the identity transaction was the first write.
+    match context
+        .store
+        .settle_command(command_id, result.clone())
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::store::StoreError::UnclaimedCommand(_)) => {
+            context
+                .store
+                .record_command_result(command_id, fingerprint, result.clone())
+                .await
+                .map_err(store_error)?;
+        }
+        Err(error) => return Err(store_error(error)),
+    }
+
+    Ok(Outcome {
+        committed: None,
+        result,
+        queued: None,
+        events: Vec::new(),
+    })
 }
 
 /// Revokes a Local Computer's credential and disconnects its daemon.
@@ -23447,6 +23635,12 @@ pub mod test_support {
     use crate::server::ApiError;
     use crate::state::ActionView;
     use crate::store::Store;
+
+    /// Returns the fingerprint the server uses for one command, for crash
+    /// tests that claim a command before its effect.
+    pub fn command_fingerprint(call: &neha::surface::CommandCall) -> String {
+        super::fingerprint(call).expect("a command fingerprint")
+    }
 
     /// The runtime a run works on, for tests that build one by hand.
     pub struct RunRuntime(InnerRunRuntime);

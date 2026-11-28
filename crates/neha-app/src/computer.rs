@@ -1391,7 +1391,7 @@ fn normalized_space_url(url: &str) -> Result<String> {
 ///
 /// A remote Space must use https: the machine sends its pairing token and its
 /// daemon credential there, and only the system's certificate store is trusted.
-fn normalized_any_space_url(url: &str) -> Result<String> {
+pub(crate) fn normalized_any_space_url(url: &str) -> Result<String> {
     let parsed = parsed_space_origin(url)?;
     let host = parsed
         .host_str()
@@ -1444,7 +1444,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// The pairing names the Computer in the record, so the User sees the machine
 /// name rather than a generic one. The value is bounded and control-free
 /// because it reaches a terminal and the record.
-fn machine_name() -> String {
+pub(crate) fn machine_name() -> String {
     let name = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_default();
@@ -1468,7 +1468,7 @@ fn random_secret() -> String {
 }
 
 /// Shows a pairing code the way a User types it.
-fn display_pairing_code(code: &str) -> String {
+pub(crate) fn display_pairing_code(code: &str) -> String {
     let mut letters = code.chars();
     let first: String = letters.by_ref().take(4).collect();
     let rest: String = letters.collect();

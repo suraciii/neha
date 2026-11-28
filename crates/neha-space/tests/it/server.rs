@@ -9469,6 +9469,11 @@ fn machine_poll() -> String {
     URL_SAFE_NO_PAD.encode([9_u8; 32])
 }
 
+/// Returns the base64url SHA-256 digest a CLI sends at device-login start.
+fn hash_of(secret: &str) -> String {
+    URL_SAFE_NO_PAD.encode(neha_space::test_support::identity::digest(secret))
+}
+
 /// The body a fake machine sends to start pairing.
 fn pair_body(machine: &str, workspace: &str, token: &str, poll_secret: &str) -> Value {
     json!({
@@ -28742,5 +28747,213 @@ async fn a_plain_stream_error_that_is_not_too_long_ends_the_run_without_a_retry(
 
     socket.close(None).await.unwrap();
     provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_approval_recovers_only_for_its_owner_and_code() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let account = running
+        .test_fields()
+        .identity
+        .authenticate(&token)
+        .await
+        .unwrap()
+        .unwrap();
+    let started = running
+        .test_fields()
+        .identity
+        .begin_device_login(
+            "",
+            "laptop",
+            &neha_space::test_support::identity::digest(&machine_token()),
+            &neha_space::test_support::identity::digest(&machine_poll()),
+        )
+        .await
+        .unwrap();
+    let call = CommandCall::DeviceApprove {
+        code: started.code.clone(),
+    };
+    let command_id = Id::new();
+    // The production crash window: the command row is claimed, the identity
+    // transaction commits, and settlement never runs.
+    running
+        .test_fields()
+        .store
+        .claim_command(
+            command_id,
+            neha_space::test_support::commands::command_fingerprint(&call),
+        )
+        .await
+        .unwrap();
+    running
+        .test_fields()
+        .identity
+        .approve_device_login(&started.code, account.id, command_id)
+        .await
+        .unwrap();
+
+    let recovered = command(&mut socket, command_id, call.clone()).await;
+    assert_eq!(recovered["account"]["display_name"], "Ada");
+    let replay = command(&mut socket, command_id, call.clone()).await;
+    assert_eq!(replay, recovered, "the recovered result is recorded");
+
+    // A different account cannot replay that command's success.
+    running
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Grace", "correct horse battery")
+        .await
+        .unwrap();
+    let grace = sign_in(&running, "Grace").await;
+    let mut grace_socket = open_socket(&running, &grace).await;
+    let refused = try_command(&mut grace_socket, command_id, call.clone()).await;
+    assert!(
+        matches!(refused, Err((ErrorCode::Forbidden, _))),
+        "another account cannot replay the approval: {refused:?}"
+    );
+    grace_socket.close(None).await.unwrap();
+
+    // A different code under one command id is refused before it can reach
+    // the approval row.
+    let second = running
+        .test_fields()
+        .identity
+        .begin_device_login(
+            "",
+            "laptop",
+            &neha_space::test_support::identity::digest("second-token"),
+            &neha_space::test_support::identity::digest("second-poll"),
+        )
+        .await
+        .unwrap();
+    let second_id = Id::new();
+    let second_call = CommandCall::DeviceApprove {
+        code: second.code.clone(),
+    };
+    running
+        .test_fields()
+        .store
+        .claim_command(
+            second_id,
+            neha_space::test_support::commands::command_fingerprint(&second_call),
+        )
+        .await
+        .unwrap();
+    running
+        .test_fields()
+        .identity
+        .approve_device_login(&second.code, account.id, second_id)
+        .await
+        .unwrap();
+    let refused = try_command(
+        &mut socket,
+        second_id,
+        CommandCall::DeviceApprove {
+            code: "ZZZZ-ZZZZ".to_owned(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::IdempotencyConflict, _))),
+        "a different code is a different command: {refused:?}"
+    );
+
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cli_device_login_is_approved_once_and_answers_its_polls() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let client = reqwest::Client::new();
+
+    let started: serde_json::Value = client
+        .post(format!("{}/api/devices/login", running.url()))
+        .json(&json!({
+            "client": "laptop",
+            "token_hash": hash_of(&machine_token()),
+            "poll_hash": hash_of(&machine_poll()),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let device = started["device"].as_str().unwrap().to_owned();
+    let code = started["code"].as_str().unwrap().to_owned();
+    assert_eq!(started["expires_in"], 900);
+    assert_eq!(started["interval"], 2);
+
+    let pending: serde_json::Value = client
+        .post(format!("{}/api/devices/login/{device}", running.url()))
+        .json(&json!({"secret": machine_poll()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending["state"], "pending");
+
+    // A wrong code is refused with the same invalid-code answer, and does not
+    // consume this command's future approval.
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::DeviceApprove {
+            code: "ZZZZ-ZZZZ".to_owned(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+        "a wrong code is invalid: {refused:?}"
+    );
+
+    let command_id = Id::new();
+    let approved = command(
+        &mut socket,
+        command_id,
+        CommandCall::DeviceApprove { code: code.clone() },
+    )
+    .await;
+    assert_eq!(approved["account"]["display_name"], "Ada");
+    let replay = command(&mut socket, command_id, CommandCall::DeviceApprove { code }).await;
+    assert_eq!(replay, approved, "the command id replays its answer");
+
+    let answered: serde_json::Value = client
+        .post(format!("{}/api/devices/login/{device}", running.url()))
+        .json(&json!({"secret": machine_poll()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(answered["state"], "approved");
+    assert_eq!(answered["account"]["display_name"], "Ada");
+
+    // The CLI's own token is now an ordinary session token.
+    let mut cli = open_socket(&running, &machine_token()).await;
+    cli.close(None).await.unwrap();
+
+    // The code cannot approve a second device.
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::DeviceApprove {
+            code: "ZZZZ-ZZZZ".to_owned(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+        "a used or unknown code is invalid: {refused:?}"
+    );
+
+    socket.close(None).await.unwrap();
     running.shutdown().await;
 }

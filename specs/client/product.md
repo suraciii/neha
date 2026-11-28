@@ -205,6 +205,8 @@ The Admin sets the Space's default Model in the settings. [Model](../model/produ
 
 A Space with no Provider shows that empty state with the action that connects one. Each Provider's Models list shows its own empty state when it offers none.
 
+The Devices section accepts the code a terminal shows after `neha login --device-code`. The User confirms that the terminal acts as their account, and the section says the sign-in succeeded. [Identity](../identity/product.md#devices) covers the code.
+
 ## Computers
 
 The settings list every Computer the User owns, Local and Hosted, with its name, kind, sharing, and whether it is online. Each Computer says what a Bot's shell runs as on it, and one that has not answered the Space yet says it waits. [Computer](../computer/product.md) owns what a Computer is.
@@ -212,6 +214,8 @@ The settings list every Computer the User owns, Local and Hosted, with its name,
 The owner creates a Hosted Computer from that list, choosing a name and whether it is shared or exclusive. The owner makes an exclusive Computer shared there.
 
 The owner resets a Hosted Computer from that list. The reset asks for confirmation and names what it deletes. [Computer](../computer/product.md#keeping-files) covers the reset.
+
+The owner revokes a Local Computer from that list. The revocation asks for confirmation, disconnects the machine, and leaves the Computer listed offline until it pairs again. [Computer](../computer/product.md#revoking-a-local-computer) covers revocation.
 
 A Bot moves on its own page, between the Computers its owner owns.
 

@@ -468,6 +468,7 @@ export const space = {
   creates: [] as { name: string; computer?: string }[],
   resets: [] as string[],
   revoked: [] as string[],
+  deviceApprovals: [] as string[],
   // The Hosted Computers the Space was asked to create, and the sharing
   // changes it was asked to make.
   computerCreates: [] as { name: string; sharing: Computer["sharing"] }[],
@@ -584,6 +585,7 @@ export const space = {
     madeBots = 0;
     space.resets = [];
     space.revoked = [];
+    space.deviceApprovals = [];
     space.computerCreates = [];
     space.computerUpdates = [];
     space.ruleAdds = [];
@@ -1046,6 +1048,11 @@ export class FakeCommands {
         const asked = args as { computer: string };
         space.resets.push(asked.computer);
         return { computer: asked.computer } as T;
+      }
+      case "device_approve": {
+        const asked = args as { code: string };
+        space.deviceApprovals.push(asked.code);
+        return { account: { id: "a1", display_name: "Ada", is_admin: true } } as T;
       }
       case "computer_revoke": {
         const asked = args as { computer: string };

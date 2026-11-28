@@ -56,15 +56,24 @@ enum Top {
     },
     /// Sign in to a Space you already joined.
     Login {
-        /// Your display name in the Space.
+        /// Your display name in the Space; required for password sign-in.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
         /// The Space URL; defaults to the saved one.
         #[arg(long)]
         server: Option<String>,
+        /// Sign in from a terminal without a password, by approving a code on
+        /// a client that is already signed in.
+        #[arg(long)]
+        device_code: bool,
     },
     /// Show the account and Space this CLI uses.
     Whoami,
+    /// Approve a CLI's device code from this signed-in client.
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
     /// Connect or list Providers.
     Provider {
         #[command(subcommand)]
@@ -451,6 +460,16 @@ enum ChatCommand {
 }
 
 #[derive(Subcommand)]
+enum DeviceCommand {
+    /// Approve a CLI waiting to sign in.
+    Approve {
+        /// The code the CLI showed; omit it to type the code without leaving
+        /// it in shell history.
+        code: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum FileCommand {
     /// Download a File.
     Get {
@@ -729,8 +748,13 @@ pub async fn run() -> Result<()> {
     match Cli::parse().command {
         Top::Serve { port, ui, domain } => serve(port, ui, domain).await,
         Top::Join { link, name } => join(&link, &name).await,
-        Top::Login { name, server } => login(&name, server).await,
+        Top::Login {
+            name,
+            server,
+            device_code,
+        } => login(name, server, device_code).await,
         Top::Whoami => whoami(),
+        Top::Device { command } => device_command(command).await,
         Top::Provider { command } => provider(command).await,
         Top::Catalog { command } => catalog(command).await,
         Top::Model { command } => model(command).await,
@@ -852,17 +876,24 @@ async fn join(link: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn login(name: &str, server: Option<String>) -> Result<()> {
+async fn login(name: Option<String>, server: Option<String>, device_code: bool) -> Result<()> {
     let server = match server {
-        Some(server) => server,
+        Some(server) => computer::normalized_any_space_url(&server)?,
         None => {
-            Credential::load()
-                .context("pass --server when this machine has no saved Space")?
-                .url
+            let saved =
+                Credential::load().context("pass --server when this machine has no saved Space")?;
+            computer::normalized_any_space_url(&saved.url)?
         }
     };
+    if device_code {
+        if name.is_some() {
+            bail!("--name signs in with a password; leave it out with --device-code");
+        }
+        return login_with_device_code(server).await;
+    }
+    let name = name.context("pass --name (or --device-code) to sign in")?;
     let password = read_password()?;
-    let credential = client::login(&server, name, &password).await?;
+    let credential = client::login(&server, &name, &password).await?;
     credential.save()?;
     println!(
         "Signed in to {} as {}.",
@@ -870,6 +901,103 @@ async fn login(name: &str, server: Option<String>) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Signs in from a terminal that has no password prompt, through a code.
+///
+/// The token is kept only after a User approves the code and the Space accepts
+/// it for an authenticated command. A failed or cancelled login leaves any
+/// saved credential untouched.
+async fn login_with_device_code(server: String) -> Result<()> {
+    let token = client::random_secret();
+    let poll_secret = client::random_secret();
+    let started =
+        client::start_device_login(&server, &computer::machine_name(), &token, &poll_secret)
+            .await
+            .context("the device login could not start")?;
+    let minutes = (started.expires_in / 60).max(1);
+    println!(
+        "To sign in, open {server} and enter code {} under Settings, Devices (expires in {minutes} minutes).",
+        computer::display_pairing_code(&started.code)
+    );
+    println!("Waiting for approval...");
+
+    let account =
+        wait_for_device_approval(&server, &started.device, &poll_secret, &started).await?;
+    let credential = Credential {
+        url: server,
+        token,
+        account,
+    };
+    // The poll says a User approved this token; one authenticated command says
+    // the Space accepts it. Only then replace the saved credential.
+    client::command(&credential, CommandCall::ComputerList)
+        .await
+        .context("the approved session cannot reach the Space")?;
+    credential.save()?;
+    println!(
+        "Signed in to {} as {}.",
+        credential.url, credential.account.display_name
+    );
+
+    Ok(())
+}
+
+/// Waits for a User to approve one device login.
+///
+/// A transient poll failure backs off rather than failing the terminal: a
+/// connection reset after approval must not leave an approved session unsaved.
+/// Every request and sleep shares the code's one deadline.
+async fn wait_for_device_approval(
+    server: &str,
+    device: &str,
+    poll_secret: &str,
+    started: &client::StartedDeviceLogin,
+) -> Result<client::SignedIn> {
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(started.expires_in))
+        .context("the Space announced an unusable device-login lifetime")?;
+    let interval = Duration::from_secs(started.interval);
+    let mut retry = Duration::from_secs(1);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "the device code expired before a User approved it; run \
+                 `neha login --server {server} --device-code` again"
+            );
+        }
+        let outcome = tokio::time::timeout(
+            remaining.min(Duration::from_secs(30)),
+            client::poll_device_login(server, device, poll_secret),
+        )
+        .await;
+        let wait = match outcome {
+            Ok(Ok(client::DeviceLoginPoll::Pending)) => interval,
+            Ok(Ok(client::DeviceLoginPoll::Approved { account })) => return Ok(account),
+            Ok(Ok(client::DeviceLoginPoll::Gone)) => bail!(
+                "the device code expired or was replaced before a User approved it; run \
+                 `neha login --server {server} --device-code` again"
+            ),
+            Ok(Err(error)) => {
+                eprintln!("warning: a device-login poll failed; retrying: {error:#}");
+                let wait = retry;
+                retry = (retry * 2).min(Duration::from_secs(30));
+                wait
+            }
+            Err(_) => {
+                eprintln!("warning: a device-login poll timed out; retrying");
+                let wait = retry;
+                retry = (retry * 2).min(Duration::from_secs(30));
+                wait
+            }
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            continue;
+        }
+        tokio::time::sleep(wait.min(remaining)).await;
+    }
 }
 
 fn whoami() -> Result<()> {
@@ -885,6 +1013,43 @@ fn whoami() -> Result<()> {
             "no"
         }
     );
+
+    Ok(())
+}
+
+async fn device_command(command: DeviceCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        DeviceCommand::Approve { code } => {
+            let code = match code {
+                Some(code) => code,
+                None => {
+                    print!("Enter the code the CLI showed: ");
+                    std::io::stdout()
+                        .flush()
+                        .context("cannot write the prompt")?;
+                    let mut line = String::new();
+                    std::io::stdin()
+                        .lock()
+                        .read_line(&mut line)
+                        .context("cannot read the code")?;
+                    line.trim().to_owned()
+                }
+            };
+            println!(
+                "This approves a terminal to act as {} on {}.",
+                credential.account.display_name, credential.url
+            );
+            println!(
+                "Only approve a terminal you just started. Its session lasts until it signs out; closing the terminal does not end it, and this milestone has no device list to remove it."
+            );
+            let result = client::command(&credential, CommandCall::DeviceApprove { code }).await?;
+            let account = result["account"]["display_name"]
+                .as_str()
+                .unwrap_or(&credential.account.display_name);
+            println!("Approved a sign-in for {} on {}.", account, credential.url);
+        }
+    }
 
     Ok(())
 }

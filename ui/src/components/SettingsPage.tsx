@@ -54,6 +54,8 @@ interface SettingsPageProps {
   onAdd: (code: string) => Promise<boolean>;
   // Revokes a Local Computer's credential and disconnects its daemon.
   onRevoke: (computer: string) => Promise<boolean>;
+  // Approves a CLI's device code, signing that terminal in as this account.
+  onApproveDevice: (code: string) => Promise<boolean>;
   // Opens one Bot's page from a Computer that has Bots on it.
   onOpenBot: (bot: Bot) => void;
   onConnect: (input: {
@@ -207,6 +209,15 @@ export default function SettingsPage(props: SettingsPageProps) {
     if (await props.onCatalog()) setNote(t("settings.catalog.updated"));
   }
 
+  async function approveDevice() {
+    if (props.busy || deviceCode().trim() === "") return;
+    setNote(null);
+    if (await props.onApproveDevice(deviceCode().trim())) {
+      setDeviceCode("");
+      setNote(t("settings.devices.approved"));
+    }
+  }
+
   const title = () =>
     props.section === "providers"
       ? t("sidebar.settings.providers")
@@ -214,7 +225,9 @@ export default function SettingsPage(props: SettingsPageProps) {
         ? t("sidebar.settings.models")
         : props.section === "computers"
           ? t("sidebar.settings.computers")
-          : t("sidebar.settings.catalog");
+          : props.section === "devices"
+            ? t("sidebar.settings.devices")
+            : t("sidebar.settings.catalog");
 
   // The Bots that work on one Computer, and what each of them may write. A
   // Local Computer's access belongs to its Bots, so this is where the summary
@@ -252,6 +265,8 @@ export default function SettingsPage(props: SettingsPageProps) {
   const [pairingCode, setPairingCode] = createSignal("");
   // Revoking access disconnects a machine, so it asks twice.
   const [armedRevoke, setArmedRevoke] = createSignal<string | null>(null);
+  // The code a terminal without a session shows.
+  const [deviceCode, setDeviceCode] = createSignal("");
 
   async function createComputer() {
     const name = computerName().trim();
@@ -812,6 +827,53 @@ export default function SettingsPage(props: SettingsPageProps) {
                     <Icon name="arrow-right" size="sm" />
                   </button>
                 </div>
+              </form>
+            </div>
+          </section>
+        </Show>
+
+        <Show when={props.section === "devices"}>
+          <section class="panel">
+            <div class="panel__head">
+              <div>
+                <h2>{t("sidebar.settings.devices")}</h2>
+              </div>
+            </div>
+            <div class="panel__body">
+              <p class="panel__note">{t("settings.devices.hint")}</p>
+              <form
+                class="panel__form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void approveDevice();
+                }}
+              >
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field__label">{t("settings.devices.code")}</span>
+                    <input
+                      class="input mono"
+                      name="device_code"
+                      autocomplete="off"
+                      spellcheck={false}
+                      maxlength={16}
+                      placeholder={t("settings.devices.placeholder")}
+                      value={deviceCode()}
+                      onInput={(event) => setDeviceCode(event.currentTarget.value)}
+                    />
+                  </label>
+                </div>
+                <div class="panel__foot panel__foot--end">
+                  <button
+                    class="btn btn--primary"
+                    type="submit"
+                    disabled={props.busy || deviceCode().trim() === ""}
+                  >
+                    {props.busy ? t("settings.devices.approving") : t("settings.devices.action")}
+                    <Icon name="arrow-right" size="sm" />
+                  </button>
+                </div>
+                <span class="field__hint">{t("settings.devices.warning")}</span>
               </form>
             </div>
           </section>

@@ -13,6 +13,7 @@ use neha::id::Id;
 use neha::surface::{ClientFrame, CommandCall, FileSummary, PROTOCOL_VERSION, ServerFrame};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -235,6 +236,33 @@ async fn accepted(response: reqwest::Response) -> Result<reqwest::Response> {
     bail!("the Space refused ({code}): {message}");
 }
 
+/// The device login a Space gives a CLI without a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartedDeviceLogin {
+    /// The device identifier the CLI polls with.
+    pub device: String,
+    /// The code a signed-in User enters.
+    pub code: String,
+    /// How long the code stays valid.
+    pub expires_in: u64,
+    /// How often the CLI should poll.
+    pub interval: u64,
+}
+
+/// What a device-login poll answers.
+#[derive(Clone, Debug)]
+pub enum DeviceLoginPoll {
+    /// No User approved the CLI yet.
+    Pending,
+    /// A User approved the CLI; its own token is now a session.
+    Approved {
+        /// The account that approved the terminal.
+        account: SignedIn,
+    },
+    /// The Space no longer knows the login: it expired or was replaced.
+    Gone,
+}
+
 /// The pairing a Space gives a Local Computer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairedComputer {
@@ -385,6 +413,87 @@ pub async fn poll_pairing(space_url: &str, device: &str, poll_secret: &str) -> R
             computer: pairing_computer(&text_field(&body, "computer")?)?,
         }),
         other => bail!("the Space answered a pairing poll with {other:?}"),
+    }
+}
+
+/// Returns the base64url SHA-256 digest of a secret sent at device-login start.
+fn secret_hash(secret: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()))
+}
+
+/// Returns a fresh 32-byte URL-safe base64 secret.
+pub(crate) fn random_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Starts a CLI device login and returns the code to show the User.
+pub async fn start_device_login(
+    space_url: &str,
+    client: &str,
+    token: &str,
+    poll_secret: &str,
+) -> Result<StartedDeviceLogin> {
+    let response = remote_pairing_client()?
+        .post(format!(
+            "{}/api/devices/login",
+            space_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "client": client,
+            "token_hash": secret_hash(token),
+            "poll_hash": secret_hash(poll_secret),
+        }))
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+    let expires_in = body["expires_in"].as_u64().unwrap_or(900).clamp(1, 3600);
+    let interval = body["interval"].as_u64().unwrap_or(2).clamp(1, 60);
+
+    Ok(StartedDeviceLogin {
+        device: pairing_device(&text_field(&body, "device")?)?,
+        code: pairing_code(&text_field(&body, "code")?)?,
+        expires_in,
+        interval,
+    })
+}
+
+/// Polls one CLI device login. A 404 means the login expired or was replaced.
+pub async fn poll_device_login(
+    space_url: &str,
+    device: &str,
+    poll_secret: &str,
+) -> Result<DeviceLoginPoll> {
+    let response = remote_pairing_client()?
+        .post(format!(
+            "{}/api/devices/login/{device}",
+            space_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({"secret": poll_secret}))
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(DeviceLoginPoll::Gone);
+    }
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+    match body["state"].as_str() {
+        Some("pending") => Ok(DeviceLoginPoll::Pending),
+        Some("approved") => Ok(DeviceLoginPoll::Approved {
+            account: serde_json::from_value(body["account"].clone())
+                .context("the approved account does not fit")?,
+        }),
+        other => bail!("the Space answered a device-login poll with {other:?}"),
     }
 }
 
@@ -981,6 +1090,67 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::BotSession;
+
+    #[tokio::test]
+    async fn a_device_login_start_sends_digests_not_the_secrets() {
+        use std::sync::{Arc, Mutex};
+
+        use axum::extract::Json as AxumJson;
+        use axum::routing::post;
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let handler = {
+            let captured = Arc::clone(&captured);
+            move |AxumJson(body): AxumJson<serde_json::Value>| {
+                *captured.lock().expect("the captured body") = Some(body);
+                async {
+                    AxumJson(serde_json::json!({
+                        "device": URL_SAFE_NO_PAD.encode([1_u8; 16]),
+                        "code": "ABCD2345",
+                        "expires_in": 900,
+                        "interval": 2,
+                    }))
+                }
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/api/devices/login", post(handler)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let started = super::start_device_login(
+            &format!("http://{address}"),
+            "laptop",
+            "cli-token",
+            "poll-secret",
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(started.code, "ABCD2345");
+        let body = captured
+            .lock()
+            .expect("the captured body")
+            .clone()
+            .expect("the start body");
+        assert_eq!(body["token_hash"], super::secret_hash("cli-token"));
+        assert_eq!(body["poll_hash"], super::secret_hash("poll-secret"));
+        assert!(
+            body.get("token").is_none(),
+            "the bearer never leaves the terminal"
+        );
+        assert!(body.get("poll_secret").is_none());
+        assert_ne!(body["token_hash"], "cli-token");
+    }
 
     #[test]
     fn a_bot_request_names_the_public_host_when_the_deployment_gives_one() {

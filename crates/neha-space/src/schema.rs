@@ -8,7 +8,7 @@ use sqlx::{Connection, SqliteConnection};
 use thiserror::Error;
 
 /// The schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The statements that create the tables of schema version 1.
 ///
@@ -92,6 +92,25 @@ const VERSION_SEVEN_STATEMENTS: [&str; 2] = [
      ON computer_codes(code_hash) WHERE owner IS NULL",
 ];
 
+/// The statements schema version 8 adds.
+///
+/// A CLI signs in from a machine without a session: it starts a device login,
+/// shows a code, and a signed-in User approves it. The token is stored only by
+/// hash, and the approving command is kept so a retry can answer the same
+/// account without claiming a second row.
+const VERSION_EIGHT_STATEMENTS: [&str; 3] = [
+    "CREATE TABLE IF NOT EXISTS device_logins (\
+        device_id TEXT PRIMARY KEY, code_hash BLOB NOT NULL, \
+        poll_hash BLOB NOT NULL, token_hash BLOB NOT NULL, \
+        client TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', \
+        created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, \
+        tries INTEGER NOT NULL, owner TEXT, command TEXT)",
+    "CREATE UNIQUE INDEX device_logins_unclaimed_code \
+     ON device_logins(code_hash) WHERE owner IS NULL",
+    "CREATE UNIQUE INDEX device_logins_command ON device_logins(command) \
+     WHERE command IS NOT NULL",
+];
+
 /// Creates or upgrades the Space database.
 pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaError> {
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
@@ -131,6 +150,9 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SEVEN_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         1 => {
             // A version 1 database has the record and the account tables;
@@ -153,6 +175,9 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SEVEN_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         2 => {
             // Version 2 paired Computers: their token rows were final, which
@@ -172,6 +197,9 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SEVEN_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         3 => {
             // Version 3 pairings are final tokens; local tickets are new and
@@ -188,6 +216,9 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SEVEN_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         4 => {
             // Version 4 has every table but the continuation cache.
@@ -200,6 +231,9 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SEVEN_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         5 => {
             // Version 5 has every table; version 6 adds record vocabulary.
@@ -209,10 +243,22 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SEVEN_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         6 => {
             // Version 6 has every table; version 7 adds pairing bookkeeping.
             for statement in VERSION_SEVEN_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+        }
+        7 => {
+            // Version 7 has every table; version 8 adds device logins.
+            for statement in VERSION_EIGHT_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
         }
@@ -252,14 +298,14 @@ pub enum SchemaError {
 #[cfg(test)]
 mod tests {
     use super::{
-        SCHEMA_VERSION, SchemaError, VERSION_FIVE_STATEMENTS, VERSION_FOUR_STATEMENTS,
-        VERSION_ONE_STATEMENTS, VERSION_SEVEN_STATEMENTS, VERSION_SIX_STATEMENTS,
-        VERSION_THREE_STATEMENTS, VERSION_TWO_STATEMENTS, migrate,
+        SCHEMA_VERSION, SchemaError, VERSION_EIGHT_STATEMENTS, VERSION_FIVE_STATEMENTS,
+        VERSION_FOUR_STATEMENTS, VERSION_ONE_STATEMENTS, VERSION_SEVEN_STATEMENTS,
+        VERSION_SIX_STATEMENTS, VERSION_THREE_STATEMENTS, VERSION_TWO_STATEMENTS, migrate,
     };
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{Connection, SqliteConnection};
 
-    const TABLES: [&str; 9] = [
+    const TABLES: [&str; 10] = [
         "meta",
         "events",
         "commands",
@@ -269,6 +315,7 @@ mod tests {
         "computer_tokens",
         "computer_tickets",
         "run_continuations",
+        "device_logins",
     ];
 
     async fn connection() -> SqliteConnection {
@@ -320,6 +367,22 @@ mod tests {
                 .unwrap();
         }
         sqlx::query("PRAGMA user_version = 3")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+
+        connection
+    }
+
+    async fn connection_at_version_seven() -> SqliteConnection {
+        let mut connection = connection_at_version_six().await;
+        for statement in VERSION_SEVEN_STATEMENTS {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 7")
             .execute(&mut connection)
             .await
             .unwrap();
@@ -573,6 +636,35 @@ mod tests {
         .await;
         assert!(duplicate.is_err(), "a waiting code hash must be unique");
         assert!(!VERSION_SEVEN_STATEMENTS.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_version_seven_database_with_device_logins() {
+        let mut connection = connection_at_version_seven().await;
+
+        migrate(&mut connection).await.unwrap();
+
+        assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
+        assert!(table_exists(&mut connection, "device_logins").await);
+        sqlx::query(
+            "INSERT INTO device_logins (\
+             device_id, code_hash, poll_hash, token_hash, client, \
+             created_at, expires_at, tries) \
+             VALUES ('device', x'01', x'02', x'03', 'laptop', 0, 1000, 0)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        let duplicate = sqlx::query(
+            "INSERT INTO device_logins (\
+             device_id, code_hash, poll_hash, token_hash, client, \
+             created_at, expires_at, tries) \
+             VALUES ('other', x'01', x'04', x'05', 'desktop', 0, 1000, 0)",
+        )
+        .execute(&mut connection)
+        .await;
+        assert!(duplicate.is_err(), "a waiting device code is unique");
+        assert!(!VERSION_EIGHT_STATEMENTS.is_empty());
     }
 
     #[tokio::test]

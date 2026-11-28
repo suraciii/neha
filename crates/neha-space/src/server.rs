@@ -541,6 +541,8 @@ impl SpaceServer {
             .route("/api/computer/pair", post(computer_pair))
             .route("/api/computers/pair", post(computer_pair_start))
             .route("/api/computers/pair/{device}", post(computer_pair_poll))
+            .route("/api/devices/login", post(device_login_start))
+            .route("/api/devices/login/{device}", post(device_login_poll))
             .route(
                 "/api/chats/{chat}/files",
                 post(file_upload).layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize)),
@@ -2838,6 +2840,14 @@ fn is_pairing_secret(value: &str) -> bool {
             .is_ok_and(|bytes| bytes.len() == 32)
 }
 
+/// Decodes one base64url SHA-256 digest a CLI sent at device-login start.
+fn pairing_hash(value: &str) -> Option<Vec<u8>> {
+    if !is_pairing_secret(value) {
+        return None;
+    }
+    URL_SAFE_NO_PAD.decode(value).ok()
+}
+
 /// Returns the canonical origin a Computer says it reaches, or `None` when
 /// the value is not an origin with no credentials or path.
 fn computer_origin(value: &str) -> Option<String> {
@@ -2975,6 +2985,131 @@ async fn computer_pair_poll(
             Ok(Json(PairingReply::Approved { computer }))
         }
         None => Err(ApiError::not_found("no such pairing")),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeviceLoginStartRequest {
+    client: String,
+    /// The CLI token's SHA-256 digest, base64url encoded.
+    token_hash: String,
+    /// The polling secret's SHA-256 digest, base64url encoded.
+    poll_hash: String,
+}
+
+/// Starts a CLI device login.
+///
+/// The CLI generated its token and polling secret and keeps them; the Space
+/// stores only their digests and answers with the device identifier it polls
+/// by and the code a signed-in User enters.
+async fn device_login_start(
+    State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceLoginStartRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    let client = request.client.trim();
+    if !is_pairing_text(client) {
+        return Err(ApiError::invalid_argument(
+            "the client name is not usable: it must be at most 256 bytes and carry no control characters",
+        ));
+    }
+    let Some(token_hash) = pairing_hash(&request.token_hash) else {
+        return Err(ApiError::invalid_argument(
+            "token_hash must be the base64url SHA-256 digest of the CLI token",
+        ));
+    };
+    let Some(poll_hash) = pairing_hash(&request.poll_hash) else {
+        return Err(ApiError::invalid_argument(
+            "poll_hash must be the base64url SHA-256 digest of the polling secret",
+        ));
+    };
+    if !server.pairs.lock().expect("pair lock").allows(source) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many pairing starts; wait a minute",
+        ));
+    }
+    let _permit = server
+        .pair_work
+        .try_acquire()
+        .map_err(|_| ApiError::unavailable("the Space is busy with pairing; try again"))?;
+    let start = server
+        .identity
+        .begin_device_login(&source.to_string(), client, &token_hash, &poll_hash)
+        .await
+        .map_err(identity_error)?;
+
+    Ok(Json(serde_json::json!({
+        "device": start.device,
+        "code": start.code,
+        "expires_in": crate::identity::PAIRING_TTL_SECS,
+        "interval": crate::identity::PAIRING_POLL_SECS,
+    })))
+}
+
+#[derive(Deserialize)]
+struct DeviceLoginPollRequest {
+    secret: String,
+}
+
+/// What a CLI learns when it polls its device login.
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum DeviceLoginReply {
+    /// No User approved this CLI yet.
+    Pending,
+    /// A User approved it; the CLI's own token is now a session.
+    Approved {
+        /// The account that approved the terminal.
+        account: crate::identity::Account,
+    },
+}
+
+/// Answers a CLI's device-login poll.
+///
+/// The poll is a POST: the polling secret is a secret, and a request line ends
+/// up in proxy logs and browser history. A poll never changes the login.
+async fn device_login_poll(
+    State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    PathParams(device): PathParams<String>,
+    Json(request): Json<DeviceLoginPollRequest>,
+) -> Result<Json<DeviceLoginReply>, ApiError> {
+    if !is_pairing_device(&device) || !is_pairing_secret(&request.secret) {
+        return Err(ApiError::not_found("no such device login"));
+    }
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    if !server
+        .device_polls
+        .lock()
+        .expect("device polls lock")
+        .allows_poll(source)
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many device-login polls; slow down",
+        ));
+    }
+    let _permit = server
+        .pair_work
+        .try_acquire()
+        .map_err(|_| ApiError::unavailable("the Space is busy with pairing; try again"))?;
+    match server
+        .identity
+        .device_login(&device, &request.secret)
+        .await
+        .map_err(identity_error)?
+    {
+        Some(crate::identity::DeviceLoginState::Pending) => Ok(Json(DeviceLoginReply::Pending)),
+        Some(crate::identity::DeviceLoginState::Approved { account }) => {
+            Ok(Json(DeviceLoginReply::Approved { account }))
+        }
+        None => Err(ApiError::not_found("no such device login")),
     }
 }
 
@@ -4331,6 +4466,9 @@ pub(crate) fn identity_error(error: IdentityError) -> ApiError {
             ErrorCode::Unauthorized,
             "invalid credentials",
         ),
+        IdentityError::InvalidDeviceCode => {
+            ApiError::invalid_argument("the device code is not usable")
+        }
         IdentityError::TooManyPending => ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::RateLimited,

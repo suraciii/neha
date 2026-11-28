@@ -148,7 +148,11 @@ computer: string, } } | { "name": "computer_revoke", "args": {
 /**
  * The Local Computer to revoke.
  */
-computer: string, } } | { "name": "bot_create", "args": BotCreate } | { "name": "bot_update", "args": BotUpdate } | { "name": "bot_move", "args": { 
+computer: string, } } | { "name": "device_approve", "args": { 
+/**
+ * The device code the CLI showed.
+ */
+code: string, } } | { "name": "bot_create", "args": BotCreate } | { "name": "bot_update", "args": BotUpdate } | { "name": "bot_move", "args": { 
 /**
  * The Bot.
  */

@@ -21,7 +21,7 @@ import type { RailView } from "./Rail";
 
 // What the Settings surface opens: the Providers, the Models, the Computers, or
 // the catalog.
-export type SettingsSection = "providers" | "models" | "computers" | "catalog";
+export type SettingsSection = "providers" | "models" | "computers" | "devices" | "catalog";
 
 interface SidebarProps {
   account: Account;
@@ -236,6 +236,7 @@ export default function Sidebar(props: SidebarProps) {
     { section: "providers", icon: "server" },
     { section: "models", icon: "cpu" },
     { section: "computers", icon: "monitor" },
+    { section: "devices", icon: "key" },
     { section: "catalog", icon: "book" },
   ];
 
@@ -428,7 +429,9 @@ export default function Sidebar(props: SidebarProps) {
                           ? "sidebar.settings.models"
                           : entry.section === "computers"
                             ? "sidebar.settings.computers"
-                            : "sidebar.settings.catalog",
+                            : entry.section === "devices"
+                              ? "sidebar.settings.devices"
+                              : "sidebar.settings.catalog",
                     )}
                     active={props.section === entry.section}
                     onSelect={() => props.onSection(entry.section)}
