@@ -95,7 +95,8 @@ const en = {
   "notify.loading": "Checking notifications…",
   "notify.error": "The notification setting could not be changed.",
   "notify.close": "Close",
-  "notify.hint": "A Bot finished a run or waits for your approval. The notification opens its Chat.",
+  "notify.hint":
+    "A Bot finished a run or waits for your approval. The notification opens its Chat.",
 
   "attention.title": "Needs attention",
   "attention.count.one": "1 approval waiting",
@@ -192,8 +193,8 @@ const en = {
   "chat.approval.undo.unknown": "It is not known whether this action can be undone.",
   "chat.approval.lastingScope": "Always allow covers: {scope}",
   "chat.approval.cwd": "in {path}",
-  "chat.approval.scope.shell": "shell commands starting with \"{command}\"",
-  "chat.approval.scope.files": "files under \"{path}\"",
+  "chat.approval.scope.shell": 'shell commands starting with "{command}"',
+  "chat.approval.scope.files": 'files under "{path}"',
   "chat.approval.scope.root": "files in the Workspace root",
   "chat.approval.showFull": "Show full action",
   "chat.approval.showLess": "Show less",
@@ -222,6 +223,11 @@ const en = {
   "sidebar.settings.models": "Models",
   "sidebar.settings.catalog": "Catalog",
   "sidebar.settings.computers": "Computers",
+  "bots.new": "New Bot",
+  "bots.new.computer": "Computer",
+  "bots.new.computer.offline": "An offline Computer cannot take a new Bot yet.",
+  "bots.new.noProvider":
+    "This Space has no Provider yet, so it has no Model for a Bot to work with.",
   "bots.select.title": "Select a Bot to open its page.",
 
   "common.cancel": "Cancel",
@@ -307,10 +313,10 @@ const en = {
     "With full access on, the Bot may read and change any file this Computer's user can reach, including files outside its Workspace. It can also read Neha's configuration directory, ~/.config/neha by default, which holds the saved pairing, the machine's token, and CLI sessions. Turn it on only for a Computer you trust.",
   "bot.fullAccess.confirm": "Turn on full access",
   "bot.fullAccess.on": "Full access is on.",
-  "bot.fullAccess.hosted": "A Hosted Computer works only in its Workspace, so full access does not apply.",
+  "bot.fullAccess.hosted":
+    "A Hosted Computer works only in its Workspace, so full access does not apply.",
   "bot.rules.empty": "No rule is set.",
-  "bot.rules.hosted":
-    "A Hosted Computer applies no Ask or Allow rule, so none can be set here.",
+  "bot.rules.hosted": "A Hosted Computer applies no Ask or Allow rule, so none can be set here.",
   "bot.rules.hint":
     "A rule names a kind of action. Ask makes the Bot ask first; Allow lets it run.",
   "bot.rules.effect": "Effect",
@@ -344,7 +350,8 @@ const en = {
   "settings.models.empty.text": "Connect a Provider and its Models appear here.",
   "settings.models.default": "Space default",
   "settings.models.empty.provider": "This Provider offers no Models yet.",
-  "settings.models.setDefault.noTools": "This Model cannot call tools, so it cannot be the default.",
+  "settings.models.setDefault.noTools":
+    "This Model cannot call tools, so it cannot be the default.",
   "settings.models.setDefault": "Make default",
   "settings.models.setDefault.done": "Default Model saved",
   "settings.catalog.hint":
@@ -414,7 +421,8 @@ const zh: Record<MessageKey, string> = {
   "auth.fine": "你的会话保存在这个客户端里。",
 
   "desktop.title": "选择 Space 所在的位置。",
-  "desktop.lede": "在这台电脑上运行 Neha，或打开一个已有的 Space。两者使用同一个客户端和同一次登录。",
+  "desktop.lede":
+    "在这台电脑上运行 Neha，或打开一个已有的 Space。两者使用同一个客户端和同一次登录。",
   "desktop.point.local": "Space 在这台电脑上",
   "desktop.point.remote": "Space 已经在你手里",
   "desktop.point.login": "正常登录一次",
@@ -575,8 +583,8 @@ const zh: Record<MessageKey, string> = {
   "chat.approval.undo.unknown": "这个操作能否撤销尚不清楚。",
   "chat.approval.lastingScope": "始终允许的范围：{scope}",
   "chat.approval.cwd": "在 {path}",
-  "chat.approval.scope.shell": "以 \"{command}\" 开头的 shell 命令",
-  "chat.approval.scope.files": "\"{path}\" 下的文件",
+  "chat.approval.scope.shell": '以 "{command}" 开头的 shell 命令',
+  "chat.approval.scope.files": '"{path}" 下的文件',
   "chat.approval.scope.root": "Workspace 根目录下的文件",
   "chat.approval.showFull": "显示完整动作",
   "chat.approval.showLess": "收起",
@@ -605,6 +613,10 @@ const zh: Record<MessageKey, string> = {
   "sidebar.settings.models": "Model",
   "sidebar.settings.catalog": "目录",
   "sidebar.settings.computers": "Computer",
+  "bots.new": "新建 Bot",
+  "bots.new.computer": "Computer",
+  "bots.new.computer.offline": "离线的 Computer 还不能接管新 Bot。",
+  "bots.new.noProvider": "这个 Space 还没有 Provider，因此没有可供 Bot 使用的 Model。",
   "bots.select.title": "选择一个 Bot 打开它的页面。",
 
   "common.cancel": "取消",
@@ -652,13 +664,16 @@ const zh: Record<MessageKey, string> = {
   "bot.computer.workspace": "Workspace",
   "bot.computer.reset": "重置 Workspace",
   "bot.computer.reset.armed": "再按一次确认重置",
-  "bot.computer.reset.hint": "清空这个 Computer Workspace 中每个 Bot 的目录。每个 Bot 的记忆和 Chat 会保留。",
+  "bot.computer.reset.hint":
+    "清空这个 Computer Workspace 中每个 Bot 的目录。每个 Bot 的记忆和 Chat 会保留。",
   "bot.computer.move": "移动到另一个 Computer",
-  "bot.computer.move.hint": "移动不会迁移文件：原来的 Computer 保留文件，Bot 在新的 Computer 上从新目录开始。",
+  "bot.computer.move.hint":
+    "移动不会迁移文件：原来的 Computer 保留文件，Bot 在新的 Computer 上从新目录开始。",
   "bot.computer.move.armed": "再按一次确认移动",
   "bot.computer.move.choose": "选择 Computer",
   "bot.computer.move.none": "没有其他可用的 Computer。",
-  "bot.computer.hostedNote": "Hosted Bot 从该 Computer Workspace 内自己的目录启动，sandbox 可以访问该 Workspace 的其余部分。",
+  "bot.computer.hostedNote":
+    "Hosted Bot 从该 Computer Workspace 内自己的目录启动，sandbox 可以访问该 Workspace 的其余部分。",
   "bot.model.hint": "一个 Bot 同一时间只用一个 Model。",
   "bot.model.default": "Space 默认",
   "bot.model.thinking": "思考档位",
@@ -745,7 +760,8 @@ const zh: Record<MessageKey, string> = {
   "settings.computers.create.action": "创建 Computer",
   "settings.computers.create.creating": "创建中…",
   "settings.computers.create.done": "Computer 已创建",
-  "settings.computers.create.hint": "Hosted Computer 属于你。共享的 Computer 可以承载你的任意 Bot；独占的 Computer 只承载一个 Bot。",
+  "settings.computers.create.hint":
+    "Hosted Computer 属于你。共享的 Computer 可以承载你的任意 Bot；独占的 Computer 只承载一个 Bot。",
   "settings.computers.share": "改为共享",
   "settings.computers.share.done": "Computer 已改为共享",
   "settings.computers.access.none": "仅自己的 Workspace",

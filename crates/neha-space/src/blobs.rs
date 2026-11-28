@@ -286,8 +286,8 @@ impl BlobsError {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_s3 {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_s3 {
     //! The S3 test environment.
     //!
     //! The S3 tests run only when `NEHA_TEST_S3` is set. The endpoint, bucket,
@@ -307,7 +307,7 @@ pub(crate) mod test_s3 {
     /// connection from a finished test makes the next one fail with "dispatch
     /// task is gone". The S3 tests run their async bodies on this runtime
     /// instead.
-    pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
         static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
         RUNTIME
@@ -325,7 +325,7 @@ pub(crate) mod test_s3 {
     /// `NEHA_TEST_S3` opens the tests explicitly. Once it is set, a missing
     /// variable refuses to skip quietly: the test fails and names what is
     /// missing.
-    pub(crate) fn storage() -> Option<S3Storage> {
+    pub fn storage() -> Option<S3Storage> {
         std::env::var_os("NEHA_TEST_S3")?;
         require_credentials();
 
@@ -341,12 +341,12 @@ pub(crate) mod test_s3 {
     }
 
     /// Returns a prefix no other test run shares.
-    pub(crate) fn unique_prefix() -> String {
+    pub fn unique_prefix() -> String {
         format!("spaces/test-{}", neha::id::Id::new())
     }
 
     /// Writes one object under a digest, as an outside writer would.
-    pub(crate) async fn write_object(storage: &S3Storage, sha256: &str, bytes: &[u8]) {
+    pub async fn write_object(storage: &S3Storage, sha256: &str, bytes: &[u8]) {
         let operator = super::s3_operator(storage).expect("the test store opens");
         operator
             .write(&format!("{}/{}", &sha256[..2], sha256), bytes.to_vec())
@@ -355,7 +355,7 @@ pub(crate) mod test_s3 {
     }
 
     /// Deletes one object of the store, as something outside the Space would.
-    pub(crate) async fn delete(storage: &S3Storage, sha256: &str) {
+    pub async fn delete(storage: &S3Storage, sha256: &str) {
         let operator = super::s3_operator(storage).expect("the test store opens");
         operator
             .delete(&format!("{}/{}", &sha256[..2], sha256))
@@ -364,7 +364,7 @@ pub(crate) mod test_s3 {
     }
 
     /// Returns the objects under the store's prefix, as path and length.
-    pub(crate) async fn objects(storage: &S3Storage) -> Vec<(String, u64)> {
+    pub async fn objects(storage: &S3Storage) -> Vec<(String, u64)> {
         let operator = super::s3_operator(storage).expect("the test store opens");
         let mut objects: Vec<_> = operator
             .list_with("")

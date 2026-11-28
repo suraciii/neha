@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
-use rand::RngCore as _;
+use rand::Rng as _;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -129,7 +129,7 @@ fn path_from(home: &Home, config: Option<PathBuf>) -> Option<PathBuf> {
 #[must_use]
 pub fn space_key(home: &Home) -> String {
     let digest = Sha256::digest(home.root().as_os_str().as_encoded_bytes());
-    let hex = format!("{digest:x}");
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
 
     hex[..HOME_KEY_HEX].to_owned()
 }

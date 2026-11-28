@@ -1,4 +1,4 @@
-import { For, Show, createSignal, createTrackedEffect, untrack } from "solid-js";
+import { createSignal, createTrackedEffect, For, Show, untrack } from "solid-js";
 
 import { t } from "../i18n";
 import type { Bot, Computer, Model, Rule, ThinkingLevel } from "../types";
@@ -88,7 +88,7 @@ function targetLabel(computer: Computer, targets: Computer[]): string {
   return sameName > 1 ? `${computer.name} · ${computer.id}` : computer.name;
 }
 
-function draftOf(bot: Bot | null, models: Model[]): Draft {
+function draftOf(bot: Bot | null): Draft {
   const model = bot?.model ?? "";
   // A Bot that names no level follows the Space's, so the draft holds none too:
   // filling it in here would name a level the Bot never chose.
@@ -142,7 +142,7 @@ interface BotPageProps {
 export default function BotPage(props: BotPageProps) {
   // The page opens on what the Space says about this Bot. Reading it untracked
   // marks it a one-time snapshot: the effect below is what follows the Bot.
-  const [draft, setDraft] = createSignal(untrack(() => draftOf(props.bot, props.models)));
+  const [draft, setDraft] = createSignal(untrack(() => draftOf(props.bot)));
   // Another Bot was opened, so the page starts from what the Space says. Only
   // the Bot's own id moves the draft: a Bot the Space read again keeps what the
   // User has typed since.
@@ -151,7 +151,7 @@ export default function BotPage(props: BotPageProps) {
     const id = props.bot?.id ?? null;
     if (id === shown) return;
     shown = id;
-    setDraft(draftOf(props.bot, props.models));
+    setDraft(draftOf(props.bot));
   });
 
   const patch = (write: Partial<Draft>) => setDraft((current) => ({ ...current, ...write }));
@@ -166,7 +166,7 @@ export default function BotPage(props: BotPageProps) {
   // The switch shows the Bot's own state, or what the User just asked for while
   // that write is on its way: a switch that snapped back would say the press did
   // nothing. The Space's answer puts it back on what the Space holds.
-  const fullOn = () => draft().fullWanted ?? (props.bot?.full_access ?? false);
+  const fullOn = () => draft().fullWanted ?? props.bot?.full_access ?? false;
   const renamed = () => {
     const name = draft().name.trim();
     return name !== "" && name !== (props.bot?.name ?? "");
@@ -179,8 +179,7 @@ export default function BotPage(props: BotPageProps) {
   // The other Computers this User owns, which is where a Bot may move. A move
   // works between Hosted and Local Computers in either direction, so the list
   // names every one of them.
-  const targets = () =>
-    props.computers.filter((known) => known.id !== props.computer?.id);
+  const targets = () => props.computers.filter((known) => known.id !== props.computer?.id);
   const chosen = () => inUse(props.models, draft().model);
   const levels = () => accepted(chosen());
 
@@ -272,7 +271,8 @@ export default function BotPage(props: BotPageProps) {
   // What one rule covers, in the record's words.
   function scope(rule: Rule): string {
     const parts: string[] = [];
-    if (rule.command_prefix) parts.push(t("chat.approval.scope.shell", { command: rule.command_prefix }));
+    if (rule.command_prefix)
+      parts.push(t("chat.approval.scope.shell", { command: rule.command_prefix }));
     if (rule.path_prefix) parts.push(t("chat.approval.scope.files", { path: rule.path_prefix }));
     return parts.length === 0 ? t("bot.rules.scope.all", { tool: rule.tool }) : parts.join(" · ");
   }
@@ -295,7 +295,9 @@ export default function BotPage(props: BotPageProps) {
                     {(computer) => (
                       <>
                         <span class="chat__dot" />
-                        <span class={computer().online ? "state-text state-text--online" : "state-text"}>
+                        <span
+                          class={computer().online ? "state-text state-text--online" : "state-text"}
+                        >
                           {computer().online ? t("chat.online") : t("chat.offline")}
                         </span>
                       </>
@@ -366,9 +368,7 @@ export default function BotPage(props: BotPageProps) {
                 <div class="facts">
                   <div class="fact">
                     <span class="fact__label">{t("bot.computer.name")}</span>
-                    <span class="fact__value">
-                      {props.computer?.name ?? t("common.loading")}
-                    </span>
+                    <span class="fact__value">{props.computer?.name ?? t("common.loading")}</span>
                   </div>
                   <div class="fact">
                     <span class="fact__label">{t("bot.computer.kind")}</span>
@@ -377,9 +377,7 @@ export default function BotPage(props: BotPageProps) {
                   <div class="fact">
                     <span class="fact__label">{t("bot.computer.sharing")}</span>
                     <span class="fact__value">
-                      {props.computer === null
-                        ? t("common.loading")
-                        : sharingOf(props.computer)}
+                      {props.computer === null ? t("common.loading") : sharingOf(props.computer)}
                     </span>
                   </div>
                   <div class="fact">
@@ -394,7 +392,9 @@ export default function BotPage(props: BotPageProps) {
                   </div>
                   <div class="fact">
                     <span class="fact__label">{t("bot.computer.workspace")}</span>
-                    <span class="fact__value mono">{props.computer?.workspace ?? t("common.loading")}</span>
+                    <span class="fact__value mono">
+                      {props.computer?.workspace ?? t("common.loading")}
+                    </span>
                   </div>
                 </div>
 
@@ -416,7 +416,9 @@ export default function BotPage(props: BotPageProps) {
                       name="move_target"
                       disabled={props.busy || targets().length === 0}
                       value={draft().target}
-                      onChange={(event) => patch({ target: event.currentTarget.value, armedMove: false })}
+                      onChange={(event) =>
+                        patch({ target: event.currentTarget.value, armedMove: false })
+                      }
                     >
                       <option value="">{t("bot.computer.move.choose")}</option>
                       <For each={targets()}>
@@ -523,10 +525,16 @@ export default function BotPage(props: BotPageProps) {
                 <Show when={chosen()}>
                   {(model) => (
                     <div class="chips">
-                      <span class="chip">{t("bot.model.context", { limit: model().context_limit })}</span>
-                      <span class="chip">{t("bot.model.output", { limit: model().max_output })}</span>
                       <span class="chip">
-                        {model().reads_images ? t("bot.model.readsImages") : t("bot.model.noImages")}
+                        {t("bot.model.context", { limit: model().context_limit })}
+                      </span>
+                      <span class="chip">
+                        {t("bot.model.output", { limit: model().max_output })}
+                      </span>
+                      <span class="chip">
+                        {model().reads_images
+                          ? t("bot.model.readsImages")
+                          : t("bot.model.noImages")}
                       </span>
                       <span class="chip">
                         {model().tools ? t("bot.model.callsTools") : t("bot.model.noTools")}
@@ -581,62 +589,62 @@ export default function BotPage(props: BotPageProps) {
                     when={shown().grants.length > 0}
                     fallback={<p class="rows__empty">{t("bot.folders.empty")}</p>}
                   >
-                      <div class="rows">
-                        <For each={shown().grants}>
-                          {(path) => (
-                            <div class="row">
-                              <Icon name="folder" size="sm" />
-                              <span class="row__text mono">{path}</span>
-                              <button
-                                class="row__remove"
-                                type="button"
-                                aria-label={t("bot.folders.remove", { path })}
-                                title={t("bot.folders.remove", { path })}
-                                disabled={props.busy}
-                                onClick={() => void props.onGrantRemove(path)}
-                              >
-                                <Icon name="x" size="sm" />
-                              </button>
-                            </div>
-                          )}
-                        </For>
-                      </div>
-                    </Show>
-                    {/* Only a new grant goes: a Computer whose daemon takes no
+                    <div class="rows">
+                      <For each={shown().grants}>
+                        {(path) => (
+                          <div class="row">
+                            <Icon name="folder" size="sm" />
+                            <span class="row__text mono">{path}</span>
+                            <button
+                              class="row__remove"
+                              type="button"
+                              aria-label={t("bot.folders.remove", { path })}
+                              title={t("bot.folders.remove", { path })}
+                              disabled={props.busy}
+                              onClick={() => void props.onGrantRemove(path)}
+                            >
+                              <Icon name="x" size="sm" />
+                            </button>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                  {/* Only a new grant goes: a Computer whose daemon takes no
                         grant says so instead of offering a folder it would
                         refuse. */}
-                    <Show
-                      when={grantsOpen()}
-                      fallback={<p class="panel__note">{t("bot.access.machine")}</p>}
+                  <Show
+                    when={grantsOpen()}
+                    fallback={<p class="panel__note">{t("bot.access.machine")}</p>}
+                  >
+                    <form
+                      class="field"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void grant();
+                      }}
                     >
-                      <form
-                        class="field"
-                        onSubmit={(event) => {
-                          event.preventDefault();
-                          void grant();
-                        }}
-                      >
-                        <span class="field__label">{t("bot.folders.add")}</span>
-                        <div class="field-row">
-                          <input
-                            class="input mono"
-                            name="grant_path"
-                            placeholder={t("bot.folders.placeholder")}
-                            value={draft().grant}
-                            onInput={(event) => patch({ grant: event.currentTarget.value })}
-                          />
-                          <button
-                            class="btn btn--quiet"
-                            type="submit"
-                            disabled={props.busy || draft().grant.trim() === ""}
-                          >
-                            {props.busy ? t("bot.folders.adding") : t("common.add")}
-                          </button>
-                        </div>
-                        <span class="field__hint">{t("bot.folders.hint")}</span>
-                      </form>
-                    </Show>
+                      <span class="field__label">{t("bot.folders.add")}</span>
+                      <div class="field-row">
+                        <input
+                          class="input mono"
+                          name="grant_path"
+                          placeholder={t("bot.folders.placeholder")}
+                          value={draft().grant}
+                          onInput={(event) => patch({ grant: event.currentTarget.value })}
+                        />
+                        <button
+                          class="btn btn--quiet"
+                          type="submit"
+                          disabled={props.busy || draft().grant.trim() === ""}
+                        >
+                          {props.busy ? t("bot.folders.adding") : t("common.add")}
+                        </button>
+                      </div>
+                      <span class="field__hint">{t("bot.folders.hint")}</span>
+                    </form>
                   </Show>
+                </Show>
               </div>
             </section>
 
@@ -755,66 +763,64 @@ export default function BotPage(props: BotPageProps) {
                       }}
                     >
                       <div class="field-row">
-                          <label class="field">
-                            <span class="field__label">{t("bot.rules.effect")}</span>
-                            <select
-                              class="input"
-                              name="rule_effect"
-                              value={draft().effect}
-                              onChange={(event) =>
-                                patch({ effect: event.currentTarget.value as Rule["effect"] })
-                              }
-                            >
-                              <option value="ask">{t("bot.rules.effect.ask")}</option>
-                              <option value="allow">{t("bot.rules.effect.allow")}</option>
-                            </select>
-                          </label>
-                          <label class="field">
-                            <span class="field__label">{t("bot.rules.tool")}</span>
-                            <select
-                              class="input mono"
-                              name="rule_tool"
-                              value={draft().tool}
-                              onChange={(event) => patch({ tool: event.currentTarget.value })}
-                            >
-                              <option value="">{t("bot.rules.tool.choose")}</option>
-                              <For each={TOOLS}>
-                                {(tool) => <option value={tool}>{tool}</option>}
-                              </For>
-                            </select>
-                          </label>
-                        </div>
-                        <div class="field-row">
-                          <label class="field">
-                            <span class="field__label">{t("bot.rules.commandPrefix")}</span>
-                            <input
-                              class="input mono"
-                              name="rule_command"
-                              placeholder="git"
-                              value={draft().command}
-                              onInput={(event) => patch({ command: event.currentTarget.value })}
-                            />
-                          </label>
-                          <label class="field">
-                            <span class="field__label">{t("bot.rules.pathPrefix")}</span>
-                            <input
-                              class="input mono"
-                              name="rule_path"
-                              placeholder="/data"
-                              value={draft().path}
-                              onInput={(event) => patch({ path: event.currentTarget.value })}
-                            />
-                          </label>
-                        </div>
-                        <div class="panel__foot panel__foot--end">
-                          <button
-                            class="btn btn--primary"
-                            type="submit"
-                            disabled={props.busy || !ruleReady()}
+                        <label class="field">
+                          <span class="field__label">{t("bot.rules.effect")}</span>
+                          <select
+                            class="input"
+                            name="rule_effect"
+                            value={draft().effect}
+                            onChange={(event) =>
+                              patch({ effect: event.currentTarget.value as Rule["effect"] })
+                            }
                           >
-                            {props.busy ? t("bot.rules.adding") : t("bot.rules.add")}
-                          </button>
-                        </div>
+                            <option value="ask">{t("bot.rules.effect.ask")}</option>
+                            <option value="allow">{t("bot.rules.effect.allow")}</option>
+                          </select>
+                        </label>
+                        <label class="field">
+                          <span class="field__label">{t("bot.rules.tool")}</span>
+                          <select
+                            class="input mono"
+                            name="rule_tool"
+                            value={draft().tool}
+                            onChange={(event) => patch({ tool: event.currentTarget.value })}
+                          >
+                            <option value="">{t("bot.rules.tool.choose")}</option>
+                            <For each={TOOLS}>{(tool) => <option value={tool}>{tool}</option>}</For>
+                          </select>
+                        </label>
+                      </div>
+                      <div class="field-row">
+                        <label class="field">
+                          <span class="field__label">{t("bot.rules.commandPrefix")}</span>
+                          <input
+                            class="input mono"
+                            name="rule_command"
+                            placeholder="git"
+                            value={draft().command}
+                            onInput={(event) => patch({ command: event.currentTarget.value })}
+                          />
+                        </label>
+                        <label class="field">
+                          <span class="field__label">{t("bot.rules.pathPrefix")}</span>
+                          <input
+                            class="input mono"
+                            name="rule_path"
+                            placeholder="/data"
+                            value={draft().path}
+                            onInput={(event) => patch({ path: event.currentTarget.value })}
+                          />
+                        </label>
+                      </div>
+                      <div class="panel__foot panel__foot--end">
+                        <button
+                          class="btn btn--primary"
+                          type="submit"
+                          disabled={props.busy || !ruleReady()}
+                        >
+                          {props.busy ? t("bot.rules.adding") : t("bot.rules.add")}
+                        </button>
+                      </div>
                       <span class="field__hint">{t("bot.rules.hint")}</span>
                     </form>
                   }

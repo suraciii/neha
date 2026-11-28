@@ -29,7 +29,9 @@
 
 :root {
   color-scheme: light;
-  --font-sans: "Schibsted Grotesk", "Neha Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-sans:
+    "Schibsted Grotesk", "Neha Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei",
+    sans-serif;
   --font-mono: "Geist Mono", "SFMono-Regular", "Cascadia Code", Consolas, monospace;
 
   --ground: #e9eae3;
@@ -372,7 +374,9 @@ code,
   background: var(--raised);
   color: var(--ink);
   outline: none;
-  transition: border-color 140ms var(--ease-soft), box-shadow 140ms var(--ease-soft);
+  transition:
+    border-color 140ms var(--ease-soft),
+    box-shadow 140ms var(--ease-soft);
 }
 
 .input:focus {
@@ -395,7 +399,9 @@ code,
   border: 1px solid transparent;
   font-size: var(--text-sm);
   font-weight: 500;
-  transition: background 140ms var(--ease-soft), border-color 140ms var(--ease-soft);
+  transition:
+    background 140ms var(--ease-soft),
+    border-color 140ms var(--ease-soft);
 }
 
 .btn--primary {
@@ -876,6 +882,53 @@ code,
 
 .side-empty {
   padding: 22px 18px;
+}
+
+/* The action that starts a Bot, above the list it will join, so a list with
+   nothing in it still has a way to fill it. */
+.side-new {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  background: none;
+  color: var(--ink-3);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    border-color 140ms var(--ease-soft),
+    color 140ms var(--ease-soft);
+}
+.side-new:hover {
+  border-color: var(--ink-4);
+  color: var(--ink);
+}
+
+/* Naming a Bot, in the list it is about to join. */
+.side-form {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 8px;
+  padding: 14px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--raised);
+}
+.side-form__actions {
+  display: flex;
+  gap: 8px;
+}
+.side-form__error {
+  margin: 0;
+  color: var(--danger);
+  font-size: var(--text-xs);
+  line-height: 1.5;
 }
 
 .side-empty__title {
@@ -1427,7 +1480,9 @@ code,
   background: var(--raised);
   color: var(--ink);
   text-decoration: none;
-  transition: border-color 140ms var(--ease-soft), background 140ms var(--ease-soft);
+  transition:
+    border-color 140ms var(--ease-soft),
+    background 140ms var(--ease-soft);
 }
 .file-card:hover {
   border-color: var(--line-strong);
@@ -1682,20 +1737,13 @@ code,
   height: 32px;
   border-radius: 999px;
   color: var(--ink-3);
-  transition: background 140ms var(--ease-soft), color 140ms var(--ease-soft);
+  transition:
+    background 140ms var(--ease-soft),
+    color 140ms var(--ease-soft);
 }
 .composer__attach:hover:not(:disabled) {
   background: var(--sunken);
   color: var(--ink);
-}
-
-/* The picker stays in the form and clickable, but out of sight. */
-.composer__picker {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-  pointer-events: none;
 }
 
 .attachment {
@@ -1878,7 +1926,9 @@ code,
   flex: none;
   border-radius: var(--r-sm);
   color: var(--ink-3);
-  transition: background 140ms var(--ease-soft), color 140ms var(--ease-soft);
+  transition:
+    background 140ms var(--ease-soft),
+    color 140ms var(--ease-soft);
 }
 .row__remove:hover:not(:disabled) {
   background: var(--danger-soft);
@@ -2269,6 +2319,17 @@ code,
   .chat__head {
     padding-top: calc(10px + env(safe-area-inset-top, 0px));
   }
+  /* The rail holds the brand and the surfaces, so the notch and the home
+     indicator move its first and last item instead of covering them. */
+  .rail {
+    padding-top: calc(14px + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+  }
+  /* A management page's head carries the Back action, and a viewport that shows
+     one surface at a time has nothing else to reach it by. */
+  .page__head {
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+  }
   /* iOS zooms a focused field under 16px, then leaves the page scrolled. */
   .input,
   .composer__input {
@@ -2488,7 +2549,9 @@ html[lang="zh-CN"] .select-chat h2 {
   color: var(--ink);
   text-align: left;
   cursor: pointer;
-  transition: background 160ms ease, border-color 160ms ease;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease;
 }
 
 .desktop__choice:hover:not(:disabled) {

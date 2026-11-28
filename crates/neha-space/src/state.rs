@@ -10,7 +10,7 @@ use ts_rs::TS;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::Rng as _;
+use rand::RngExt as _;
 
 use neha::id::Id;
 use neha::record::{

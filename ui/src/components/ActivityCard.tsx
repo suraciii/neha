@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal } from "solid-js";
+import { createEffect, createSignal, For, Show } from "solid-js";
 import { t } from "../i18n";
 import type { FileSummary, RunActivity, ToolAction } from "../types";
 import Avatar from "./Avatar";
@@ -60,10 +60,7 @@ export default function ActivityCard(props: ActivityCardProps) {
   };
 
   return (
-    <article
-      class={`activity activity--${props.failed ? "failed" : "working"}`}
-      aria-live="polite"
-    >
+    <article class={`activity activity--${props.failed ? "failed" : "working"}`} aria-live="polite">
       <button
         class="activity__head"
         type="button"
@@ -90,7 +87,10 @@ export default function ActivityCard(props: ActivityCardProps) {
           <For each={props.activity.actions}>
             {(action) => (
               <li class="activity__step">
-                <span class={`activity__mark activity__mark--${action.status}`} aria-hidden="true" />
+                <span
+                  class={`activity__mark activity__mark--${action.status}`}
+                  aria-hidden="true"
+                />
                 <span class="activity__step-no">
                   {t("chat.activity.step", { count: action.step })}
                 </span>

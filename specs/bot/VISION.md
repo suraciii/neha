@@ -16,13 +16,13 @@ A Bot lives on a Computer: a Local one a User controls, or a Hosted one Neha pro
 
 The owner sets who else can use the Bot: only the owner, everyone, or specific Users.
 
-A Bot has a page for what conversation cannot hold: name, picture, Computer, access, and the Model it thinks with.
+A Bot has a page for what conversation cannot hold: name, picture, Computer, access, the Model it thinks with, and the memory it keeps.
 
 A Bot's work is in progress, waits for the User, or is done. While it runs, the User can redirect it with a Message or stop it.
 
 ## Why this way
 
-Memory belongs to the Bot and not to a Chat, so what it learns with its owner follows it into every Group.
+Memory belongs to the Bot, not to a Chat; a template copies the Bot's `owner` rules that still apply and no `note`.
 
 Behavior is shaped in conversation because that is where preferences are discovered; the page holds only what has to be visible and revocable, and the Model a Bot thinks with.
 
@@ -32,9 +32,9 @@ Access is the owner's to give because the Bot is the owner's; what it does for a
 
 ## Principles
 
-- **A Bot remembers.** Memory belongs to the Bot; what it learns in one conversation it carries to the next.
-- **Behavior is shaped in conversation.** Lasting preferences and rules live in memory; the page holds only name, picture, Computer, access, and Model.
-- **A Hosted Computer by default.** A new Bot starts on a Hosted Computer; its owner can create it on a Local Computer they control instead.
+- **A Bot remembers, and a template carries the Bot's `owner` rules that still apply but not its notes.** Memory belongs to the Bot; what it learns in one conversation it carries to the next.
+- **Behavior is shaped in conversation.** Lasting preferences and rules live in memory; the page holds only name, picture, Computer, access, Model, and the memory it keeps.
+- **A Hosted Computer by default.** A new Bot starts on a Space Computer, a Hosted Computer its owner owns by default; its owner can create it on a Computer they control instead.
 - **Access is the owner's to give.** The owner decides who else can use the Bot: only the owner, everyone, or specific Users.
 - **Visible while it works.** A User sees that a Bot is working, can redirect it with a Message, and can stop it.
 
@@ -43,7 +43,7 @@ Access is the owner's to give because the Bot is the owner's; what it does for a
 - A teammate that gets better at the user's work over time.
 - A Bot for one machine that learns it.
 - Sharing a Bot that already knows the work.
-- Enhancements on this shape: a template (a copy without memory), a built-in helper Bot, a Schedule that starts work at a time, and a Watcher that starts work when a condition is met.
+- Enhancements on this shape: a template, a built-in helper Bot, a Schedule that starts work at a time, and a Watcher that starts work when a condition is met. A template carries the Bot's `owner` rules that still apply, without notes or its Chats.
 
 ## User stories
 

@@ -36,8 +36,7 @@ async function isShell(response) {
   if (!type.toLowerCase().includes("text/html")) return false;
   const html = await response.clone().text();
   return (
-    html.includes('id="root"') &&
-    /<script[^>]+src="[^"]*\/assets\/[^"]+\.(?:js|mjs)"/i.test(html)
+    html.includes('id="root"') && /<script[^>]+src="[^"]*\/assets\/[^"]+\.(?:js|mjs)"/i.test(html)
   );
 }
 
@@ -190,7 +189,9 @@ self.addEventListener("fetch", (event) => {
   }
 
   // A content-named asset never changes; a stable name revalidates.
-  event.respondWith(url.pathname.startsWith("/assets/") ? cacheFirst(request) : networkFirst(request));
+  event.respondWith(
+    url.pathname.startsWith("/assets/") ? cacheFirst(request) : networkFirst(request),
+  );
 });
 
 self.addEventListener("push", (event) => {

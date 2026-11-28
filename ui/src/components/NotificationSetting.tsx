@@ -1,4 +1,4 @@
-import { Show, createSignal, onSettled } from "solid-js";
+import { createSignal, onSettled, Show } from "solid-js";
 
 import { t } from "../i18n";
 import { api } from "../lib/api";
@@ -13,15 +13,7 @@ import {
 import Icon from "./Icon";
 
 // What the control has to say right now. "unsupported" is not rendered.
-type State =
-  | "loading"
-  | "unsupported"
-  | "ios"
-  | "unavailable"
-  | "off"
-  | "on"
-  | "muted"
-  | "denied";
+type State = "loading" | "unsupported" | "ios" | "unavailable" | "off" | "on" | "muted" | "denied";
 
 // The quiet footer control that turns a browser into a notification device.
 // The Space holds the subscriptions and the one VAPID key; this only asks the
@@ -46,11 +38,14 @@ export default function NotificationSetting() {
       muteTimer = undefined;
     }
     if (until === null || until * 1000 <= Date.now()) return;
-    muteTimer = setTimeout(() => {
-      muteTimer = undefined;
-      setMutedUntil(null);
-      setState((current) => (current === "muted" ? "on" : current));
-    }, until * 1000 - Date.now() + 1000);
+    muteTimer = setTimeout(
+      () => {
+        muteTimer = undefined;
+        setMutedUntil(null);
+        setState((current) => (current === "muted" ? "on" : current));
+      },
+      until * 1000 - Date.now() + 1000,
+    );
   }
   const muteTime = () => {
     const until = mutedUntil();
@@ -201,14 +196,14 @@ export default function NotificationSetting() {
         setOpen(false);
       }
     };
-    const escape = (event: KeyboardEvent) => {
+    const onKeydown = (event: KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false);
     };
     document.addEventListener("mousedown", dismiss);
-    document.addEventListener("keydown", escape);
+    document.addEventListener("keydown", onKeydown);
     return () => {
       document.removeEventListener("mousedown", dismiss);
-      document.removeEventListener("keydown", escape);
+      document.removeEventListener("keydown", onKeydown);
       if (muteTimer !== undefined) clearTimeout(muteTimer);
     };
   });
@@ -226,7 +221,9 @@ export default function NotificationSetting() {
           onClick={() => void toggleOpen()}
         >
           <Icon name="bell" size="sm" />
-          <span class={`notify__dot${muted() ? " is-muted" : ""}${state() === "on" ? " is-on" : ""}`} />
+          <span
+            class={`notify__dot${muted() ? " is-muted" : ""}${state() === "on" ? " is-on" : ""}`}
+          />
         </button>
 
         <Show when={open()}>
@@ -259,21 +256,29 @@ export default function NotificationSetting() {
             </Show>
             <Show when={state() === "unavailable"}>
               <p class="notify__text">{t("notify.unavailable")}</p>
-              <button class="btn btn--quiet btn--wide notify__quiet" type="button" disabled={busy()} onClick={() => retry()}>
+              <button
+                class="btn btn--quiet btn--wide notify__quiet"
+                type="button"
+                disabled={busy()}
+                onClick={() => retry()}
+              >
                 {t("notify.retry")}
               </button>
             </Show>
             <Show when={state() === "off"}>
               <p class="notify__text">{t("notify.off.text")}</p>
-              <button class="btn btn--primary btn--wide notify__action" type="button" disabled={busy()} onClick={() => void enable()}>
+              <button
+                class="btn btn--primary btn--wide notify__action"
+                type="button"
+                disabled={busy()}
+                onClick={() => void enable()}
+              >
                 {t("notify.enable")}
               </button>
             </Show>
             <Show when={state() === "on" || state() === "muted"}>
               <p class="notify__text">
-                {state() === "muted"
-                  ? t("notify.muted", { time: muteTime() })
-                  : t("notify.on")}
+                {state() === "muted" ? t("notify.muted", { time: muteTime() }) : t("notify.on")}
               </p>
               <button
                 class="btn btn--primary btn--wide notify__action"
@@ -283,7 +288,12 @@ export default function NotificationSetting() {
               >
                 {state() === "muted" ? t("notify.unmute") : t("notify.mute")}
               </button>
-              <button class="btn btn--quiet btn--wide notify__quiet" type="button" disabled={busy()} onClick={() => void turnOff()}>
+              <button
+                class="btn btn--quiet btn--wide notify__quiet"
+                type="button"
+                disabled={busy()}
+                onClick={() => void turnOff()}
+              >
                 {t("notify.turnOff")}
               </button>
             </Show>

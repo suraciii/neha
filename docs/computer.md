@@ -228,8 +228,8 @@ The machine ends the command it was running when the channel drops, so no action
 | `bot create` or `computer create` fails because a Hosted Computer cannot start | The Space machine needs a working `bubblewrap`. Install it; for a Bot, pairing this machine and running `neha bot create <name> --computer local` is the alternative. |
 | A Hosted Bot says it could not start its Computer | `bubblewrap` on the Space machine is missing or broken. Install it and check the sandbox as above; the run fails instead of starting. |
 | `computer reset` reports a run in progress | A queued, running, or waiting run blocks the reset. Wait for the run to end, then run `neha computer reset <computer-id>` again. |
-| A Computer shows offline | The daemon is not running, or it lost the Space. Start it with `neha computer run` and check its terminal. A daemon from another release is refused the same way: restart it with the `neha computer run` of this release. |
-| A write is refused | The path is outside the Bot's own directory, the folders its owner granted, and the run's `--cwd` directory. Write inside those, grant the folder, or answer the approval card that asks for it. Full access removes the fence. |
+| A Computer shows offline | The daemon is not running, or it lost the Space. Start it with `neha computer run` and check its terminal. A daemon that speaks a different channel version is closed the same way: restart it with the `neha computer run` of this release. |
+| A write is refused | The path is outside the Bot's Workspace, the folders its owner granted, and the run's `--cwd` directory. Write inside those, grant the folder, or answer the approval card that asks for it. Full access removes the fence. |
 
 [Building and verification](building.md#a-computer-sandbox) shows how to install `bubblewrap`.
 

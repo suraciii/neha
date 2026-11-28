@@ -153,7 +153,13 @@ describe("App with approvals", () => {
       { ...byRule, approval: "a2", tool: "shell", summary: "shell: git status" },
       { ...byRule, approval: "a3", tool: "write_file", summary: "write_file: logs/out.txt" },
       // The arguments say where the action lands; the summary only names it.
-      { ...byRule, approval: "a4", tool: "write_file", arguments: { path: "cache/tmp.txt" }, summary: "write_file: logs/out.txt" },
+      {
+        ...byRule,
+        approval: "a4",
+        tool: "write_file",
+        arguments: { path: "cache/tmp.txt" },
+        summary: "write_file: logs/out.txt",
+      },
     );
     const view = await openChat();
 
@@ -223,7 +229,11 @@ describe("App with approvals", () => {
     const view = await openChat();
 
     expect(card(view)).toContain("A rule you set asks before this action.");
-    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow once", "Always allow", "Deny"]);
+    expect(buttons(view).map((button) => button.textContent)).toEqual([
+      "Allow once",
+      "Always allow",
+      "Deny",
+    ]);
     // The Space said nothing about the scope, so the page names what it can see.
     expect(element(view, ".approval__scope").textContent).toBe(
       "Always allow covers: files in the Workspace root",
@@ -261,10 +271,28 @@ describe("App with approvals", () => {
   it("offers no Always allow when the Space, or the path, says none can last", async () => {
     space.approvals.push(
       // The Space said no; the page does not second-guess it with its own guess.
-      { ...byRule, approval: "a1", tool: "shell", summary: "shell: git status", lasting_scope: null },
+      {
+        ...byRule,
+        approval: "a1",
+        tool: "shell",
+        summary: "shell: git status",
+        lasting_scope: null,
+      },
       // A path that leaves the Workspace, or is blank, makes no rule.
-      { ...byRule, approval: "a2", tool: "write_file", arguments: { path: "../x" }, summary: "write_file: ../x" },
-      { ...byRule, approval: "a3", tool: "read_file", arguments: { path: "   " }, summary: "read_file: notes.txt" },
+      {
+        ...byRule,
+        approval: "a2",
+        tool: "write_file",
+        arguments: { path: "../x" },
+        summary: "write_file: ../x",
+      },
+      {
+        ...byRule,
+        approval: "a3",
+        tool: "read_file",
+        arguments: { path: "   " },
+        summary: "read_file: notes.txt",
+      },
     );
     const view = await openChat();
 
@@ -319,7 +347,14 @@ describe("App with approvals", () => {
     const view = await openChat();
     space.approvals = [];
 
-    record("neha.approval.decided", { approval: "a1", run: "r1", allow: false, lasting: false, user: "u1", rule: null });
+    record("neha.approval.decided", {
+      approval: "a1",
+      run: "r1",
+      allow: false,
+      lasting: false,
+      user: "u1",
+      rule: null,
+    });
 
     await waitFor(() => expect(card(view)).toContain("Denied"));
     expect(space.decisions).toEqual([]);
@@ -333,7 +368,13 @@ describe("App with approvals", () => {
     await waitFor(() => expect(card(view)).toContain("Allowed"));
     // Any later read of the Chat finds no approval for it any more.
     const lists = asked("approval_list");
-    record("neha.message.added", { chat: "h1", message: "m9", text: "done", file: null, run: "r1" });
+    record("neha.message.added", {
+      chat: "h1",
+      message: "m9",
+      text: "done",
+      file: null,
+      run: "r1",
+    });
     await waitFor(() => expect(asked("approval_list")).toBeGreaterThan(lists));
     await flush();
 
@@ -443,7 +484,13 @@ describe("App with approvals", () => {
     space.activeRuns["h1"] = "r1";
     space.runs["r1"] = { status: "waiting", approval: "a1" };
     space.runs["r2"] = { status: "waiting", approval: "a2" };
-    space.approvals.push(firstUse, { ...firstUse, approval: "a2", run: "r2", action: "act2", summary: "write_file: notes.txt" });
+    space.approvals.push(firstUse, {
+      ...firstUse,
+      approval: "a2",
+      run: "r2",
+      action: "act2",
+      summary: "write_file: notes.txt",
+    });
     const view = await openChat();
 
     expect(header(view)).toContain("Waiting for your approval");
@@ -489,7 +536,13 @@ describe("App with approvals", () => {
     // An answer read before the approval still says the Run is running.
     space.runs["r1"] = { status: "running" };
     const shows = space.runShows.length;
-    record("neha.message.added", { chat: "h1", message: "m8", text: "tick", file: null, run: "r1" });
+    record("neha.message.added", {
+      chat: "h1",
+      message: "m8",
+      text: "tick",
+      file: null,
+      run: "r1",
+    });
     await waitFor(() => expect(space.runShows.length).toBeGreaterThan(shows));
     await flush();
     expect(header(view)).toContain("Waiting for your approval");
@@ -528,7 +581,9 @@ describe("App with approvals", () => {
     space.approvals.push(said);
     requested(said);
     await waitFor(() => expect(view.container.querySelectorAll(".approval")).toHaveLength(2));
-    expect(lines(view, ".approval__scope")).toEqual(['Always allow covers: shell commands starting with "git"']);
+    expect(lines(view, ".approval__scope")).toEqual([
+      'Always allow covers: shell commands starting with "git"',
+    ]);
     expect(buttons(view).map((button) => button.textContent)).toEqual([
       "Allow once",
       "Deny",
@@ -556,7 +611,9 @@ describe("App with approvals", () => {
     space.approvals.push({ ...firstUse, summary: "printf \u001b[31mred\u001b[0m\rnext" });
     const view = await openChat();
 
-    expect(element(view, ".approval__summary").textContent).toBe("printf \\u{1b}[31mred\\u{1b}[0m\\u{d}next");
+    expect(element(view, ".approval__summary").textContent).toBe(
+      "printf \\u{1b}[31mred\\u{1b}[0m\\u{d}next",
+    );
     expect(view.container.querySelector(".approval__expand")).toBeNull();
   });
 });

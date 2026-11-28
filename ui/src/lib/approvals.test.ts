@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-
-import { escapeControls, isLongSummary, localScope, parentOf, undoableOf } from "./approvals";
 import type { Approval } from "../types";
+import { escapeControls, isLongSummary, localScope, parentOf, undoableOf } from "./approvals";
 
 // An approval whose summary is prose for the User, not a tool-prefixed action.
 const shell: Approval = {
@@ -40,19 +39,21 @@ describe("approvals", () => {
     });
 
     // The arguments come first; the summary only speaks when they are absent.
-    expect(localScope({ ...shell, arguments: { command: "git status" }, summary: "shell: rm -rf /" })).toEqual(
-      scopeShell("git"),
-    );
+    expect(
+      localScope({ ...shell, arguments: { command: "git status" }, summary: "shell: rm -rf /" }),
+    ).toEqual(scopeShell("git"));
     expect(localScope(file("cache/tmp.txt"))).toEqual(scopeFiles("cache"));
-    expect(localScope({ ...shell, tool: "write_file", arguments: { path: "out/report.pdf" } })).toEqual(
-      scopeFiles("out"),
-    );
+    expect(
+      localScope({ ...shell, tool: "write_file", arguments: { path: "out/report.pdf" } }),
+    ).toEqual(scopeFiles("out"));
     // A summary names the action after its tool; other prose names nothing.
-    expect(localScope({ ...shell, tool: "write_file", summary: "write_file: logs/out.txt" })).toEqual(
-      scopeFiles("logs"),
-    );
+    expect(
+      localScope({ ...shell, tool: "write_file", summary: "write_file: logs/out.txt" }),
+    ).toEqual(scopeFiles("logs"));
     expect(localScope({ ...shell, summary: "shell: printf hi" })).toEqual(scopeShell("printf"));
-    expect(localScope({ ...shell, tool: "read_file", summary: "read_file on this Computer" })).toBeNull();
+    expect(
+      localScope({ ...shell, tool: "read_file", summary: "read_file on this Computer" }),
+    ).toBeNull();
     expect(localScope(shell)).toBeNull();
     // A bare name sits in the Workspace root, which has its own words.
     expect(localScope(file("notes.txt"))).toEqual(scopeRoot);

@@ -4,7 +4,6 @@ import { fireEvent, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 
-import App from "./App";
 import { space } from "./test/fakeSpace";
 import { element, openChat, record, useView, type View } from "./test/view";
 
@@ -44,7 +43,13 @@ function failRun(run: string, reply: { id: string; text: string }, error: string
     run,
     file: null,
   });
-  record("neha.message.added", { chat: "h1", message: reply.id, text: reply.text, file: null, run });
+  record("neha.message.added", {
+    chat: "h1",
+    message: reply.id,
+    text: reply.text,
+    file: null,
+    run,
+  });
   record("neha.run.finished", { run, status: "failed", reply: reply.id, usage: null, error });
 }
 
@@ -53,7 +58,9 @@ function cardText(view: View): string {
 }
 
 function stepRows(view: View): string[] {
-  return Array.from(view.container.querySelectorAll(".activity__step")).map((row) => row.textContent ?? "");
+  return Array.from(view.container.querySelectorAll(".activity__step")).map(
+    (row) => row.textContent ?? "",
+  );
 }
 
 // The card starts folded, so a test that reads its steps opens it first.
@@ -70,7 +77,12 @@ describe("App run activity", () => {
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeTruthy());
 
     // The Run works on its first step and asks a tool to do something.
-    record("neha.run.step", { run: "r1", step: 1, usage: null, tool_calls: [{ id: "call1", tool: "shell" }] });
+    record("neha.run.step", {
+      run: "r1",
+      step: 1,
+      usage: null,
+      tool_calls: [{ id: "call1", tool: "shell" }],
+    });
     record("neha.action.started", {
       run: "r1",
       step: 1,
@@ -80,7 +92,9 @@ describe("App run activity", () => {
     });
     await waitFor(() => expect(cardText(view)).toContain("shell"));
     // The card stays folded, and its one line names the work.
-    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe("false");
+    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe(
+      "false",
+    );
     expect(cardText(view)).toContain("Working");
     expect(cardText(view)).toContain("Step 1");
     expect(cardText(view)).toContain("shell");
@@ -101,7 +115,13 @@ describe("App run activity", () => {
 
     // A second step's action fails, which the card names without its arguments.
     record("neha.run.step", { run: "r1", step: 2, usage: null, tool_calls: [] });
-    record("neha.action.started", { run: "r1", step: 2, action: "act2", tool: "write_file", arguments: { path: "notes/a.txt" } });
+    record("neha.action.started", {
+      run: "r1",
+      step: 2,
+      action: "act2",
+      tool: "write_file",
+      arguments: { path: "notes/a.txt" },
+    });
     record("neha.action.finished", {
       run: "r1",
       step: 2,
@@ -125,7 +145,13 @@ describe("App run activity", () => {
     const view = await openChat();
     record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeTruthy());
-    record("neha.action.started", { run: "r1", step: 1, action: "act1", tool: "shell", arguments: { command: "printf hi" } });
+    record("neha.action.started", {
+      run: "r1",
+      step: 1,
+      action: "act1",
+      tool: "shell",
+      arguments: { command: "printf hi" },
+    });
     await waitFor(() => expect(cardText(view)).toContain("shell"));
     const head = element<HTMLButtonElement>(view, ".activity__head");
 
@@ -164,7 +190,13 @@ describe("App run activity", () => {
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeTruthy());
 
     // The Bot's reply carries the File, and names the Run that made it.
-    record("neha.message.added", { chat: "h1", message: "m2", text: "here is the report", file: "f1", run: "r1" });
+    record("neha.message.added", {
+      chat: "h1",
+      message: "m2",
+      text: "here is the report",
+      file: "f1",
+      run: "r1",
+    });
     // The File names itself once the Chat reads the record again.
     await waitFor(() => expect(view.container.querySelector(".activity__tools")).toBeTruthy());
     openCard(view);
@@ -204,16 +236,29 @@ describe("App run activity", () => {
     // action behind it: its reason is all the record holds.
     space.statuses["h1"] = "working";
     space.activeRuns["h1"] = "r1";
-    space.runs["r1"] = { status: "failed", steps: [], actions: [], error: "the Provider is not reachable" };
+    space.runs["r1"] = {
+      status: "failed",
+      steps: [],
+      actions: [],
+      error: "the Provider is not reachable",
+    };
     const view = await openChat();
     await waitFor(() => expect(space.runShows).toContain("r1"));
 
     // The card is there, opened, with the reason the Run gave.
-    await waitFor(() => expect(element(view, ".activity__reason").textContent).toContain("the Provider is not reachable"));
-    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe("true");
+    await waitFor(() =>
+      expect(element(view, ".activity__reason").textContent).toContain(
+        "the Provider is not reachable",
+      ),
+    );
+    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe(
+      "true",
+    );
     expect(element(view, ".chat__state--failed").textContent).toBe("Failed");
     // The Run is over, so the composer opens again.
-    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    await waitFor(() =>
+      expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false),
+    );
   });
 
   it("opens itself with the reason when the Run fails", async () => {
@@ -221,7 +266,13 @@ describe("App run activity", () => {
     const view = await openChat();
     record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeTruthy());
-    record("neha.action.started", { run: "r1", step: 1, action: "act1", tool: "shell", arguments: { command: "printf hi" } });
+    record("neha.action.started", {
+      run: "r1",
+      step: 1,
+      action: "act1",
+      tool: "shell",
+      arguments: { command: "printf hi" },
+    });
     record("neha.action.finished", {
       run: "r1",
       step: 1,
@@ -238,17 +289,23 @@ describe("App run activity", () => {
     // The Run fails: the card opens itself, because the reason is why it failed.
     failRun("r1", { id: "m2", text: "I could not finish this." }, "the shell is not reachable");
     await waitFor(() => expect(cardText(view)).toContain("Failed"));
-    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe("true");
+    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe(
+      "true",
+    );
     expect(element(view, ".activity__reason").textContent).toContain("the shell is not reachable");
     // The Chat reads the record again, and the Bot's failure Message is in the
     // stream, in its place.
     await waitFor(() => expect(view.container.querySelectorAll(".msg__text")).toHaveLength(2));
-    const texts = Array.from(view.container.querySelectorAll(".msg__text")).map((node) => node.textContent ?? "");
+    const texts = Array.from(view.container.querySelectorAll(".msg__text")).map(
+      (node) => node.textContent ?? "",
+    );
     expect(texts).toEqual(["please work", "I could not finish this."]);
 
     // The User can fold it away again.
     flush(() => fireEvent.click(element(view, ".activity__head")));
-    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe("false");
+    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe(
+      "false",
+    );
     expect(view.container.querySelector(".activity__reason")).toBeNull();
   });
 
@@ -263,7 +320,9 @@ describe("App run activity", () => {
     await waitFor(() => expect(element(view, ".chat__state--failed").textContent).toBe("Failed"));
     expect(view.container.querySelector(".chat__state--working")).toBeNull();
     // The composer opens again: the Run is over.
-    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    await waitFor(() =>
+      expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false),
+    );
   });
 
   it("names the Run's work in the reader's language", async () => {
@@ -271,7 +330,13 @@ describe("App run activity", () => {
     const view = await openChat();
     record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeTruthy());
-    record("neha.action.started", { run: "r1", step: 1, action: "act1", tool: "shell", arguments: { command: "printf hi" } });
+    record("neha.action.started", {
+      run: "r1",
+      step: 1,
+      action: "act1",
+      tool: "shell",
+      arguments: { command: "printf hi" },
+    });
     await waitFor(() => expect(cardText(view)).toContain("shell"));
 
     flush(() => fireEvent.click(element(view, ".locale-switch--foot")));
@@ -296,7 +361,10 @@ describe("App run activity", () => {
     workingChat();
     space.runs["r1"] = {
       status: "running",
-      steps: [{ index: 1, tool_calls: 1 }, { index: 2, tool_calls: 1 }],
+      steps: [
+        { index: 1, tool_calls: 1 },
+        { index: 2, tool_calls: 1 },
+      ],
       actions: [
         { id: "act1", step: 1, tool: "shell", status: "succeeded" },
         { id: "act2", step: 2, tool: "read_file", status: "succeeded" },
@@ -323,7 +391,9 @@ describe("App run activity", () => {
     expect(stepRows(view)).toEqual(["Step 1shellSucceeded", "Step 2read_fileSucceeded"]);
     expect(cardText(view)).toContain("Step 2");
     // The Run's reply is in the stream beside the card.
-    const texts = Array.from(view.container.querySelectorAll(".msg__text")).map((node) => node.textContent ?? "");
+    const texts = Array.from(view.container.querySelectorAll(".msg__text")).map(
+      (node) => node.textContent ?? "",
+    );
     expect(texts).toContain("the report is ready");
   });
 

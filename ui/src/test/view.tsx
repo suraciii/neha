@@ -17,6 +17,24 @@ export function element<T extends Element>(view: View, selector: string): T {
   return found;
 }
 
+// The button the test names, found by what it says.
+export function button(view: View, text: string): HTMLButtonElement {
+  const found = Array.from(view.container.querySelectorAll<HTMLButtonElement>("button")).find(
+    (known) => known.textContent?.trim() === text,
+  );
+  if (!found) throw new Error(`no ${text} button in the view`);
+  return found;
+}
+
+// What one panel says, found by its own heading.
+export function panelText(view: View, heading: string): string {
+  const panel = Array.from(view.container.querySelectorAll(".panel")).find(
+    (known) => known.querySelector("h2")?.textContent === heading,
+  );
+  if (!panel) throw new Error(`no ${heading} panel in the view`);
+  return panel.textContent ?? "";
+}
+
 // Renders the client, signed in to the fake Space.
 export function renderApp(): View {
   vi.spyOn(api, "me").mockResolvedValue(space.account as Account);
@@ -54,18 +72,35 @@ export async function drain() {
   for (let turn = 0; turn < 4; turn += 1) await Promise.resolve();
 }
 
+// The viewport the client reads. jsdom answers no media query by what it says,
+// so a test that narrows it names the width itself, and the viewport goes back
+// to the wide one after it so the next test reads the same page.
+function wideViewport(query: string) {
+  return {
+    matches: false,
+    media: query,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+  };
+}
+
+// The client at a phone width.
+export function mobile() {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (query: string) => ({
+      matches: query.includes("max-width: 900px"),
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    }),
+  });
+}
+
 // Starts the fake Space clean before each test and cleans the view after it.
 export function useView() {
   beforeAll(() => {
-    Object.defineProperty(window, "matchMedia", {
-      writable: true,
-      value: (query: string) => ({
-        matches: false,
-        media: query,
-        addEventListener: () => undefined,
-        removeEventListener: () => undefined,
-      }),
-    });
+    Object.defineProperty(window, "matchMedia", { writable: true, value: wideViewport });
   });
 
   beforeEach(() => space.reset());
@@ -74,5 +109,6 @@ export function useView() {
     cleanup();
     vi.restoreAllMocks();
     flush(() => setLocale("en-US"));
+    Object.defineProperty(window, "matchMedia", { writable: true, value: wideViewport });
   });
 }

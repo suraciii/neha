@@ -44,9 +44,7 @@ class FakeSocket {
     }
     if (frame.type === "subscribe") {
       for (const page of FakeSocket.pages) {
-        queueMicrotask(() =>
-          this.message({ type: "snapshot", cursor: page.cursor, events: [] }),
-        );
+        queueMicrotask(() => this.message({ type: "snapshot", cursor: page.cursor, events: [] }));
       }
     }
   }
@@ -206,9 +204,7 @@ describe("record subscription", () => {
     await commands.subscribe(handlers);
     await Promise.resolve();
     const socket = FakeSocket.instances[0]!;
-    expect(socket.sent.find((frame) => frame.type === "subscribe")).not.toHaveProperty(
-      "cursor",
-    );
+    expect(socket.sent.find((frame) => frame.type === "subscribe")).not.toHaveProperty("cursor");
     expect(handlers.onSnapshot).toHaveBeenCalledWith([], "5", false);
     await commands.close();
   });

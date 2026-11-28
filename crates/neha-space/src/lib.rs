@@ -34,3 +34,12 @@ pub use state::{
     RunStatus, RunView, State, UserView,
 };
 pub use store::{AppendRequest, AppendResult, EventPage, Projection, Store, StoreError};
+
+/// What the integration tests need from inside the crate.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support {
+    pub use super::commands::test_support as commands;
+    pub use super::identity::test_support as identity;
+    pub use super::server::test_support as server;
+}

@@ -5,8 +5,7 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 
 const SHELL = "neha-shell-v4";
-const SHELL_HTML =
-  '<!doctype html><div id="root"></div><script src="/assets/app.js"></script>';
+const SHELL_HTML = '<!doctype html><div id="root"></div><script src="/assets/app.js"></script>';
 const LAST_GOOD = "<!doctype html><p>last good shell</p>";
 
 type Handler = (event: {
@@ -93,13 +92,20 @@ function fakeWorker(
     console,
   });
 
-  return { handlers, cacheFor, cacheApi, fetchMock, clients, showNotification, focus, navigate, openWindow };
+  return {
+    handlers,
+    cacheFor,
+    cacheApi,
+    fetchMock,
+    clients,
+    showNotification,
+    focus,
+    navigate,
+    openWindow,
+  };
 }
 
-async function pushed(
-  handlers: Map<string, Handler>,
-  payload: unknown,
-): Promise<void> {
+async function pushed(handlers: Map<string, Handler>, payload: unknown): Promise<void> {
   let answered: Promise<unknown> | undefined;
   handlers.get("push")?.({
     data: { json: () => payload },
@@ -164,14 +170,15 @@ function navigate(handlers: Map<string, Handler>, path = "/"): Promise<Response>
   return answered;
 }
 
-function resource(
-  handlers: Map<string, Handler>,
-  path: string,
-  mode = "cors",
-): Promise<Response> {
+function resource(handlers: Map<string, Handler>, path: string, mode = "cors"): Promise<Response> {
   let answered: Promise<Response> | undefined;
   handlers.get("fetch")?.({
-    request: { method: "GET", url: `https://space.example.com${path}`, mode, headers: new Headers() },
+    request: {
+      method: "GET",
+      url: `https://space.example.com${path}`,
+      mode,
+      headers: new Headers(),
+    },
     respondWith: (promise) => {
       answered = promise;
     },
@@ -252,9 +259,9 @@ describe("the installed shell worker", () => {
 
     const response = await resource(worker.handlers, "/manifest.webmanifest");
     expect(await response.text()).toBe("new manifest");
-    expect(
-      await (await worker.cacheFor(SHELL).match("/manifest.webmanifest"))!.text(),
-    ).toBe("new manifest");
+    expect(await (await worker.cacheFor(SHELL).match("/manifest.webmanifest"))!.text()).toBe(
+      "new manifest",
+    );
     expect(worker.fetchMock.mock.calls.at(-1)?.[1]).toEqual({ cache: "no-cache" });
   });
 
@@ -428,24 +435,18 @@ describe("the installed shell worker", () => {
       expect.objectContaining({ body: "等待你的审批。" }),
     );
 
-    worker.clients.matchAll.mockResolvedValue([
-      { focus: worker.focus, navigate: worker.navigate },
-    ]);
+    worker.clients.matchAll.mockResolvedValue([{ focus: worker.focus, navigate: worker.navigate }]);
     worker.navigate.mockImplementation(async () => ({ focus: worker.focus }) as never);
     const click = await clicked(worker.handlers, "/?chat=h1&approval=a1");
     expect(click.close).toHaveBeenCalled();
     expect(worker.focus).toHaveBeenCalled();
-    expect(worker.navigate).toHaveBeenCalledWith(
-      "https://space.example.com/?chat=h1&approval=a1",
-    );
+    expect(worker.navigate).toHaveBeenCalledWith("https://space.example.com/?chat=h1&approval=a1");
     expect(worker.openWindow).not.toHaveBeenCalled();
   });
 
   it("opens a window when the click cannot focus the app", async () => {
     const worker = fakeWorker(async () => new Response("ok"));
-    worker.clients.matchAll.mockResolvedValue([
-      { focus: worker.focus, navigate: worker.navigate },
-    ]);
+    worker.clients.matchAll.mockResolvedValue([{ focus: worker.focus, navigate: worker.navigate }]);
     worker.focus.mockRejectedValue(new Error("the window is gone"));
     await clicked(worker.handlers, "/?chat=h3");
 
@@ -454,9 +455,7 @@ describe("the installed shell worker", () => {
 
   it("opens a window when navigation returns no client", async () => {
     const worker = fakeWorker(async () => new Response("ok"));
-    worker.clients.matchAll.mockResolvedValue([
-      { focus: worker.focus, navigate: worker.navigate },
-    ]);
+    worker.clients.matchAll.mockResolvedValue([{ focus: worker.focus, navigate: worker.navigate }]);
     await clicked(worker.handlers, "/?chat=h4");
 
     expect(worker.navigate).toHaveBeenCalled();

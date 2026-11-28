@@ -15,7 +15,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
-use rand::RngCore as _;
+use rand::Rng as _;
 use thiserror::Error;
 
 use crate::home::Home;

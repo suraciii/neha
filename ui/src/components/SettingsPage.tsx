@@ -1,6 +1,6 @@
-import { For, Show, createSignal } from "solid-js";
+import { createSignal, For, Show } from "solid-js";
 
-import { locale, t, type MessageKey } from "../i18n";
+import { locale, type MessageKey, t } from "../i18n";
 import { dayLabel } from "../lib/format";
 import type {
   Account,
@@ -242,8 +242,7 @@ export default function SettingsPage(props: SettingsPageProps) {
   // The Hosted Computer the User is naming, and who may use it. It starts
   // exclusive, like the CLI's default, and can be made shared in the list.
   const [computerName, setComputerName] = createSignal("");
-  const [computerSharing, setComputerSharing] =
-    createSignal<Computer["sharing"]>("exclusive");
+  const [computerSharing, setComputerSharing] = createSignal<Computer["sharing"]>("exclusive");
 
   async function createComputer() {
     const name = computerName().trim();
@@ -277,7 +276,12 @@ export default function SettingsPage(props: SettingsPageProps) {
   return (
     <section class="page" aria-label={t("rail.settings")}>
       <header class="page__head">
-        <button class="page__back" type="button" onClick={props.onBack} aria-label={t("sidebar.settings")}>
+        <button
+          class="page__back"
+          type="button"
+          onClick={props.onBack}
+          aria-label={t("sidebar.settings")}
+        >
           <Icon name="chevron-left" size="sm" />
         </button>
         <div class="page__titles">
@@ -337,7 +341,9 @@ export default function SettingsPage(props: SettingsPageProps) {
                             onClick={() => void refresh(provider.id)}
                           >
                             <Icon name="repeat" size="sm" />
-                            {props.busy ? t("settings.providers.refreshing") : t("settings.providers.refresh")}
+                            {props.busy
+                              ? t("settings.providers.refreshing")
+                              : t("settings.providers.refresh")}
                           </button>
                         </Show>
                       </div>
@@ -379,7 +385,9 @@ export default function SettingsPage(props: SettingsPageProps) {
                       </For>
                     </select>
                     <span class="field__hint">
-                      {connectable().length === 0 ? t("settings.providers.vendor.empty") : t("setup.provider.lede")}
+                      {connectable().length === 0
+                        ? t("settings.providers.vendor.empty")
+                        : t("setup.provider.lede")}
                     </span>
                   </label>
                   <label class="field">
@@ -412,7 +420,9 @@ export default function SettingsPage(props: SettingsPageProps) {
                           class="input mono"
                           name="connect_base_url"
                           inputmode="url"
-                          placeholder={props.vendors.find((known) => known.id === vendor())?.api ?? ""}
+                          placeholder={
+                            props.vendors.find((known) => known.id === vendor())?.api ?? ""
+                          }
                           value={baseUrl()}
                           onInput={(event) => setBaseUrl(event.currentTarget.value)}
                         />
@@ -563,7 +573,9 @@ export default function SettingsPage(props: SettingsPageProps) {
                     <div class="fact">
                       <span class="fact__label">{t("settings.catalog.freshness")}</span>
                       <span class="fact__value">
-                        {catalog().stale ? t("settings.catalog.stale") : t("settings.catalog.fresh")}
+                        {catalog().stale
+                          ? t("settings.catalog.stale")
+                          : t("settings.catalog.fresh")}
                       </span>
                     </div>
                   </div>
@@ -632,9 +644,7 @@ export default function SettingsPage(props: SettingsPageProps) {
                         </span>
                         {/* An exclusive Computer takes one Bot, so its owner
                             makes it shared before another may use it. */}
-                        <Show
-                          when={computer.kind === "hosted" && computer.sharing === "exclusive"}
-                        >
+                        <Show when={computer.kind === "hosted" && computer.sharing === "exclusive"}>
                           <button
                             class="btn btn--quiet"
                             type="button"

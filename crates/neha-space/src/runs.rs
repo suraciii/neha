@@ -79,10 +79,10 @@ impl RunQueue {
             let mut bots = self.bots.lock().expect("run queue lock");
             Arc::clone(&bots.entry(bot).or_insert_with(Pump::new).admit)
         };
-        #[cfg(test)]
+        #[cfg(feature = "test-support")]
         let waiting = AdmitWaiter::new(bot);
         let admit = admit.lock_owned().await;
-        #[cfg(test)]
+        #[cfg(feature = "test-support")]
         drop(waiting);
 
         admit
@@ -163,13 +163,13 @@ impl RunQueue {
 /// A command that takes the lock can be interleaved with a paused run start
 /// deterministically: a test waits until the command is queued on the lock
 /// instead of sleeping and hoping.
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 static ADMIT_WAITERS: Mutex<Option<HashMap<Id, usize>>> = Mutex::new(None);
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 struct AdmitWaiter(Id);
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 impl AdmitWaiter {
     fn new(bot: Id) -> Self {
         if let Ok(mut waiters) = ADMIT_WAITERS.lock() {
@@ -182,7 +182,7 @@ impl AdmitWaiter {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 impl Drop for AdmitWaiter {
     fn drop(&mut self) {
         if let Ok(mut waiters) = ADMIT_WAITERS.lock()
@@ -198,7 +198,7 @@ impl Drop for AdmitWaiter {
 }
 
 /// Returns how many callers wait for one Bot's admit lock.
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 pub(crate) fn admit_waiters(bot: Id) -> usize {
     ADMIT_WAITERS
         .lock()
@@ -214,14 +214,14 @@ pub(crate) fn admit_waiters(bot: Id) -> usize {
 /// A test seam: when a test pauses a Bot, its pump waits between snapshotting
 /// the run's Computer and recording `RunStarted`, so a move can be
 /// interleaved deterministically.
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 type StartPause = (Arc<Notify>, Arc<Notify>);
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 static START_PAUSES: Mutex<Option<HashMap<Id, StartPause>>> = Mutex::new(None);
 
 /// Installs a pause for one Bot's next start; returns (reached, release).
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 pub(crate) fn pause_start_for_test(bot: Id) -> StartPause {
     let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
     let mut pauses = START_PAUSES.lock().expect("start pause lock");
@@ -232,7 +232,7 @@ pub(crate) fn pause_start_for_test(bot: Id) -> StartPause {
     pause
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 async fn pause_before_start(bot: Id) {
     let pause = START_PAUSES
         .lock()
@@ -361,7 +361,7 @@ async fn work(
                             continue;
                         }
                     };
-                    #[cfg(test)]
+                    #[cfg(feature = "test-support")]
                     pause_before_start(bot).await;
                     if commands::start_run(&server.store, &server.state, &server.events, &pending)
                         .await

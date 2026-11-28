@@ -4,9 +4,9 @@
 
 `just ci` is the single gate. It runs the Python hygiene checks, the documentation checks, formatting, Clippy, the workspace test suite, and the documentation build.
 
-Pull requests and pushes to `main` run the same gate. Split it into a fast pull-request gate and a full main gate when the total cost exceeds ten minutes on a hosted runner.
+Pull requests and pushes to `main` run the same gate. CI runs the checks and the test suite as separate jobs, so the checks report while the tests still run. Split it into a fast pull-request gate and a full main gate when the total cost exceeds ten minutes on a hosted runner.
 
-`just verify <directory>` runs the gate recipe by recipe and retains the source snapshot, tool versions, per-recipe timings, and output outside the repository.
+`just verify <directory> [recipe]` runs the gate, or the named recipe, recipe by recipe and retains the source snapshot, tool versions, per-recipe timings, and output outside the repository.
 
 ## Browser client
 
@@ -31,7 +31,16 @@ A change that adds more than 30 seconds to `just ci` reports the measured cost i
 ## Placement
 
 - Unit tests live in the module they test.
-- Integration tests live in `tests/` and use the public interface.
+- Integration tests live in `tests/` and use the public interface. Each crate
+  with integration tests has one binary, `tests/it/main.rs`, and its tests are
+  modules of that binary: one hundred test files would otherwise be one
+  hundred binaries to link.
+- A crate whose integration tests need an internal fixture or field exposes it
+  from a `test-support` feature-gated module (for example a runtime built by
+  hand, or the write roots a fence test inspects). The integration target
+  declares `required-features = ["test-support"]`, and the gate runs
+  `cargo test --all-features`, so the tests run with the feature while a
+  default build omits it.
 - A doc test is for a public example that a reader will copy.
 
 ## Fixtures

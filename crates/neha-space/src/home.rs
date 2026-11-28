@@ -69,7 +69,7 @@ impl Home {
     ///
     /// Tests use this to keep the configuration directory inside their own
     /// temporary home; production resolves it from `XDG_CONFIG_HOME`/`HOME`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn open_with_ticket_directory(
         root: impl Into<PathBuf>,
         ticket_directory: impl Into<PathBuf>,

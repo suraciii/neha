@@ -16,7 +16,7 @@ The workspace has no system-library dependencies. SQLite and aws-lc-sys compile 
 
 ```bash
 cargo build --locked --workspace
-cargo test --locked --workspace
+cargo test --locked --workspace --all-features
 pnpm --dir ui install --frozen-lockfile
 pnpm --dir ui build
 ```
@@ -31,6 +31,7 @@ just deny         # licenses, advisories, duplicate versions, registry sources
 just test-s3      # neha-space tests with the S3 tests switched on
 just doc          # documentation build; warnings fail
 just check-specs  # links, headings, modal case, presentation
+just checks       # the gate's fast half
 just ci           # the full gate, including the browser client
 just ui-deps      # install the browser client's locked dependencies
 just ui-check     # type-check, test, and build the browser client
@@ -54,6 +55,6 @@ The runtime's sandbox tests skip when the machine cannot start one. Set `NEHA_TE
 
 ## Evidence
 
-`just verify <directory>` runs the `ci` gate one recipe at a time and writes the source snapshot, tool versions, timings, and output to a new directory. The directory must be outside the repository.
+`just verify <directory> [recipe]` runs the `ci` gate, or the named recipe, one recipe at a time and writes the source snapshot, tool versions, timings, and output to a new directory. The directory must be outside the repository.
 
 A change that alters behavior is exercised through the real entry point, and the pull request records the scenario and result.

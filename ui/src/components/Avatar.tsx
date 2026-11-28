@@ -14,7 +14,10 @@ export default function Avatar(props: AvatarProps) {
       .join("");
 
   return (
-    <span class={`avatar avatar--${props.kind ?? "bot"} ${props.small ? "avatar--sm" : ""}`} aria-hidden="true">
+    <span
+      class={`avatar avatar--${props.kind ?? "bot"} ${props.small ? "avatar--sm" : ""}`}
+      aria-hidden="true"
+    >
       {initials()}
     </span>
   );

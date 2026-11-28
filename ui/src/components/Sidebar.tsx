@@ -1,7 +1,8 @@
-import { For, Show, createMemo } from "solid-js";
+import { createMemo, createSignal, For, Show } from "solid-js";
 
+import { computerLabel } from "../computer";
 import { t } from "../i18n";
-import type { Account, AttentionEntry, Bot, Chat, ChatStatus, Preview } from "../types";
+import type { Account, AttentionEntry, Bot, Chat, ChatStatus, Computer, Preview } from "../types";
 import Avatar from "./Avatar";
 import Brand from "./Brand";
 import Icon from "./Icon";
@@ -38,6 +39,14 @@ interface SidebarProps {
   onAttention: (entry: AttentionEntry) => void;
   onBot: (bot: Bot) => void;
   onSection: (section: SettingsSection) => void;
+  // Creates a Bot under the name and the Computer the form holds, and answers
+  // what the Space said when it made none.
+  onCreateBot: (name: string, computer?: string) => Promise<string | null>;
+  // The Computers a new Bot may work on, which the Bots surface reads.
+  computers: Computer[];
+  // Whether the Space has a Provider to work with: the client creates no Bot
+  // before one exists.
+  canCreateBot: boolean;
 }
 
 // One approval that waits: its Bot, what it asks for, and where to answer it.
@@ -55,12 +64,7 @@ function AttentionRow(props: { entry: AttentionEntry; onOpen: (entry: AttentionE
 }
 
 // One entry of a management list: the Bot or the Settings section it opens.
-function ManageRow(props: {
-  icon: string;
-  name: string;
-  active: boolean;
-  onSelect: () => void;
-}) {
+function ManageRow(props: { icon: string; name: string; active: boolean; onSelect: () => void }) {
   return (
     <button
       class={`conv${props.active ? " is-active" : ""}`}
@@ -80,8 +84,111 @@ function ManageRow(props: {
   );
 }
 
+// Naming a Bot, in the list it is about to join. The form owns what it is doing:
+// an empty name sends nothing, a refusal is the form's own to say, and a create
+// that is on its way cannot be taken back.
+function NewBotForm(props: {
+  computers: Computer[];
+  onCreate: (name: string, computer?: string) => Promise<string | null>;
+  onCancel: () => void;
+}) {
+  const [name, setName] = createSignal("");
+  // A new Bot works on the owner's Space Computer unless the User gives it one
+  // they already paired.
+  const [computer, setComputer] = createSignal("");
+  const [sending, setSending] = createSignal(false);
+  const [refused, setRefused] = createSignal<string | null>(null);
+  // The Local Computers the User owns, which are the ones a new Bot may be
+  // given. One that is offline is still theirs, so it is offered and explained
+  // rather than left out, and it cannot be chosen while it is.
+  const locals = () => props.computers.filter((known) => known.kind === "local");
+  const blank = () => name().trim() === "";
+
+  async function submit(event: SubmitEvent) {
+    event.preventDefault();
+    if (sending() || blank()) return;
+    const chosen = computer();
+    setSending(true);
+    setRefused(null);
+    const said = await props.onCreate(name().trim(), chosen === "" ? undefined : chosen);
+    // A create the Space answered is done: the Bot is there, so the form closes
+    // over a clean slate whatever the lists went on to say.
+    setSending(false);
+    if (said === null) {
+      setName("");
+      setComputer("");
+      props.onCancel();
+      return;
+    }
+    // A refusal keeps the name the User typed, and says what the Space said, so
+    // the form is the one place to fix it.
+    setRefused(said);
+  }
+
+  return (
+    <form class="side-form" onSubmit={submit}>
+      <label class="field">
+        <span class="field__label">{t("setup.bot.name")}</span>
+        <input
+          class="input"
+          name="bot_name"
+          type="text"
+          value={name()}
+          placeholder={t("setup.bot.nameHint")}
+          onInput={(event) => setName(event.currentTarget.value)}
+        />
+      </label>
+      <Show when={locals().length > 0}>
+        <label class="field">
+          <span class="field__label">{t("bots.new.computer")}</span>
+          <select
+            class="input"
+            name="bot_computer"
+            value={computer()}
+            onChange={(event) => setComputer(event.currentTarget.value)}
+          >
+            <option value="">{t("computer.space")}</option>
+            <For each={locals()}>
+              {(known) => (
+                <option value={known.id} disabled={!known.online}>
+                  {computerLabel(known)}
+                </option>
+              )}
+            </For>
+          </select>
+        </label>
+        <Show when={locals().some((known) => !known.online)}>
+          <span class="field__hint">{t("bots.new.computer.offline")}</span>
+        </Show>
+      </Show>
+      <div class="side-form__actions">
+        <button class="btn btn--primary" type="submit" disabled={sending() || blank()}>
+          {t("setup.bot.create")}
+        </button>
+        <button
+          class="btn btn--quiet"
+          type="button"
+          disabled={sending()}
+          onClick={() => props.onCancel()}
+        >
+          {t("common.cancel")}
+        </button>
+      </div>
+      <Show when={refused()}>
+        <p class="side-form__error" role="alert">
+          {refused()}
+        </p>
+      </Show>
+    </form>
+  );
+}
+
 export default function Sidebar(props: SidebarProps) {
   const botFor = (chat: Chat) => props.bots.find((bot) => bot.id === chat.bot);
+  // Naming a new Bot, which the Bots list holds the action for. The form
+  // replaces the list rather than sitting under it: a list that long scrolls
+  // away from the name being typed.
+  const [naming, setNaming] = createSignal(false);
   const preview = (chat: Chat) => {
     const recorded = props.previews[chat.id];
     if (recorded && "text" in recorded) {
@@ -121,125 +228,134 @@ export default function Sidebar(props: SidebarProps) {
       <Show
         when={managing()}
         fallback={
-          <>
-            <Show
-              when={!props.attentionOpen}
-              fallback={
-                <>
-                  <header class="sidebar__head">
-                    <Brand compact />
-                    <div>
-                      <h1 class="sidebar__title">{t("attention.title")}</h1>
-                      <p class="sidebar__sub">{countLabel()}</p>
-                    </div>
-                  </header>
-                  <div class="sidebar__list">
-                    <Show
-                      when={props.attention.length > 0}
-                      fallback={
-                        <div class="side-empty">
-                          <p class="side-empty__title">{t("attention.empty.title")}</p>
-                          <p class="side-empty__text">{t("attention.empty.text")}</p>
-                        </div>
-                      }
-                    >
-                      <For each={props.attention}>
-                        {(entry) => <AttentionRow entry={entry} onOpen={props.onAttention} />}
-                      </For>
-                    </Show>
+          <Show
+            when={!props.attentionOpen}
+            fallback={
+              <>
+                <header class="sidebar__head">
+                  <Brand compact />
+                  <div>
+                    <h1 class="sidebar__title">{t("attention.title")}</h1>
+                    <p class="sidebar__sub">{countLabel()}</p>
                   </div>
-                </>
-              }
-            >
-              <header class="sidebar__head">
-                <Brand compact />
-                <div>
-                  <h1 class="sidebar__title">{t("sidebar.chats")}</h1>
-                  <p class="sidebar__sub">
-                    {props.chats.length === 1
-                      ? t("sidebar.chats.one")
-                      : t("sidebar.chats.many", { count: props.chats.length })}
-                  </p>
+                </header>
+                <div class="sidebar__list">
+                  <Show
+                    when={props.attention.length > 0}
+                    fallback={
+                      <div class="side-empty">
+                        <p class="side-empty__title">{t("attention.empty.title")}</p>
+                        <p class="side-empty__text">{t("attention.empty.text")}</p>
+                      </div>
+                    }
+                  >
+                    <For each={props.attention}>
+                      {(entry) => <AttentionRow entry={entry} onOpen={props.onAttention} />}
+                    </For>
+                  </Show>
                 </div>
-              </header>
-
-              {/* The same list the attention view shows, above the Chats, so an
-                  approval stays one click away while the User reads. */}
-              <Show when={props.attention.length > 0}>
-                <section class="attention" aria-label={t("attention.title")}>
-                  <header class="attention__head">
-                    <Icon name="bell" size="sm" />
-                    <h2 class="attention__title">{t("attention.title")}</h2>
-                    <span class="attention__count" title={countLabel()}>
-                      {props.attention.length}
-                    </span>
-                  </header>
-                  <For each={props.attention}>
-                    {(entry) => <AttentionRow entry={entry} onOpen={props.onAttention} />}
-                  </For>
-                </section>
-              </Show>
-
-              <div class="sidebar__list">
-                <Show
-                  when={props.chats.length > 0}
-                  fallback={
-                    <div class="side-empty">
-                      <p class="side-empty__title">{t("sidebar.empty.title")}</p>
-                      <p class="side-empty__text">{t("sidebar.empty.text")}</p>
-                    </div>
-                  }
-                >
-                  <For each={props.chats}>
-                    {(chat) => {
-                      const bot = createMemo(() => botFor(chat));
-                      const line = createMemo(() => preview(chat));
-                      // One mark per Chat: waiting comes first, then working, then the
-                      // activity a User has not opened yet.
-                      const mark = () => {
-                        const status = props.statuses[chat.id] ?? "idle";
-                        if (status === "waiting") return { kind: "waiting", label: t("chat.waiting.short") };
-                        if (status === "working") return { kind: "working", label: t("chat.working") };
-                        if (props.unread[chat.id]) return { kind: "new", label: t("chat.newActivity") };
-                        return null;
-                      };
-                      return (
-                        <button
-                          class={`conv${props.activeChat?.id === chat.id ? " is-active" : ""}`}
-                          type="button"
-                          onClick={() => props.onSelect(chat)}
-                        >
-                          <Avatar name={bot()?.name ?? "Bot"} />
-                          <span class="conv__text">
-                            <span class="conv__top">
-                              <span class="conv__name">{bot()?.name ?? "Bot"}</span>
-                              <Show when={mark()} fallback={<span class="conv__meta">{t("chat.title")}</span>}>
-                                {(shown) => (
-                                  <span class={`conv__badge conv__badge--${shown().kind}`}>
-                                    <Show when={shown().kind === "waiting"} fallback={<i class="dot" />}>
-                                      <Icon name="alert" size="sm" />
-                                    </Show>
-                                    {shown().label}
-                                  </span>
-                                )}
-                              </Show>
-                            </span>
-                            <span class="conv__preview">{line()}</span>
-                          </span>
-                        </button>
-                      );
-                    }}
-                  </For>
-                </Show>
+              </>
+            }
+          >
+            <header class="sidebar__head">
+              <Brand compact />
+              <div>
+                <h1 class="sidebar__title">{t("sidebar.chats")}</h1>
+                <p class="sidebar__sub">
+                  {props.chats.length === 1
+                    ? t("sidebar.chats.one")
+                    : t("sidebar.chats.many", { count: props.chats.length })}
+                </p>
               </div>
+            </header>
+
+            {/* The same list the attention view shows, above the Chats, so an
+                  approval stays one click away while the User reads. */}
+            <Show when={props.attention.length > 0}>
+              <section class="attention" aria-label={t("attention.title")}>
+                <header class="attention__head">
+                  <Icon name="bell" size="sm" />
+                  <h2 class="attention__title">{t("attention.title")}</h2>
+                  <span class="attention__count" title={countLabel()}>
+                    {props.attention.length}
+                  </span>
+                </header>
+                <For each={props.attention}>
+                  {(entry) => <AttentionRow entry={entry} onOpen={props.onAttention} />}
+                </For>
+              </section>
             </Show>
-          </>
+
+            <div class="sidebar__list">
+              <Show
+                when={props.chats.length > 0}
+                fallback={
+                  <div class="side-empty">
+                    <p class="side-empty__title">{t("sidebar.empty.title")}</p>
+                    <p class="side-empty__text">{t("sidebar.empty.text")}</p>
+                  </div>
+                }
+              >
+                <For each={props.chats}>
+                  {(chat) => {
+                    const bot = createMemo(() => botFor(chat));
+                    const line = createMemo(() => preview(chat));
+                    // One mark per Chat: waiting comes first, then working, then the
+                    // activity a User has not opened yet.
+                    const mark = () => {
+                      const status = props.statuses[chat.id] ?? "idle";
+                      if (status === "waiting")
+                        return { kind: "waiting", label: t("chat.waiting.short") };
+                      if (status === "working")
+                        return { kind: "working", label: t("chat.working") };
+                      if (props.unread[chat.id])
+                        return { kind: "new", label: t("chat.newActivity") };
+                      return null;
+                    };
+                    return (
+                      <button
+                        class={`conv${props.activeChat?.id === chat.id ? " is-active" : ""}`}
+                        type="button"
+                        onClick={() => props.onSelect(chat)}
+                      >
+                        <Avatar name={bot()?.name ?? "Bot"} />
+                        <span class="conv__text">
+                          <span class="conv__top">
+                            <span class="conv__name">{bot()?.name ?? "Bot"}</span>
+                            <Show
+                              when={mark()}
+                              fallback={<span class="conv__meta">{t("chat.title")}</span>}
+                            >
+                              {(shown) => (
+                                <span class={`conv__badge conv__badge--${shown().kind}`}>
+                                  <Show
+                                    when={shown().kind === "waiting"}
+                                    fallback={<i class="dot" />}
+                                  >
+                                    <Icon name="alert" size="sm" />
+                                  </Show>
+                                  {shown().label}
+                                </span>
+                              )}
+                            </Show>
+                          </span>
+                          <span class="conv__preview">{line()}</span>
+                        </span>
+                      </button>
+                    );
+                  }}
+                </For>
+              </Show>
+            </div>
+          </Show>
         }
       >
         <header class="sidebar__head">
           <Brand compact />
           <div>
-            <h1 class="sidebar__title">{props.view === "bots" ? t("sidebar.bots") : t("sidebar.settings")}</h1>
+            <h1 class="sidebar__title">
+              {props.view === "bots" ? t("sidebar.bots") : t("sidebar.settings")}
+            </h1>
             <Show when={props.view === "bots"}>
               <p class="sidebar__sub">
                 {props.bots.length === 1
@@ -275,24 +391,41 @@ export default function Sidebar(props: SidebarProps) {
             }
           >
             <Show
-              when={props.bots.length > 0}
+              when={!naming()}
               fallback={
-                <div class="side-empty">
-                  <p class="side-empty__title">{t("sidebar.bots.empty.title")}</p>
-                  <p class="side-empty__text">{t("sidebar.bots.empty.text")}</p>
-                </div>
+                <NewBotForm
+                  computers={props.computers}
+                  onCreate={(name, computer) => props.onCreateBot(name, computer)}
+                  onCancel={() => setNaming(false)}
+                />
               }
             >
-              <For each={props.bots}>
-                {(bot) => (
-                  <ManageRow
-                    icon="cpu"
-                    name={bot.name}
-                    active={props.activeBot === bot.id}
-                    onSelect={() => props.onBot(bot)}
-                  />
-                )}
-              </For>
+              <Show when={props.canCreateBot}>
+                <button class="side-new" type="button" onClick={() => setNaming(true)}>
+                  <Icon name="plus" size="sm" />
+                  {t("bots.new")}
+                </button>
+              </Show>
+              <Show
+                when={props.bots.length > 0}
+                fallback={
+                  <div class="side-empty">
+                    <p class="side-empty__title">{t("sidebar.bots.empty.title")}</p>
+                    <p class="side-empty__text">{t("sidebar.bots.empty.text")}</p>
+                  </div>
+                }
+              >
+                <For each={props.bots}>
+                  {(bot) => (
+                    <ManageRow
+                      icon="cpu"
+                      name={bot.name}
+                      active={props.activeBot === bot.id}
+                      onSelect={() => props.onBot(bot)}
+                    />
+                  )}
+                </For>
+              </Show>
             </Show>
           </Show>
         </div>

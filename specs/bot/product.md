@@ -22,7 +22,7 @@ A Bot works once the Space has a Provider.
 
 ## The Bot's page
 
-A Bot has a page with its name, picture, Computer, access, and Model. The owner edits them; other Users read them.
+A Bot has a page with its name, picture, Computer, access, Model, and memory. The owner edits its name, picture, Computer, access, and Model; other Users read them. The owner views the memory entries and deletes any of them there; [Client](../client/product.md#memory) owns the page.
 
 | Field | What it holds | Who changes it |
 | --- | --- | --- |
@@ -31,8 +31,9 @@ A Bot has a page with its name, picture, Computer, access, and Model. The owner 
 | Computer | The Hosted or Local Computer it lives on | The owner, on the page or with `neha bot move` |
 | Access | Who else can use the Bot, the folders it can write, whether it has full access, and its Ask and Allow rules | The owner |
 | Model | The Model it thinks with and its thinking level; the Space's default unless the owner chooses | The owner; the Admin sets the Space's default |
+| Memory | The entries it keeps, as `rule` and `note`, and the room each kind has left | The Bot writes its `note` entries; a User's words start a `rule`; the owner clears any entry |
 
-The page shows what the Bot can reach on its Computer: the granted folders, full access, and the rules. [Computer](../computer/product.md#what-a-bot-can-do) owns the folders and full access, and [asking before an action](#asking-before-an-action) owns the rules.
+The page shows what the Bot can reach on its Computer: the granted folders, full access, and the Ask and Allow rules. [Computer](../computer/product.md#what-a-bot-can-do) owns the folders and full access, and [asking before an action](#asking-before-an-action) owns the rules.
 
 The owner chooses the Bot's Model and thinking level, and clears each back to the Space's default. A clear and a choice for the same field in one change are refused, so the result never depends on their order. [Model](../model/product.md) covers connecting Providers and choosing a Model.
 
@@ -46,7 +47,14 @@ A move to a Computer that does not serve the access the Bot carries is refused, 
 
 ## Memory
 
-A Bot keeps what it learns as memory entries. The default scope is the owner's Chats; a Chat entry belongs to that Chat's User, and a Group entry belongs to the Group.
+A Bot keeps what it learns as memory entries of two kinds.
+
+| Kind | What it is | What starts it |
+| --- | --- | --- |
+| `rule` | A lasting instruction; the Bot's job is the earliest `rule` in `owner` scope that still applies | A User's words, never the Bot on its own |
+| `note` | What the Bot noticed, kept as data | The Bot, with its memory tool |
+
+The default scope is the owner's Chats; a Chat entry belongs to that Chat's User, and a Group entry belongs to the Group.
 
 | Scope | Applies in | Who reads it | Who clears it |
 | --- | --- | --- | --- |
@@ -54,13 +62,21 @@ A Bot keeps what it learns as memory entries. The default scope is the owner's C
 | User | One other User's Chat | That User | That User, and the owner |
 | Group | The Group where it was learned | Every member of the Group | Its author, and the owner |
 
-When a User asks a Bot to remember something, it keeps the entry at the scope of that conversation. In a Group, an entry from a non-owner waits as a suggestion.
+When a User asks a Bot to remember something, it keeps the entry at the scope of that conversation. A User can ask what the Bot remembers. The Bot answers from the entries that apply to that request, and it deletes an entry when the User who can clear it asks.
 
-A suggestion applies to nothing until the owner approves it. A rule the owner gives in a Group applies to the Group.
+The owner can audit every entry's scope, author, and source without reading a User entry's content. A User sees and clears the entries that are theirs, including the `note` entries the Bot wrote while acting for that User.
 
-The owner can audit every entry's scope, author, and source without reading a User entry's content, and can clear any entry. A User sees and clears the entries that are theirs by asking the Bot in the Chat.
+The Bot merges or removes its own `note` entries. A Bot's memory holds at most 4 KiB of `rule` text and 16 KiB of `note` text, counted in UTF-8 bytes.
 
-As a conversation grows past what the Model can hold, the Bot summarizes its older parts. Lasting rules live in memory and stay.
+A write that passes a limit changes nothing, and the Bot says that its memory is full. A write that makes room clears or changes entries in the same request, and the request changes everything or nothing.
+
+A memory write needs no approval, and no Ask or Allow rule covers it.
+
+A template copy carries the Bot's `owner` rules that still apply, including its job, and no `note`, `user`, or `group` entry.
+
+Memory has no on or off switch.
+
+As a conversation grows past what the Model can hold, the Bot summarizes its older parts. Lasting memory rules live in memory and stay.
 
 ## Skills
 
@@ -108,7 +124,7 @@ An Always allow that would grant a folder is refused when the Bot's Computer ser
 
 An Ask rule makes the Bot ask before a kind of action, and an Allow rule lets it proceed without asking. Which rule wins, which forms a rule cannot judge, and what an Always allow writes follow [design](design.md#approvals).
 
-A rule belongs to a Bot on a Local Computer. A Bot on a Hosted Computer takes no rule: a Hosted Computer does not ask before an action yet, so the Space refuses one rather than record it.
+An Ask or Allow rule belongs to a Bot on a Local Computer and covers only a Computer action, never a memory write. A Bot on a Hosted Computer takes no rule: a Hosted Computer does not ask before an action yet, so the Space refuses one rather than record it.
 
 While a Bot waits for an answer, its other work goes on.
 
@@ -124,7 +140,7 @@ A request also ends when the User leaves the conversation, the Computer is revok
 
 These actions always need the acting User's Allow, and a lasting rule never covers them:
 
-- Changing the Bot's rules or instructions.
+- Changing the Bot's Ask or Allow rules, its access, its Model, or its Computer.
 - Accepting a Bot connection from another owner.
 - The first use of a Local Computer.
 - The first use of an app on a Computer.
@@ -157,8 +173,8 @@ The owner shares a Bot as a template: a link that admits any User of the Space t
 
 | A copy carries | A copy leaves behind |
 | --- | --- |
-| Name and picture | Memory |
-| The Bot's job and rules | Its Chats |
+| Name and picture | Its `note`, `user`, and `group` entries |
+| The Bot's job and its `owner` rules that still apply | Its Chats |
 | The skills the Bot itself wrote | Its Computer and credentials |
 | | Its Schedules and Watchers |
 
@@ -169,6 +185,7 @@ The owner shares a Bot as a template: a link that admits any User of the Space t
 - A Hosted Computer does not ask before an action yet.
 - The Bot's page does not show approvals yet.
 - An independent reviewer of approvals is not yet specified.
+- Group memory, its suggestions, and their approval are not yet available.
 - A template shared across Spaces is not yet specified.
 - Changing a Bot's picture is not yet available; a Bot's picture is the initials of its name, and a User cannot upload or replace one.
 - Changing who else can use a Bot is not yet available; it arrives when a Bot is shared among several Users.
