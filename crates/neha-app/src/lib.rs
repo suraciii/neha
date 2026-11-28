@@ -7,3 +7,7 @@
 pub mod cli;
 pub mod client;
 pub mod computer;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use cli::test_support;
