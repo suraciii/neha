@@ -134,9 +134,15 @@ The built-in loop offers `remember`, `forget`, and `list_memories`. `remember` w
 
 `forget` by text matches only an entry the caller reads and MAY remove; the owner removes another User's entry by the id its metadata names.
 
-The targets of `remember` are ids of entries the acting User can remove, and a call whose target does not exist or cannot be removed changes nothing.
+`remember` names its targets by id, and each target is an entry of the same Bot that still applies and that the acting User can remove. A call with a target that is absent, superseded, or not removable changes no memory entry.
 
-A memory write is a record event and needs no approval. It records `neha.memory.added`, a removal records `neha.memory.removed`, and [Space](../space/design.md#memory-events) owns those kinds. A memory tool is a record operation and not an Action: it never reaches the Computer, no unknown-action recovery applies to it, and no approval or Ask or Allow rule covers it.
+A memory write is a record event and needs no approval. It records `neha.memory.added`, a removal records `neha.memory.removed`, and [Space](../space/design.md#memory-events) owns those kinds. A memory read records no entry change; its answer is still a record event.
+
+A memory tool is a record operation and not an Action: it never reaches the Computer, no unknown-action recovery applies to it, and no approval or Ask or Allow rule covers it.
+
+A memory tool call's answer is a record event: it is appended with the entry changes the call makes, or alone when the call changes no memory entry. It covers a no-op, a refusal, and an error alike. A replay returns the recorded answer and does not run the call again; [Space](../space/design.md#memory-events) owns its kind `neha.memory.answered`.
+
+For one Bot, a memory read, a tool write, and a management removal form one serial order: each is planned and recorded without another of them in flight, and a second removal of one id sees the first one committed. A write and its answer commit together or not at all.
 
 The Bot merges or removes its own `note` entries. A Bot never removes a `rule` on its own. The owner removes any entry, and a User removes the entries that User's words gave and the `note` entries the Bot wrote while acting for that User.
 
