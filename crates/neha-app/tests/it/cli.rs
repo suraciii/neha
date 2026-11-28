@@ -5678,10 +5678,20 @@ async fn chat_read_marks_a_compacted_chat_without_its_summary() {
     // larger than the context, so the run compacts the span, writes its
     // summary, and retries.
     let summary = "an earlier summary standing in for the first notes";
-    for (text, reply) in [("first", "first done"), ("second", "second done")] {
-        script.say(reply);
-        let sent = run(&home, &credential, &["chat", "send", "--chat", &chat, text]);
-        assert!(sent.contains(reply), "{sent}");
+    // Long Messages make a short summary strictly shorter than the span it
+    // replaces, so the refused request is retried.
+    let long = |prefix: &str| format!("{prefix}{}", "x".repeat(200));
+    for (text, reply) in [
+        (long("first "), "first done".to_owned()),
+        (long("second "), "second done".to_owned()),
+    ] {
+        script.say(&reply);
+        let sent = run(
+            &home,
+            &credential,
+            &["chat", "send", "--chat", &chat, &text],
+        );
+        assert!(sent.contains(&reply), "{sent}");
     }
     script.too_large();
     script.say(r#"[{"text": "the owner sent two notes"}]"#);
@@ -5700,9 +5710,10 @@ async fn chat_read_marks_a_compacted_chat_without_its_summary() {
     let position = |line: &str| -> usize {
         lines
             .iter()
-            .position(|shown| shown.ends_with(line))
+            .position(|shown| shown.contains(line))
             .unwrap_or_else(|| panic!("no `{line}` Message in:\n{read}"))
     };
+    let first = position("User: first");
     let (second, third) = (position("User: second"), position("User: third"));
     let marker = lines
         .iter()
@@ -5711,7 +5722,7 @@ async fn chat_read_marks_a_compacted_chat_without_its_summary() {
     // The boundary is inside the first dialogue, so the marker follows one of
     // its Messages and the third Message stays after the summary's span.
     assert!(
-        second <= marker && marker < third,
+        first < marker && marker < second && second < third,
         "the marker follows a compacted Message:\n{read}"
     );
     assert_eq!(

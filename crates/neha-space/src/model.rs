@@ -741,6 +741,12 @@ async fn read_responses_stream(
                 }
             }
             "response.failed" | "error" => {
+                let message = provider_error(&value, data);
+                // A failed response that names an over-long input is the
+                // context limit, not a Provider fault.
+                if says_input_too_long(&serde_json::to_string(&value).unwrap_or_default()) {
+                    return Err(ModelError::ContextTooLarge);
+                }
                 let usage = value
                     .pointer("/response/usage")
                     .and_then(|reported| {
@@ -748,7 +754,7 @@ async fn read_responses_stream(
                     })
                     .map_or(usage, ResponsesUsage::normalize);
                 return Err(ModelError::ProviderStream {
-                    message: provider_error(&value, data),
+                    message,
                     usage,
                     retryable: responses_error_retryable(&value),
                 });
@@ -1494,9 +1500,32 @@ fn map_status(
         429 => ModelError::RateLimited { retry_after },
         413 => ModelError::ContextTooLarge,
         500..=599 => ModelError::Server { retry_after },
-        _ if body.to_lowercase().contains("context") => ModelError::ContextTooLarge,
+        _ if says_input_too_long(body) => ModelError::ContextTooLarge,
         _ => ModelError::Request(body.to_owned()),
     }
+}
+
+/// The phrases a Provider uses for an input larger than its context.
+///
+/// Only these mean the request was too long. A rejected parameter that merely
+/// mentions the context (`unsupported context parameter`) is a request error
+/// and must not compact the conversation.
+const INPUT_TOO_LONG_MARKERS: [&str; 6] = [
+    "context_length_exceeded",
+    "context length exceeded",
+    "context_window_exceeded",
+    "prompt is too long",
+    "input is too long",
+    "maximum context length",
+];
+
+/// Returns whether one Provider error says the input is too long.
+fn says_input_too_long(body: &str) -> bool {
+    let body = body.to_lowercase();
+
+    INPUT_TOO_LONG_MARKERS
+        .iter()
+        .any(|marker| body.contains(marker))
 }
 
 #[derive(Serialize)]
@@ -1810,7 +1839,7 @@ mod tests {
 
     use super::{
         ChatMessage, ChatRequest, ChatRole, ChatTool, ChatToolCall, ModelClient, ModelError,
-        ProviderProtocol, ThinkingLevel, Usage,
+        ProviderProtocol, ThinkingLevel, Usage, map_status, says_input_too_long,
     };
 
     async fn provider(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -3489,5 +3518,44 @@ mod tests {
             "thinking None sends no reasoning_effort"
         );
         task.abort();
+    }
+
+    #[test]
+    fn only_an_input_too_long_error_compacts() {
+        let too_large = |body: &str| {
+            matches!(
+                map_status(reqwest::StatusCode::BAD_REQUEST, None, body),
+                ModelError::ContextTooLarge
+            )
+        };
+        // An explicit too-long status or code is the context limit.
+        assert!(matches!(
+            map_status(reqwest::StatusCode::PAYLOAD_TOO_LARGE, None, ""),
+            ModelError::ContextTooLarge
+        ));
+        assert!(too_large(r#"{"error":{"code":"context_length_exceeded"}}"#));
+        assert!(too_large(
+            r#"{"error":{"message":"the prompt is too long"}}"#
+        ));
+        assert!(too_large(
+            r#"{"error":{"message":"input is too long for this model"}}"#
+        ));
+        assert!(too_large(
+            r#"{"error":{"message":"maximum context length is 128000 tokens"}}"#
+        ));
+        // A rejected parameter that merely mentions the context is a request
+        // error: it must not compact the conversation.
+        assert!(!too_large(
+            r#"{"error":{"message":"unsupported context parameter"}}"#
+        ));
+        assert!(matches!(
+            map_status(
+                reqwest::StatusCode::BAD_REQUEST,
+                None,
+                r#"{"error":{"message":"unsupported context parameter"}}"#
+            ),
+            ModelError::Request(_)
+        ));
+        assert!(!says_input_too_long("the request is fine"));
     }
 }

@@ -1337,7 +1337,7 @@ impl State {
 /// A Card is presentation. A Message that carries only a Card would become an
 /// empty turn in the Model's history, so the history leaves it out; a Message
 /// with text or a File beside its Card is kept.
-fn speaks_to_the_model(message: &MessageView) -> bool {
+pub(crate) fn speaks_to_the_model(message: &MessageView) -> bool {
     message.file.is_some() || !message.text.trim().is_empty() || message.card.is_none()
 }
 

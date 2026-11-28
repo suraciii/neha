@@ -938,6 +938,8 @@ enum ScriptedReply {
     },
     /// The Provider refuses the request as larger than its context.
     TooLarge,
+    /// The Provider rejects the request as malformed, with this body.
+    BadRequest(String),
 }
 
 /// A scripted Provider whose replies run in order; a `Hold` reply waits
@@ -995,6 +997,13 @@ async fn gated_provider(
                             .status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
                             .header(CONTENT_TYPE, "application/json")
                             .body(Body::from("{\"error\":\"context length exceeded\"}"))
+                            .unwrap();
+                    }
+                    ScriptedReply::BadRequest(body) => {
+                        return Response::builder()
+                            .status(axum::http::StatusCode::BAD_REQUEST)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
                             .unwrap();
                     }
                     ScriptedReply::Text(text) => {
@@ -22592,6 +22601,50 @@ async fn an_mcp_app_tool_records_its_card_and_html() {
         );
         assert!(!body.contains("token-1"));
     }
+    // A later run leaves the Card-only Message out of its history: it would
+    // be an empty assistant turn. The Chat still lists the Card.
+    let later = send(&mut socket, chat, "hello again").await;
+    assert_eq!(later["status"], "succeeded", "{later}");
+    {
+        let requests = recorded.lock().unwrap();
+        let last = requests.last().expect("the later run asked the Model");
+        let history = last["messages"].as_array().unwrap();
+        assert_eq!(
+            history.len(),
+            4,
+            "only the system prompt and the spoken Messages reach the Model: {history:?}"
+        );
+        assert_eq!(history[0]["role"], "system");
+        assert_eq!(history[1]["content"], "search");
+        assert_eq!(history[2]["content"], "done");
+        assert_eq!(history[3]["content"], "hello again");
+        assert!(
+            history
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .all(|message| message["content"]
+                    .as_str()
+                    .is_some_and(|content| !content.is_empty())),
+            "no empty assistant turn is sent"
+        );
+    }
+    let messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    assert_eq!(
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["card"].is_object())
+            .count(),
+        1,
+        "the Chat keeps the Card"
+    );
+
     // The app is read once, by the client the call used.
     {
         let seen = log.lock().unwrap();
@@ -27306,8 +27359,20 @@ async fn a_long_chat_compacts_before_the_run() {
     // answer; both extra calls are separate requests to the same Model.
     let requests = recorded.lock().unwrap().clone();
     assert_eq!(requests.len(), 6, "two seed runs and the compacted run");
-    assert_eq!(requests[3]["max_tokens"], 4096, "the flush turn's cap");
-    assert_eq!(requests[4]["max_tokens"], 8192, "the summary's cap");
+    // A private request never asks for more than the Model declared it can
+    // give: this Model's maximum output is 100 tokens.
+    for request in &requests {
+        assert!(
+            request["max_tokens"].as_u64().unwrap() <= 100,
+            "a private request caps its output at the Model's: {request}"
+        );
+    }
+    assert_eq!(
+        requests[3]["max_tokens"],
+        json!(100),
+        "the flush turn's cap"
+    );
+    assert_eq!(requests[4]["max_tokens"], json!(100), "the summary's cap");
     let main = &requests[5];
     let system = main["messages"][0]["content"].as_str().unwrap();
     assert!(
@@ -27422,10 +27487,16 @@ async fn a_provider_that_says_the_input_is_too_long_compacts_and_retries() {
     ])
     .await;
     let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
-    for message in ["first", "second"] {
-        let result = send(&mut socket, chat, message).await;
+    // The conversation is long enough that a short summary is strictly
+    // shorter than the history it replaces.
+    let mut history = 0;
+    for prefix in ["first ", "second "] {
+        let message = format!("{prefix}{}", "x".repeat(300));
+        let result = send(&mut socket, chat, &message).await;
         assert_eq!(result["status"], "succeeded", "{result}");
+        history += 1;
     }
+    assert_eq!(history, 2);
 
     let third = send(&mut socket, chat, "third").await;
     assert_eq!(third["status"], "succeeded", "{third}");
@@ -27444,16 +27515,33 @@ async fn a_provider_that_says_the_input_is_too_long_compacts_and_retries() {
             .any(|message| message["content"] == "third"),
         "the first request held the whole Chat"
     );
-    assert_eq!(requests[3]["max_tokens"], 4096);
-    assert_eq!(requests[4]["max_tokens"], 8192);
+    for request in &requests {
+        assert!(
+            request["max_tokens"].as_u64().unwrap() <= 8_192,
+            "a private request caps its output at the Model's: {request}"
+        );
+    }
+    assert_eq!(requests[3]["max_tokens"], json!(4096));
+    assert_eq!(requests[4]["max_tokens"], json!(8192));
     let retried = requests[5]["messages"].as_array().unwrap();
-    assert_eq!(retried.len(), 3, "{retried:?}");
+    assert_eq!(
+        retried.len(),
+        5,
+        "the retried request keeps the text after the cut: {retried:?}"
+    );
     assert!(
         retried[1]["content"]
             .as_str()
             .unwrap()
             .starts_with("Summary of earlier messages (data):"),
         "{retried:?}"
+    );
+    // The silent turn wrote a note, so the retried request reads the prompt
+    // rebuilt from the record.
+    let system = requests[5]["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("the owner sent two notes"),
+        "the new note reaches the next request's prompt: {system}"
     );
 
     let chat_messages = command(
@@ -27520,6 +27608,61 @@ async fn a_chat_with_no_span_to_compact_sends_only_the_run() {
     );
 
     capable.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrelated_provider_error_does_not_compact() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![
+        // A rejected parameter that mentions the context is not an over-long
+        // input: it must not compact the conversation.
+        ScriptedReply::BadRequest(
+            "{\"error\":{\"message\":\"unsupported context parameter\",\
+             \"code\":\"unsupported_parameter\"}}"
+                .to_owned(),
+        ),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+    let queued = submit(&mut socket, chat, "hello", None).await;
+    let run = run_of(&queued);
+    let shown = wait_run(&mut socket, run).await;
+    assert_eq!(shown["status"], "failed", "{shown}");
+    assert_eq!(
+        recorded.lock().unwrap().len(),
+        1,
+        "the rejected request is neither compacted nor retried"
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_that_cannot_hold_its_output_never_compacts() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![text("hello")]).await;
+    // A window smaller than the Model's own output leaves no input room:
+    // nothing can be compacted into it.
+    command(&mut socket, Id::new(), provider_add_limits(base, 100, 200)).await;
+    let created = command(&mut socket, Id::new(), bot_create()).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+
+    let result = send(&mut socket, chat, "hi").await;
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(
+        recorded.lock().unwrap().len(),
+        1,
+        "a window with no input room compacts nothing and retries nothing"
+    );
+
     socket.close(None).await.unwrap();
     provider_task.abort();
     running.shutdown().await;

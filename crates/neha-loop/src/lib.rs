@@ -15,8 +15,8 @@ pub use model::{
     Continuation, Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall, ToolSpec,
 };
 pub use run::{
-    Authorization, Decision, Dispatched, LoopError, McpIdentity, RecordedCall, Recorder, Resume,
-    RunOutcome, RunRequest, Runtime, ScriptIdentity, WaitingApproval, call_id, chars_of,
-    context_threshold, estimate_tokens, message_chars, run,
+    Authorization, Compaction, Decision, Dispatched, LoopError, McpIdentity, RecordedCall,
+    Recorder, Resume, RunOutcome, RunRequest, Runtime, ScriptIdentity, WaitingApproval, call_id,
+    chars_of, context_threshold, estimate_tokens, message_chars, run,
 };
 pub use tools::SpaceCall;
