@@ -3849,12 +3849,12 @@ mod tests {
 pub mod test_support {
     use std::path::Path;
 
-    /// Reads the folder a `grant --folder` argument names.
+    /// Reads the folder a `grant` path argument names.
     pub fn checked_grant(path: &Path) -> anyhow::Result<String> {
         super::checked_grant(path)
     }
 
-    /// Reads the folder a `revoke --folder` argument names.
+    /// Reads the folder a `revoke` path argument names.
     pub fn revocable_grant(path: &Path, shown: &[String]) -> anyhow::Result<String> {
         super::revocable_grant(path, shown)
     }

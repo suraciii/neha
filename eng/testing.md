@@ -40,7 +40,7 @@ A change that adds more than 30 seconds to `just ci` reports the measured cost i
   hand, or the write roots a fence test inspects). The integration target
   declares `required-features = ["test-support"]`, and the gate runs
   `cargo test --all-features`, so the tests run with the feature while a
-  production build never compiles it.
+  default build omits it.
 - A doc test is for a public example that a reader will copy.
 
 ## Fixtures
