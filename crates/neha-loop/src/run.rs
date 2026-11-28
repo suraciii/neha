@@ -832,7 +832,7 @@ struct Anchor {
 }
 
 /// One Message's identity in a request prefix: its role, size, and content.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Fingerprint {
     role: u8,
     chars: u64,
@@ -911,9 +911,10 @@ const PRUNED_TOOL_RESULT: &str = "[tool result removed from context; call ";
 /// Projects one request: old tool results become placeholders until the input
 /// fits, and the estimate says what the projection costs.
 ///
-/// The anchor covers the system Message, the schemas, and the prefix of the
-/// previous request; when that prefix is trimmed or replaced, the estimate
-/// starts from zero over the projection instead.
+/// The anchor covers the prefix of the previous request. While the candidate
+/// projection still starts with that exact prefix the Provider's count is
+/// reused; once a replacement lands inside it, the estimate starts from zero
+/// over the projection instead.
 fn project(
     messages: &[Message],
     tools: &[ToolSpec],
@@ -923,10 +924,12 @@ fn project(
 ) -> Projection {
     let mut projection = messages.to_vec();
     // The Provider's count covers the request it saw, placeholders included.
-    // It is only reusable while the raw prefix is byte-for-byte what that
-    // request sent; otherwise the estimate starts from the current text.
-    let anchored = anchor.filter(|anchor| prefix_matches(&anchor.prefix, messages));
-    let mut estimate = estimate_projection(&projection, tools, anchored.as_ref());
+    // It is reused only while the candidate projection's prefix is
+    // byte-for-byte what that request sent; otherwise the estimate starts
+    // from the current text. The check runs on the candidate, not the raw
+    // Messages: a trim can restore the exact placeholder prefix the Provider
+    // counted, and then the count still covers it.
+    let mut estimate = estimate_projection(&projection, tools, anchor.as_ref());
     let Some(budget) = input_budget(context_window, max_output) else {
         return Projection {
             messages: projection,
@@ -961,7 +964,7 @@ fn project(
         // A replacement after the anchored prefix keeps the Provider's count;
         // one inside it invalidates the anchor, and the candidate is counted
         // from zero again.
-        estimate = estimate_projection(&projection, tools, anchored.as_ref());
+        estimate = estimate_projection(&projection, tools, anchor.as_ref());
         if estimate < budget {
             break;
         }
@@ -3036,11 +3039,10 @@ mod tests {
     #[test]
     fn an_anchor_covers_only_the_prefix_a_request_actually_sent() {
         // The first request trims a 12,000-character tool result to a
-        // placeholder and sends about 3,026 characters. The next request holds
-        // the same raw result again, so the Provider's 36-token count covers a
-        // prefix that is not this text: the estimate must count what the next
-        // trimmed request will actually send, and the result must be trimmed
-        // again.
+        // placeholder. The next request holds the same raw result again, but
+        // trimming it restores the exact placeholder prefix the Provider
+        // counted: the anchored count stays valid, and the result is trimmed
+        // again so the request really is that prefix.
         let tools = probe_tools();
         let mut messages = vec![
             Message::system("system"),
@@ -3090,15 +3092,17 @@ mod tests {
             "the second request trims the same result again: {:?}",
             second.messages[2].content
         );
+        // Trimming restores exactly the placeholder prefix the Provider
+        // counted, so its 36 tokens still cover the request: the appended
+        // "done" adds one token.
         assert_eq!(
+            second.estimate, 37,
+            "the anchor covers the restored placeholder prefix"
+        );
+        assert_ne!(
             second.estimate,
             estimate_tokens(&second.messages, &tools),
-            "the estimate counts the request that will be sent, not the anchor"
-        );
-        assert!(
-            second.estimate > 100,
-            "36 anchored tokens do not cover the raw result: {}",
-            second.estimate
+            "counting the whole text from zero would report the raw result"
         );
     }
 
@@ -3201,6 +3205,88 @@ mod tests {
             "a replacement inside the prefix invalidates the anchored count"
         );
         assert!(projection.estimate < 5_000);
+    }
+
+    #[test]
+    fn a_second_step_can_reuse_the_anchor_after_trimming_the_same_result() {
+        // The previous step was sent with its oldest result trimmed to the
+        // placeholder this step restores at the same position. The Provider
+        // counted 4,350 input tokens for that request; the step appends one
+        // call and result (108 characters, 27 tokens), so the candidate is
+        // 4,377 tokens: over the 4,364-token threshold. Counting the whole
+        // text from zero would report 1,069 and skip the compaction.
+        let tools = vec![ToolSpec {
+            name: "shell".to_owned(),
+            description: "d".repeat(4_000),
+            parameters: json!({}),
+        }];
+        let mut raw = vec![Message::system("system"), Message::user("go")];
+        for (id, content) in [
+            ("call-a", "A".repeat(300_000)),
+            ("call-b", "B".repeat(10)),
+            ("call-c", "C".repeat(10)),
+            ("call-d", "D".repeat(10)),
+        ] {
+            raw.push(Message::assistant_with_calls(
+                None,
+                vec![call(id, "shell", json!({}))],
+            ));
+            raw.push(Message::tool_result(id, content));
+        }
+        // The first step's raw text is over the 69,900-token input budget, so
+        // its oldest result becomes a placeholder.
+        let first = project(&raw, &tools, None, 70_000, 100);
+        assert!(
+            first.messages[3]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("call call-a"),
+            "{:?}",
+            first.messages[3].content
+        );
+        let anchor = Anchor {
+            tokens: 4_350,
+            prefix: first.messages.iter().map(fingerprinted).collect(),
+        };
+
+        // The step appends one more call and result after the sent prefix.
+        let mut next = raw;
+        next.push(Message::assistant_with_calls(
+            None,
+            vec![call("call-e", "shell", json!({}))],
+        ));
+        next.push(Message::tool_result("call-e", "e".repeat(89)));
+        let second = project(&next, &tools, Some(anchor.clone()), 70_000, 100);
+
+        assert!(
+            second.messages[3]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("call call-a"),
+            "the same result is trimmed to the same placeholder: {:?}",
+            second.messages[3].content
+        );
+        assert_eq!(
+            fingerprinted(&second.messages[3]),
+            anchor.prefix[3],
+            "the restored placeholder is the prefix the Provider counted"
+        );
+        assert_eq!(context_threshold(70_000, 100), Some(4_364));
+        assert_eq!(
+            second.estimate, 4_377,
+            "the Provider's count plus the 27 appended tokens"
+        );
+        assert!(
+            second.estimate > 4_364,
+            "the step is over the compaction threshold"
+        );
+        assert_eq!(
+            estimate_tokens(&second.messages, &tools),
+            1_069,
+            "counting the whole text from zero would hide the overage"
+        );
     }
 
     #[tokio::test]
