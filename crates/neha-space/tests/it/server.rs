@@ -28784,6 +28784,176 @@ async fn every_response_carries_a_request_id_and_a_traceparent() {
     );
 }
 
+/// Restores the metrics token when a test ends, including on panic.
+struct MetricsToken;
+impl Drop for MetricsToken {
+    fn drop(&mut self) {
+        neha_space::metrics::set_token_for_test(None);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_are_token_protected_and_readyz_turns_503_when_closed() {
+    let (_dir, running, _invite) = running().await;
+    let client = reqwest::Client::new();
+    let url = running.url();
+
+    // A disabled endpoint must not reveal that the route exists, whatever the
+    // host environment or method.
+    neha_space::metrics::disable_token_for_test();
+    let _restore = MetricsToken;
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::HEAD,
+        reqwest::Method::POST,
+    ] {
+        assert_eq!(
+            client
+                .request(method, format!("{url}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404,
+            "a disabled endpoint answers 404 for every method"
+        );
+    }
+
+    let token = "metrics-test-token-0123456789abcdef";
+    neha_space::metrics::set_token_for_test(Some(token));
+
+    assert_eq!(
+        client
+            .get(format!("{url}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "a missing token is refused"
+    );
+    assert_eq!(
+        client
+            .get(format!("{url}/metrics"))
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "a wrong token is refused"
+    );
+    for method in [reqwest::Method::HEAD, reqwest::Method::POST] {
+        assert_eq!(
+            client
+                .request(method, format!("{url}/metrics"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            405,
+            "only GET is served"
+        );
+    }
+
+    let response = client
+        .get(format!("{url}/metrics"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain; version=0.0.4"),
+        "Prometheus text content type"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no-store"
+    );
+    let first = response.text().await.unwrap();
+    assert!(first.contains("neha_build_info"), "{first}");
+    assert!(first.contains("neha_http_requests_total"), "{first}");
+    assert!(first.contains("neha_workers_running"), "{first}");
+    assert!(
+        first.contains("neha_http_request_duration_seconds_bucket"),
+        "the HTTP histogram has fixed buckets: {first}"
+    );
+    for boundary in ["0.001", "0.005", "10"] {
+        assert!(
+            first.contains(&format!("le=\"{boundary}\"")),
+            "bucket {boundary} is exported: {first}"
+        );
+    }
+    assert!(
+        !first.contains("_total_total"),
+        "counter names end in one _total: {first}"
+    );
+    assert!(
+        !first.contains("target_info") && !first.contains("otel_scope"),
+        "the exporter adds no resource or scope labels: {first}"
+    );
+
+    let ready_before = counter_value(&first, "GET", "/readyz", "2xx");
+    client.get(format!("{url}/readyz")).send().await.unwrap();
+    let second = client
+        .get(format!("{url}/metrics"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let ready_after = counter_value(&second, "GET", "/readyz", "2xx");
+    assert!(
+        ready_after > ready_before,
+        "a real request increments its route counter: {ready_before} -> {ready_after}"
+    );
+
+    let ready = client.get(format!("{url}/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 200);
+    assert_eq!(ready.text().await.unwrap(), r#"{"status":"ready"}"#);
+
+    neha_space::test_support::server::close(&running);
+    let stopping = client.get(format!("{url}/readyz")).send().await.unwrap();
+    assert_eq!(stopping.status(), 503);
+    assert_eq!(
+        stopping.text().await.unwrap(),
+        r#"{"status":"shutting_down"}"#
+    );
+}
+
+/// Reads one `neha_http_requests_total` series value from the scrape text.
+fn counter_value(body: &str, method: &str, route: &str, status_class: &str) -> u64 {
+    for line in body.lines() {
+        if !line.starts_with("neha_http_requests_total{") {
+            continue;
+        }
+        if !line.contains(&format!("method=\"{method}\""))
+            || !line.contains(&format!("route=\"{route}\""))
+            || !line.contains(&format!("status_class=\"{status_class}\""))
+        {
+            continue;
+        }
+        let value = line.rsplit(' ').next().unwrap_or("0");
+        return value.parse::<f64>().unwrap_or(0.0) as u64;
+    }
+    0
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_approval_recovers_only_for_its_owner_and_code() {
     let (_dir, running, invite) = running().await;

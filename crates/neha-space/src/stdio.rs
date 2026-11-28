@@ -835,6 +835,7 @@ impl StdioClient {
                 Err(unreachable_error("the MCP server did not answer in time"))
             }
         };
+        crate::metrics::install().mcp_call(if result.is_ok() { "ok" } else { "failed" });
         span.in_scope(|| match &result {
             Ok(_) => tracing::debug!(target: "neha::mcp", event = "mcp.call", outcome = "ok", "an MCP stdio call answered"),
             Err(error) => tracing::warn!(target: "neha::mcp", event = "mcp.call", outcome = "failed", error_kind = stdio_error_kind(error), "an MCP stdio call failed"),

@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -225,6 +225,10 @@ pub struct SpaceServer {
     start_ticket: Mutex<Option<crate::ticket::StartTicket>>,
     /// Set once the Space stops: no command may then start new work.
     closed: AtomicBool,
+    /// Connected browser WebSockets, for the metrics gauge.
+    pub(crate) ws_clients: AtomicU64,
+    /// Provisioned worker containers, for the metrics gauge.
+    pub(crate) workers_running: AtomicU64,
     /// Worker provisioning, when this Space runs Hosted Computers in containers.
     worker_config: Option<crate::workers::WorkerConfig>,
     pub(crate) runs: Arc<RunQueue>,
@@ -462,6 +466,8 @@ impl SpaceServer {
             pair_work: tokio::sync::Semaphore::new(ANONYMOUS_PAIR_PERMITS),
             start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
+            ws_clients: AtomicU64::new(0),
+            workers_running: AtomicU64::new(0),
             worker_config,
             runs: Arc::new(RunQueue::new()),
             uploads: Mutex::new(std::collections::HashMap::new()),
@@ -534,6 +540,8 @@ impl SpaceServer {
     pub fn router(self: &Arc<Self>) -> Router {
         let router = Router::new()
             .route("/healthz", get(health))
+            .route("/readyz", get(ready))
+            .route("/metrics", any(metrics))
             .route("/api/join", post(join))
             .route("/api/login", post(login))
             .route("/api/me", get(me))
@@ -894,6 +902,15 @@ async fn start_prepared(
     startup: Startup,
 ) -> Result<Running, ServerError> {
     crate::diagnostics::install_propagator();
+    let _ = crate::metrics::install();
+    if let Some(reason) = crate::metrics::token_problem() {
+        tracing::warn!(
+            target: "neha::metrics",
+            event = "metrics.disabled",
+            reason,
+            "NEHA_METRICS_TOKEN is invalid, so the metrics endpoint stays closed"
+        );
+    }
     let ui_enabled = ui.is_some();
     if let Some(dir) = &ui
         && !dir.join("index.html").is_file()
@@ -1093,7 +1110,13 @@ async fn trace_request(request: Request, next: Next) -> Response {
         .get::<ErrorCause>()
         .map_or("internal", |cause| cause.0);
     span.record("route", route);
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let elapsed = started.elapsed();
+    let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let instruments = crate::metrics::install();
+    instruments.http_request(route, method, status.as_u16(), elapsed.as_secs_f64());
+    if status.is_server_error() {
+        instruments.internal_error("http");
+    }
     span.in_scope(|| {
         tracing::debug!(
             target: "neha::http",
@@ -1494,6 +1517,92 @@ async fn resolve_path(path: &Path) -> Result<PathBuf, std::io::Error> {
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+async fn ready(State(server): State<Arc<SpaceServer>>) -> Response {
+    if server.is_closed() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "shutting_down"})),
+        )
+            .into_response()
+    } else {
+        (StatusCode::OK, Json(serde_json::json!({"status": "ready"}))).into_response()
+    }
+}
+
+async fn metrics(
+    State(server): State<Arc<SpaceServer>>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+) -> Response {
+    let Some(expected) = crate::metrics::token() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if method != axum::http::Method::GET {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(axum::http::header::ALLOW, "GET")],
+        )
+            .into_response();
+    }
+    let supplied = bearer(&headers).unwrap_or("");
+    let authorized = supplied.len() == expected.len()
+        && bool::from(supplied.as_bytes().ct_eq(expected.as_bytes()));
+    if !authorized {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let instruments = crate::metrics::install();
+    instruments.scrape();
+    let (queued, running, waiting) = server.state.lock().ok().map_or((0, 0, 0), |state| {
+        let mut queued = 0_u64;
+        let mut running = 0_u64;
+        let mut waiting = 0_u64;
+        for run in state.runs.values() {
+            match run.status {
+                crate::state::RunStatus::Queued => queued += 1,
+                crate::state::RunStatus::Running => running += 1,
+                crate::state::RunStatus::Waiting => waiting += 1,
+                crate::state::RunStatus::Succeeded | crate::state::RunStatus::Failed => {}
+            }
+        }
+        (queued, running, waiting)
+    });
+    instruments.runs_queued.record(queued, &[]);
+    instruments.runs_running.record(running, &[]);
+    instruments.runs_waiting.record(waiting, &[]);
+    instruments
+        .ws_clients
+        .record(server.ws_clients.load(Ordering::Relaxed), &[]);
+    instruments
+        .computers_connected
+        .record(server.links.connected() as u64, &[]);
+    instruments
+        .workers_running
+        .record(server.workers_running.load(Ordering::Relaxed), &[]);
+    let seq = server
+        .store
+        .last_seq()
+        .await
+        .map_or(0, |seq| u64::try_from(seq.as_i64()).unwrap_or(0));
+    instruments.record_seq.record(seq, &[]);
+    let bytes = std::fs::metadata(server.home.db_path())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    instruments.record_bytes.record(bytes, &[]);
+
+    match instruments.render() {
+        Ok(body) => (
+            [
+                (CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
+                (CACHE_CONTROL, "no-store"),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -3913,6 +4022,8 @@ async fn socket(
         .on_upgrade(move |socket| {
             let span = span.clone();
             async move {
+                let clients = Arc::clone(&server);
+                clients.ws_clients.fetch_add(1, Ordering::Relaxed);
                 span.in_scope(|| {
                     tracing::debug!(target: "neha::ws", event = "ws.connect", connection_id = %connection_id, "a client connected");
                 });
@@ -3922,6 +4033,7 @@ async fn socket(
                 span.in_scope(|| {
                     tracing::debug!(target: "neha::ws", event = "ws.disconnect", connection_id = %connection_id, "a client disconnected");
                 });
+                clients.ws_clients.fetch_sub(1, Ordering::Relaxed);
             }
         })
 }
@@ -4162,6 +4274,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                                         "a command failed"
                                     );
                                 });
+                                crate::metrics::install().ws_command_error(&format!("{:?}", error.code()));
                                 let _ = send(&out, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
                                 continue;
                             }
@@ -4287,6 +4400,7 @@ fn spawn_forwarder(
                     cursor = seq;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
+                    crate::metrics::install().ws_events_lagged();
                     let allows = || administers(&server, account);
                     match catch_up(
                         &reader,
@@ -4349,6 +4463,7 @@ async fn catch_up(
             .events_from(cursor, page_size)
             .await
             .map_err(|error| {
+                crate::metrics::install().store_error("subscription_read");
                 tracing::error!(
                     target: "neha::store",
                     event = "store.fail",
@@ -4933,6 +5048,7 @@ impl IntoResponse for ApiError {
 
 impl From<BlobsError> for ApiError {
     fn from(error: BlobsError) -> Self {
+        crate::metrics::install().blob_error(error.kind());
         tracing::debug!(
             target: "neha::blob",
             event = "blob.fail",
@@ -5237,6 +5353,11 @@ pub mod test_support {
     /// The longest machine name or workspace a pairing request may carry.
     pub const MAX_PAIRING_FIELD_BYTES: usize = super::MAX_PAIRING_FIELD_BYTES;
 
+    /// Stops accepting new work while the listener still answers `/readyz`.
+    pub fn close(running: &Running) {
+        running.server.close();
+    }
+
     /// Why sending a reader's recorded pages stopped, as the socket reports it.
     #[derive(Debug)]
     pub enum CatchUpError {
@@ -5283,6 +5404,13 @@ pub mod test_support {
     }
 
     impl Running {
+        /// Returns the running-worker gauge a test asserts without the endpoint.
+        pub fn workers_running(&self) -> u64 {
+            self.server
+                .workers_running
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         /// Returns the private state a test inspects without moving the Space.
         pub fn test_fields(&self) -> Fields<'_> {
             let server = &self.server;

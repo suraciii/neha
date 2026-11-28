@@ -5,7 +5,7 @@
 //! container-deployment test, and this test proves the control-plane order.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use neha::id::Id;
@@ -500,6 +500,18 @@ async fn an_idle_worker_stops_without_work() {
             .iter()
             .any(|call| call.path.ends_with("/start")),
         "an idle worker was started"
+    );
+
+    // A stopped worker is no longer running. The manager updates its gauge on
+    // the next tick, so give it one tick rather than reading at the same moment.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while running.workers_running() != 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        running.workers_running(),
+        0,
+        "a stopped worker is not running"
     );
 
     running.shutdown().await;

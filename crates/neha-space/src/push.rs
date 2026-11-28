@@ -449,6 +449,7 @@ impl Push {
         let response = match response {
             Ok(response) => response,
             Err(_) => {
+                crate::metrics::install().push_delivery("failed");
                 span.in_scope(|| {
                     tracing::debug!(
                         target: "neha::push",
@@ -462,6 +463,11 @@ impl Push {
             }
         };
         let status = response.status().as_u16();
+        crate::metrics::install().push_delivery(if (200..300).contains(&status) {
+            "ok"
+        } else {
+            "failed"
+        });
         span.in_scope(|| {
             tracing::debug!(
                 target: "neha::push",

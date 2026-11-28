@@ -471,6 +471,12 @@ impl Default for ComputerLinks {
 }
 
 impl ComputerLinks {
+    /// Returns how many Computers have a live channel.
+    #[must_use]
+    pub fn connected(&self) -> usize {
+        self.links.lock().map(|links| links.len()).unwrap_or(0)
+    }
+
     /// Builds a Space with no connected Computer.
     #[must_use]
     pub fn new() -> Self {

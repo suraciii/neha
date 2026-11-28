@@ -13,6 +13,7 @@ pub mod diagnostics;
 pub mod home;
 pub mod identity;
 pub mod mcp;
+pub mod metrics;
 pub mod model;
 pub mod oauth;
 pub mod plugins;

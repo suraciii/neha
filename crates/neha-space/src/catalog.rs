@@ -119,6 +119,12 @@ impl CatalogStore {
     /// then fetches on its own. The cache is written only after the body parsed
     /// and validated, so a broken answer never replaces a working cache.
     pub async fn refresh(&self) -> Result<CatalogRefresh, CatalogError> {
+        let result = self.refresh_inner().await;
+        crate::metrics::install().catalog_refresh(if result.is_ok() { "ok" } else { "failed" });
+        result
+    }
+
+    async fn refresh_inner(&self) -> Result<CatalogRefresh, CatalogError> {
         let _fetching = self.fetching.lock().await;
         let loaded = self.current();
         let known_etag = loaded

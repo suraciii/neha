@@ -59,6 +59,7 @@ services:
       NEHA_LOG: ${NEHA_LOG:-info}
       NEHA_LOG_FORMAT: ${NEHA_LOG_FORMAT:-json}
       NEHA_ENV: ${NEHA_ENV:-production}
+      NEHA_METRICS_TOKEN: ${NEHA_METRICS_TOKEN:-}
     volumes:
       - ./data:/data
     networks:

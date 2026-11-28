@@ -721,6 +721,7 @@ async fn append(
     }
     transaction.commit().await?;
 
+    crate::runs::observe_recorded_events(&events);
     Ok(AppendResult {
         events,
         existing: false,

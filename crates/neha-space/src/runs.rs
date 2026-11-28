@@ -304,6 +304,7 @@ async fn work(
                     )
                     .await
                     {
+                        crate::metrics::install().store_error("fail_denied_run");
                         tracing::error!(
                             target: "neha::store",
                             event = "store.fail",
@@ -402,6 +403,7 @@ async fn work(
                             )
                             .await
                             {
+                                crate::metrics::install().store_error("fail_queued_run");
                                 tracing::error!(
                                     target: "neha::store",
                                     event = "store.fail",
@@ -531,7 +533,8 @@ fn log_run_finish(
             };
             (outcome, record.usage)
         });
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let elapsed = started.elapsed();
+    let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     span.in_scope(|| match usage {
         Some(usage) => tracing::info!(
             target: "neha::runs",
@@ -558,6 +561,63 @@ fn log_run_finish(
             "a run finished"
         ),
     });
+}
+
+/// Watches the events a successful record append wrote and counts a run when
+/// its `RunFinished` first lands. The start time comes from the observed
+/// `RunStarted`, so a run that waited for an approval keeps the whole duration.
+pub(crate) fn observe_recorded_events(events: &[neha::record::Event]) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static STARTS: OnceLock<Mutex<HashMap<Id, std::time::Instant>>> = OnceLock::new();
+    let starts = STARTS.get_or_init(|| Mutex::new(HashMap::new()));
+
+    for event in events {
+        let Some(run) = event
+            .data
+            .get("run")
+            .and_then(|run| serde_json::from_value::<Id>(run.clone()).ok())
+        else {
+            continue;
+        };
+        match event.kind {
+            neha::record::EventKind::RunStarted => {
+                starts
+                    .lock()
+                    .expect("run start map")
+                    .insert(run, std::time::Instant::now());
+            }
+            neha::record::EventKind::RunFinished => {
+                let status = event
+                    .data
+                    .get("status")
+                    .and_then(|status| serde_json::from_value::<RunStatus>(status.clone()).ok());
+                let Some(status) = status.and_then(terminal_status) else {
+                    continue;
+                };
+                let started = starts.lock().expect("run start map").remove(&run);
+                match started {
+                    Some(started) => crate::metrics::install()
+                        .run_finished(status, started.elapsed().as_secs_f64()),
+                    None => crate::metrics::install().run_finished_without_duration(status),
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The metric label for a persisted terminal run status.
+///
+/// A queued, running, or waiting run is not finished: counting it here would
+/// count a run twice after it resumes and skew the failure rate.
+fn terminal_status(status: RunStatus) -> Option<&'static str> {
+    match status {
+        RunStatus::Succeeded => Some("succeeded"),
+        RunStatus::Failed => Some("failed"),
+        RunStatus::Queued | RunStatus::Running | RunStatus::Waiting => None,
+    }
 }
 
 /// The work one turn of a pump does.
@@ -660,4 +720,72 @@ fn next_queued(
     }
 
     Some(run)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{observe_recorded_events, terminal_status};
+    use crate::state::RunStatus;
+
+    fn event(
+        kind: neha::record::EventKind,
+        run: neha::id::Id,
+        status: Option<RunStatus>,
+    ) -> neha::record::Event {
+        neha::record::Event {
+            seq: neha::seq::Seq::ZERO,
+            kind,
+            version: 1,
+            at: neha::time::Timestamp::now(),
+            author: neha::record::Author::Bot(neha::id::Id::new()),
+            acting: None,
+            command: None,
+            data: match status {
+                Some(status) => serde_json::json!({"run": run, "status": status}),
+                None => serde_json::json!({"run": run}),
+            },
+        }
+    }
+
+    fn finished_total() -> u64 {
+        crate::metrics::install()
+            .render()
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .filter(|line| line.starts_with("neha_runs_finished_total{"))
+            .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum::<f64>() as u64
+    }
+
+    #[test]
+    fn a_run_counts_once_at_its_terminal_event() {
+        let run = neha::id::Id::new();
+        observe_recorded_events(&[event(neha::record::EventKind::RunStarted, run, None)]);
+        observe_recorded_events(&[event(
+            neha::record::EventKind::RunFinished,
+            run,
+            Some(RunStatus::Waiting),
+        )]);
+        let waiting = finished_total();
+        observe_recorded_events(&[event(
+            neha::record::EventKind::RunFinished,
+            run,
+            Some(RunStatus::Succeeded),
+        )]);
+        assert_eq!(finished_total(), waiting + 1);
+    }
+
+    #[test]
+    fn only_a_persisted_terminal_status_counts() {
+        assert_eq!(terminal_status(RunStatus::Succeeded), Some("succeeded"));
+        assert_eq!(terminal_status(RunStatus::Failed), Some("failed"));
+        assert_eq!(terminal_status(RunStatus::Queued), None);
+        assert_eq!(terminal_status(RunStatus::Running), None);
+        assert_eq!(
+            terminal_status(RunStatus::Waiting),
+            None,
+            "a run waiting for an approval is not finished"
+        );
+    }
 }
