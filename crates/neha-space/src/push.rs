@@ -432,11 +432,46 @@ impl Push {
         for (name, value) in parts.headers.iter() {
             outgoing = outgoing.header(name.as_str(), value.as_bytes());
         }
-        let response = match outgoing.body(body).send().await {
+        let endpoint_host = reqwest::Url::parse(&subscription.endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(ToOwned::to_owned))
+            .unwrap_or_default();
+        let span = tracing::info_span!(
+            target: "neha::push",
+            "push.delivery",
+            endpoint_host = %endpoint_host,
+            otel.kind = "client",
+        );
+        let response = {
+            use tracing::Instrument as _;
+            outgoing.body(body).send().instrument(span.clone()).await
+        };
+        let response = match response {
             Ok(response) => response,
-            Err(_) => return Delivery::Failed(0),
+            Err(_) => {
+                span.in_scope(|| {
+                    tracing::debug!(
+                        target: "neha::push",
+                        event = "push.delivery",
+                        endpoint_host = %endpoint_host,
+                        outcome = "failed",
+                        "a push delivery failed"
+                    );
+                });
+                return Delivery::Failed(0);
+            }
         };
         let status = response.status().as_u16();
+        span.in_scope(|| {
+            tracing::debug!(
+                target: "neha::push",
+                event = "push.delivery",
+                endpoint_host = %endpoint_host,
+                status,
+                outcome = if (200..300).contains(&status) { "ok" } else { "failed" },
+                "a push delivery finished"
+            );
+        });
         match status {
             200..=299 => Delivery::Sent,
             404 | 410 => Delivery::Gone,

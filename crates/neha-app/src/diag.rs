@@ -94,6 +94,9 @@ pub fn init(mode: Mode) -> Result<()> {
     };
     let environment = environment()?;
     let filter = directive_filter(&filters)?;
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
 
     let service = mode.service();
     let version = env!("CARGO_PKG_VERSION");

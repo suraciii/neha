@@ -37,6 +37,145 @@ const SECRET_KEYS: [&str; 14] = [
 /// Control characters become spaces, URLs lose their user information, query,
 /// and fragment, and a value after a credential-like key is replaced. The
 /// result is at most [`MAX_ERROR_CHARS`] characters.
+/// Installs the W3C trace-context propagator.
+///
+/// It is a process-wide setting, so a library start and the binary's
+/// diagnostics initialization both call it; the last call wins with the same
+/// value.
+pub fn install_propagator() {
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+}
+
+/// Returns a fresh request identifier.
+#[must_use]
+pub fn request_id() -> String {
+    neha::id::Id::new().to_string()
+}
+
+/// Extracts the W3C trace context an inbound request carries.
+#[must_use]
+pub fn inbound_parent(headers: &axum::http::HeaderMap) -> opentelemetry::Context {
+    use opentelemetry::propagation::Extractor;
+
+    struct Headers<'a>(&'a axum::http::HeaderMap);
+    impl Extractor for Headers<'_> {
+        fn get(&self, key: &str) -> Option<&str> {
+            self.0.get(key).and_then(|value| value.to_str().ok())
+        }
+        fn keys(&self) -> Vec<&str> {
+            self.0.keys().map(axum::http::HeaderName::as_str).collect()
+        }
+    }
+
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&Headers(headers))
+    })
+}
+
+/// Makes the current tracing span a child of `parent`.
+pub fn set_parent(span: &tracing::Span, parent: opentelemetry::Context) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let _ = span.set_parent(parent);
+}
+
+/// Injects the current span's W3C context into outbound headers.
+pub fn inject_headers(headers: &mut reqwest::header::HeaderMap) {
+    // Only the agreed field crosses the boundary: a vendor `tracestate` is
+    // not forwarded.
+    let Some(traceparent) = current_traceparent() else {
+        return;
+    };
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&traceparent) {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("traceparent"),
+            value,
+        );
+    }
+}
+
+/// Adds the current W3C context to JSON-RPC `params._meta`.
+pub fn inject_json_meta(params: &mut serde_json::Value) {
+    let Some(traceparent) = current_traceparent() else {
+        return;
+    };
+    let Some(object) = params.as_object_mut() else {
+        return;
+    };
+    let meta = object
+        .entry("_meta")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert("traceparent".to_owned(), serde_json::json!(traceparent));
+    }
+}
+
+/// Returns the W3C `traceparent` an outbound frame carries, when the current
+/// span has a valid trace.
+#[must_use]
+pub fn current_traceparent() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    format_traceparent(tracing::Span::current().context().span().span_context())
+}
+
+/// Formats one span context as a W3C `traceparent` header value.
+#[must_use]
+pub fn traceparent(span: &tracing::Span) -> Option<String> {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    format_traceparent(span.context().span().span_context())
+}
+
+/// Returns a W3C `traceparent` for a response even when no subscriber is
+/// installed: the inbound trace id is kept, and otherwise a new trace starts.
+#[must_use]
+pub fn response_traceparent(span: &tracing::Span, inbound: &opentelemetry::Context) -> String {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    if let Some(traceparent) = format_traceparent(span.context().span().span_context()) {
+        return traceparent;
+    }
+    let inbound = inbound.span().span_context().clone();
+    if inbound.is_valid() {
+        return format!(
+            "00-{:032x}-{:016x}-{:02x}",
+            inbound.trace_id(),
+            new_span_id(),
+            u8::from(inbound.trace_flags().is_sampled())
+        );
+    }
+    format!(
+        "00-{:032x}-{:016x}-01",
+        rand::random::<u128>(),
+        new_span_id()
+    )
+}
+
+fn new_span_id() -> u64 {
+    // A span id is eight bytes and must not be zero.
+    loop {
+        let id = rand::random::<u64>();
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
+fn format_traceparent(context: &opentelemetry::trace::SpanContext) -> Option<String> {
+    if !context.is_valid() {
+        return None;
+    }
+    let trace = context.trace_id();
+    let span = context.span_id();
+    let flags = u8::from(context.trace_flags().is_sampled());
+    Some(format!("00-{trace:032x}-{span:016x}-{flags:02x}"))
+}
+
 #[must_use]
 pub fn scrub_error(message: &str) -> String {
     let mut scrubbed = String::with_capacity(message.len());
@@ -426,6 +565,29 @@ mod tests {
             scrub_error("cannot write /home/user/Neha Workspace/cache.json"),
             "cannot write [redacted] [redacted]"
         );
+    }
+
+    #[test]
+    fn a_response_keeps_an_inbound_trace_or_starts_one() {
+        super::install_propagator();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
+        let inbound = super::inbound_parent(&headers);
+        let echoed = super::response_traceparent(&tracing::Span::none(), &inbound);
+        assert!(echoed.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+        assert_eq!(echoed.rsplit('-').next(), Some("01"));
+
+        let root =
+            super::response_traceparent(&tracing::Span::none(), &opentelemetry::Context::new());
+        let parts: Vec<&str> = root.split('-').collect();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[1].len(), 32);
+        assert_eq!(parts[2].len(), 16);
     }
 
     #[test]

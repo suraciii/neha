@@ -38,6 +38,9 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "rt", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+tracing-opentelemetry.workspace = true
 sad-web-push = { version = "0.12", default-features = false }
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 
@@ -53,6 +56,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 hkdf = "0.13"
+tower = { version = "0.5", features = ["util"] }
+tracing-subscriber.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = "0.30"

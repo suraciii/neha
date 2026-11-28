@@ -189,12 +189,20 @@ pub fn spawn(server: Arc<SpaceServer>, config: WorkerConfig) -> tokio::task::Joi
             for (computer, workspace) in computers {
                 if !provisioned.contains(&computer) {
                     match token_for(&server, computer).await {
-                        Ok(token) => match client.create(computer, &workspace, &token).await {
-                            Ok(()) => {
-                                provisioned.insert(computer);
+                        Ok(token) => {
+                            match supervised(
+                                computer,
+                                "create",
+                                client.create(computer, &workspace, &token),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    provisioned.insert(computer);
+                                }
+                                Err(error) => warn_once(&mut warned, computer, &error),
                             }
-                            Err(error) => warn_once(&mut warned, computer, &error),
-                        },
+                        }
                         Err(error) => warn_once(&mut warned, computer, &error),
                     }
                 }
@@ -205,7 +213,8 @@ pub fn spawn(server: Arc<SpaceServer>, config: WorkerConfig) -> tokio::task::Joi
                 if config.always_on || active.contains(&computer) {
                     last_active.insert(computer, now);
                     stopped.remove(&computer);
-                    if let Err(error) = client.start(computer).await {
+                    if let Err(error) = supervised(computer, "start", client.start(computer)).await
+                    {
                         // The container may have been removed outside this
                         // manager. Forget the provisioning so the next tick
                         // asks the Supervisor to create it again.
@@ -216,7 +225,7 @@ pub fn spawn(server: Arc<SpaceServer>, config: WorkerConfig) -> tokio::task::Joi
                 } else {
                     let since = *last_active.entry(computer).or_insert(now);
                     if !stopped.contains(&computer) && now.duration_since(since) >= config.idle {
-                        match client.stop(computer).await {
+                        match supervised(computer, "stop", client.stop(computer)).await {
                             Ok(()) => {
                                 stopped.insert(computer);
                             }
@@ -341,6 +350,42 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
         std::fs::write(path, bytes)
             .map_err(|error| format!("cannot write the worker token: {}", error.kind()))
     }
+}
+
+/// Runs one Supervisor request inside a span and records its outcome.
+async fn supervised<F>(computer: Id, operation: &'static str, future: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    use tracing::Instrument as _;
+
+    let span = tracing::info_span!(
+        target: "neha::worker",
+        "worker.operation",
+        computer_id = %computer,
+        operation,
+        otel.kind = "client",
+    );
+    let result = future.instrument(span.clone()).await;
+    span.in_scope(|| match &result {
+        Ok(()) => tracing::debug!(
+            target: "neha::worker",
+            event = "worker.operation",
+            computer_id = %computer,
+            operation,
+            outcome = "ok",
+            "a worker operation finished"
+        ),
+        Err(_) => tracing::warn!(
+            target: "neha::worker",
+            event = "worker.operation",
+            computer_id = %computer,
+            operation,
+            outcome = "failed",
+            "a worker operation failed"
+        ),
+    });
+    result
 }
 
 fn warn_once(warned: &mut HashSet<Id>, computer: Id, error: &str) {

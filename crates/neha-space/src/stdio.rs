@@ -135,6 +135,16 @@ const WORKING_DIRECTORY_UNCREATABLE: &str = "the MCP server's working directory 
 const WORKING_DIRECTORY_MISSING: &str = "the MCP server's working directory is not a directory";
 
 /// A stdio MCP server failed.
+/// Names a stdio MCP failure without its display text.
+fn stdio_error_kind(error: &StdioError) -> &'static str {
+    match error {
+        StdioError::Unusable(_) => "unusable",
+        StdioError::SandboxUnavailable(_) => "sandbox_unavailable",
+        StdioError::Unreachable(_) => "unreachable",
+        StdioError::Protocol(_) => "protocol",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StdioError {
     /// The server cannot be run with the specification it was given.
@@ -796,20 +806,40 @@ impl StdioClient {
         timeout: Duration,
     ) -> Result<Value, StdioError> {
         self.require_live()?;
+        use tracing::Instrument as _;
+
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
+        let span = tracing::info_span!(
+            target: "neha::mcp",
+            "mcp.call",
+            method,
+            transport = "stdio",
+            otel.kind = "client",
+        );
         let mut message = json!({"jsonrpc": "2.0", "id": id, "method": method});
-        if let Some(params) = params {
+        if let Some(mut params) = params {
+            span.in_scope(|| crate::diagnostics::inject_json_meta(&mut params));
             message["params"] = params;
         }
 
-        match tokio::time::timeout(timeout, self.exchange(&message, id)).await {
+        let result = match tokio::time::timeout(
+            timeout,
+            self.exchange(&message, id).instrument(span.clone()),
+        )
+        .await
+        {
             Ok(answer) => answer,
             Err(_) => {
                 self.kill().await;
                 Err(unreachable_error("the MCP server did not answer in time"))
             }
-        }
+        };
+        span.in_scope(|| match &result {
+            Ok(_) => tracing::debug!(target: "neha::mcp", event = "mcp.call", outcome = "ok", "an MCP stdio call answered"),
+            Err(error) => tracing::warn!(target: "neha::mcp", event = "mcp.call", outcome = "failed", error_kind = stdio_error_kind(error), "an MCP stdio call failed"),
+        });
+        result
     }
 
     /// Sends one JSON-RPC notification; the protocol has no answer.

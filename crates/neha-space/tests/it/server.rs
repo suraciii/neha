@@ -27756,3 +27756,103 @@ async fn a_plain_stream_error_that_is_not_too_long_ends_the_run_without_a_retry(
     provider_task.abort();
     running.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_response_carries_a_request_id_and_a_traceparent() {
+    let (_dir, running, _invite) = running().await;
+    let client = reqwest::Client::new();
+    let first = client
+        .get(format!("{}/healthz", running.url()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let request_id = first
+        .headers()
+        .get("x-request-id")
+        .expect("every response names its request")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(!request_id.is_empty());
+    let traceparent = first
+        .headers()
+        .get("traceparent")
+        .expect("every response carries its trace")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let parts: Vec<&str> = traceparent.split('-').collect();
+    assert_eq!(parts.len(), 4, "traceparent: {traceparent}");
+    assert_eq!(parts[0], "00");
+    assert_eq!(parts[1].len(), 32);
+    assert_eq!(parts[2].len(), 16);
+
+    let second = client
+        .get(format!("{}/healthz", running.url()))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        request_id,
+        second
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "each request gets its own id"
+    );
+
+    let supplied = client
+        .get(format!("{}/healthz", running.url()))
+        .header("x-request-id", "review-client-007")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        supplied
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "review-client-007",
+        "a valid caller request id is kept"
+    );
+
+    let invalid = client
+        .get(format!("{}/healthz", running.url()))
+        .header("x-request-id", "not a request id")
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        invalid
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "not a request id",
+        "an invalid caller request id is replaced"
+    );
+
+    let inbound = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let propagated = client
+        .get(format!("{}/healthz", running.url()))
+        .header("traceparent", inbound)
+        .send()
+        .await
+        .unwrap();
+    let traceparent = propagated
+        .headers()
+        .get("traceparent")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        traceparent.contains("4bf92f3577b34da6a3ce929d0e0e4736"),
+        "the inbound trace id is kept: {traceparent}"
+    );
+}

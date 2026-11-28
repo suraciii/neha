@@ -150,6 +150,7 @@ impl ComputerLink {
                 working_dir: working_dir.map(ToOwned::to_owned),
                 access: access.clone(),
                 env: env.to_vec(),
+                traceparent: crate::diagnostics::current_traceparent(),
             },
         )
         .await
@@ -552,6 +553,7 @@ mod tests {
                 working_dir: None,
                 access: Default::default(),
                 env: Vec::new(),
+                traceparent: None,
             }
         );
 

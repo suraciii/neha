@@ -804,6 +804,36 @@ fn bot_runtime(
     machine(config, hidden, denied, runtimes, bot, access, working_dir)
 }
 
+/// Makes the daemon's action span a child of the Space's step.
+fn action_span(traceparent: Option<&str>, bot: &str) -> tracing::Span {
+    use opentelemetry::propagation::Extractor;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    struct Carrier<'a>(&'a str);
+    impl Extractor for Carrier<'_> {
+        fn get(&self, key: &str) -> Option<&str> {
+            (key == "traceparent").then_some(self.0)
+        }
+        fn keys(&self) -> Vec<&str> {
+            vec!["traceparent"]
+        }
+    }
+
+    let span = tracing::info_span!(
+        target: "neha::computer",
+        "computer.action",
+        bot_id = %bot,
+        otel.kind = "server",
+    );
+    if let Some(traceparent) = traceparent {
+        let parent = opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&Carrier(traceparent))
+        });
+        let _ = span.set_parent(parent);
+    }
+    span
+}
+
 /// Answers one frame from the Space.
 async fn execute_frame(
     config: &Config,
@@ -823,6 +853,7 @@ async fn execute_frame(
             working_dir,
             access,
             env,
+            traceparent,
         } => {
             let runtime = match bot_runtime(
                 config,
@@ -841,7 +872,23 @@ async fn execute_frame(
             // The worker finds the running action here when the channel goes
             // away, so it can stop the child it owns.
             *current.lock().expect("current action lock") = Some(Arc::clone(&runtime));
-            let result = runtime.execute(action.into()).await;
+            let span = action_span(traceparent.as_deref(), &bot);
+            let result = {
+                use tracing::Instrument as _;
+                runtime
+                    .execute(action.into())
+                    .instrument(span.clone())
+                    .await
+            };
+            span.in_scope(|| {
+                tracing::debug!(
+                    target: "neha::computer",
+                    event = "computer.action",
+                    bot_id = %bot,
+                    status = ?result.status,
+                    "a Computer action finished"
+                );
+            });
             *current.lock().expect("current action lock") = None;
             DeviceFrame::Result {
                 id,

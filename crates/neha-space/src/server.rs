@@ -46,13 +46,14 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 use crate::blobs::{Blobs, BlobsError};
 use crate::catalog::CatalogStore;
 use crate::commands;
 use crate::computer_link::{self, AccessCapabilities, ComputerLinks};
 use crate::config::{Config, ConfigError, Storage};
-use crate::diagnostics::{scrub_error, storage_kind};
+use crate::diagnostics::{sanitize_value, scrub_error, storage_kind};
 use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError, PairingState};
 use crate::model::{ModelClient, ModelError};
@@ -548,8 +549,10 @@ impl SpaceServer {
             router.route("/invite", get(invite_page))
         };
         router
+            .route_layer(middleware::from_fn(matched_route))
             .layer(DefaultBodyLimit::max(64 * 1024))
             .layer(middleware::from_fn_with_state(Arc::clone(self), guard))
+            .layer(middleware::from_fn(trace_request))
             .with_state(Arc::clone(self))
     }
 
@@ -768,6 +771,7 @@ async fn start_with_workers(
     public_url: Option<String>,
     worker_config: Option<crate::workers::WorkerConfig>,
 ) -> Result<Running, ServerError> {
+    crate::diagnostics::install_propagator();
     let ui_enabled = ui.is_some();
     if let Some(dir) = &ui
         && !dir.join("index.html").is_file()
@@ -894,6 +898,118 @@ async fn start_with_workers(
     })
 }
 
+/// Records the matched route template on the response.
+///
+/// The raw path is client-controlled and can name a file; only the router's
+/// template (`/api/chats/{chat}/files`) may reach a diagnostic.
+async fn matched_route(request: Request, next: Next) -> Response {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
+    let mut response = next.run(request).await;
+    if let Some(route) = route {
+        response.extensions_mut().insert(MatchedRoute(route));
+    }
+    response
+}
+
+/// The label for the request method; an unusual method gets `OTHER`, so a
+/// client cannot put arbitrary text into the field.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    match *method {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        _ => "OTHER",
+    }
+}
+
+/// Names every request, joins its W3C trace, and records its outcome.
+async fn trace_request(request: Request, next: Next) -> Response {
+    use tracing::Instrument as _;
+
+    let method = method_label(request.method());
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+                })
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(crate::diagnostics::request_id);
+    let parent = crate::diagnostics::inbound_parent(request.headers());
+    let span = tracing::info_span!(
+        target: "neha::http",
+        "http.request",
+        request_id = %request_id,
+        "http.request.method" = method,
+        route = tracing::field::Empty,
+        otel.kind = "server",
+    );
+    crate::diagnostics::set_parent(&span, parent.clone());
+
+    let started = Instant::now();
+    let response = next.run(request).instrument(span.clone()).await;
+    let status = response.status();
+    let route = response
+        .extensions()
+        .get::<MatchedRoute>()
+        .map_or("unmatched", |route| route.0.as_str());
+    let cause = response
+        .extensions()
+        .get::<ErrorCause>()
+        .map_or("internal", |cause| cause.0);
+    span.record("route", route);
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    span.in_scope(|| {
+        tracing::debug!(
+            target: "neha::http",
+            event = "http.request",
+            request_id = %request_id,
+            method,
+            route,
+            status = status.as_u16(),
+            duration_ms,
+            "request finished"
+        );
+        if status.is_server_error() {
+            tracing::error!(
+                target: "neha::http",
+                event = "http.failed",
+                request_id = %request_id,
+                status = status.as_u16(),
+                error_kind = cause,
+                "the request answered with a server error"
+            );
+        }
+    });
+
+    let mut response = response;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
+    let traceparent = crate::diagnostics::response_traceparent(&span, &parent);
+    if let Ok(value) = HeaderValue::from_str(&traceparent) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("traceparent"), value);
+    }
+
+    response
+}
+
 async fn guard(State(server): State<Arc<SpaceServer>>, request: Request, next: Next) -> Response {
     let path = request.uri().path().to_owned();
     let host = request
@@ -902,10 +1018,12 @@ async fn guard(State(server): State<Arc<SpaceServer>>, request: Request, next: N
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let Some(host) = host.as_deref() else {
+        tracing::warn!(target: "neha::security", event = "security.reject", reason = "host", "a request named no valid Host");
         return ApiError::forbidden("the Host header must name this Space").into_response();
     };
     let browser_host = is_browser_authority(&server, host);
     if !loopback_host(host) && !browser_host {
+        tracing::warn!(target: "neha::security", event = "security.reject", reason = "host", "a request named no valid Host");
         return ApiError::forbidden("the Host header must name this Space").into_response();
     }
     let origin = request
@@ -920,6 +1038,7 @@ async fn guard(State(server): State<Arc<SpaceServer>>, request: Request, next: N
     if let Some(origin) = origin {
         let same_site = same_authority(origin, host, server.browser_scheme());
         if (!same_site || !browser_host) && !bearer {
+            tracing::warn!(target: "neha::security", event = "security.reject", reason = "origin", "a browser Origin did not name this Space");
             return ApiError::forbidden("a browser Origin must name this Space").into_response();
         }
     }
@@ -2186,6 +2305,13 @@ async fn login(
         .expect("login lock")
         .allows(&request.display_name, source)
     {
+        tracing::warn!(
+            target: "neha::security",
+            event = "security.rate_limited",
+            operation = "login",
+            ip = sanitize_value(&source.to_string()).as_str(),
+            "sign-in attempts were rate-limited"
+        );
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::RateLimited,
@@ -2212,6 +2338,12 @@ async fn login(
             })
         }
         Err(IdentityError::InvalidCredentials) => {
+            tracing::warn!(
+                target: "neha::security",
+                event = "security.login_failed",
+                ip = sanitize_value(&source.to_string()).as_str(),
+                "a sign-in attempt failed"
+            );
             server
                 .login
                 .lock()
@@ -2921,10 +3053,29 @@ async fn computer_socket(
         return Err(unauthorized_computer());
     }
 
+    let span = tracing::info_span!(
+        target: "neha::computer",
+        "computer.channel",
+        computer_id = %computer,
+        otel.kind = "internal",
+    );
     Ok(ws
         .max_message_size(MAX_CHANNEL_FRAME_BYTES)
         .max_frame_size(MAX_CHANNEL_FRAME_BYTES)
-        .on_upgrade(move |socket| handle_computer_socket(socket, server, computer)))
+        .on_upgrade(move |socket| {
+            let span = span.clone();
+            async move {
+                span.in_scope(|| {
+                    tracing::debug!(target: "neha::computer", event = "computer.connected", computer_id = %computer, "a Computer connected");
+                });
+                handle_computer_socket(socket, server, computer)
+                    .instrument(span.clone())
+                    .await;
+                span.in_scope(|| {
+                    tracing::debug!(target: "neha::computer", event = "computer.disconnected", computer_id = %computer, "a Computer disconnected");
+                });
+            }
+        }))
 }
 
 fn unauthorized_computer() -> ApiError {
@@ -3153,9 +3304,31 @@ async fn socket(
     ws: WebSocketUpgrade,
     State(server): State<Arc<SpaceServer>>,
 ) -> Response {
+    use tracing::Instrument as _;
+
+    let connection_id = crate::diagnostics::request_id();
+    let span = tracing::info_span!(
+        target: "neha::ws",
+        "ws.connection",
+        connection_id = %connection_id,
+        otel.kind = "internal",
+    );
     ws.max_message_size(MAX_FRAME_BYTES)
         .max_frame_size(MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, server, account))
+        .on_upgrade(move |socket| {
+            let span = span.clone();
+            async move {
+                span.in_scope(|| {
+                    tracing::debug!(target: "neha::ws", event = "ws.connect", connection_id = %connection_id, "a client connected");
+                });
+                handle_socket(socket, server, account)
+                    .instrument(span.clone())
+                    .await;
+                span.in_scope(|| {
+                    tracing::debug!(target: "neha::ws", event = "ws.disconnect", connection_id = %connection_id, "a client disconnected");
+                });
+            }
+        })
 }
 
 async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account: Account) {
@@ -3348,7 +3521,18 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             browser_origin: server.browser_origin(),
                         };
                         let reset = matches!(command, CommandCall::ComputerReset { .. });
-                        let outcome = commands::execute(&context, &account, id, command).await;
+                        let command_span = tracing::info_span!(
+                            target: "neha::command",
+                            "command",
+                            command_id = %id,
+                            otel.kind = "internal",
+                        );
+                        command_span.in_scope(|| {
+                            tracing::debug!(target: "neha::command", event = "command.start", command_id = %id, "a command started");
+                        });
+                        let outcome = commands::execute(&context, &account, id, command)
+                            .instrument(command_span.clone())
+                            .await;
                         // A Message that arrived during a reset queued a run
                         // whose pump saw the reset mark and stopped. Wake the
                         // pumps whether the reset succeeded or failed: the mark
@@ -3373,6 +3557,15 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                                 outcome.result
                             }
                             Err(error) => {
+                                command_span.in_scope(|| {
+                                    tracing::warn!(
+                                        target: "neha::command",
+                                        event = "command.fail",
+                                        command_id = %id,
+                                        code = ?error.code(),
+                                        "a command failed"
+                                    );
+                                });
                                 let _ = send(&out, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
                                 continue;
                             }
@@ -3903,11 +4096,20 @@ fn cookie_token<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str
     })
 }
 
+/// The matched route template, put on the response by [`matched_route`].
+#[derive(Clone)]
+struct MatchedRoute(String);
+
+/// The failing component of a 5xx response, for the one error event.
+#[derive(Clone)]
+struct ErrorCause(&'static str);
+
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     code: ErrorCode,
     message: String,
+    cause: &'static str,
 }
 
 impl ApiError {
@@ -3916,7 +4118,14 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            cause: "internal",
         }
+    }
+
+    /// Names the failing component for the one correlated 5xx error line.
+    pub(crate) fn with_cause(mut self, cause: &'static str) -> Self {
+        self.cause = cause;
+        self
     }
 
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
@@ -3953,16 +4162,12 @@ impl ApiError {
             ErrorCode::Unavailable,
             message,
         )
+        .with_cause("unavailable")
     }
 
     pub(crate) fn internal(_message: impl Into<String>) -> Self {
-        // The message can carry a remote response body or a path; only the
-        // fixed event leaves the Space.
-        tracing::error!(
-            target: "neha::http",
-            event = "http.internal_error",
-            "the Space hit an internal error"
-        );
+        // The message can carry a remote response body or a path; the request
+        // middleware records the one 5xx event instead.
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Internal,
@@ -3988,36 +4193,32 @@ impl IntoResponse for ApiError {
             "message": self.message,
         });
 
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        response.extensions_mut().insert(ErrorCause(self.cause));
+        response
     }
 }
 
 impl From<BlobsError> for ApiError {
     fn from(error: BlobsError) -> Self {
+        tracing::debug!(
+            target: "neha::blob",
+            event = "blob.fail",
+            operation = if error.is_unavailable() { "unavailable" } else { "internal" },
+            error_kind = error.kind(),
+            "a File store operation failed"
+        );
         if error.is_unavailable() {
             // The store is down, not broken: a caller may retry.
-            tracing::warn!(
-                target: "neha::blob",
-                event = "blob.fail",
-                operation = "unavailable",
-                error_kind = error.kind(),
-                "the File store is unavailable"
-            );
             return ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::Unavailable,
                 "the File store is unavailable",
-            );
+            )
+            .with_cause(error.kind());
         }
 
-        tracing::error!(
-            target: "neha::blob",
-            event = "blob.fail",
-            operation = "internal",
-            error_kind = error.kind(),
-            "the File store failed"
-        );
-        ApiError::internal("")
+        ApiError::internal("").with_cause(error.kind())
     }
 }
 
@@ -4803,5 +5004,107 @@ mod tests {
         // Two flows never share a name, so one flow's binding is another's
         // never to write or clear.
         assert_ne!(name, super::sign_in_cookie_name(Id::new()));
+    }
+
+    #[tokio::test]
+    async fn each_5xx_logs_one_correlated_error_with_its_cause() {
+        use std::sync::{Arc, Mutex};
+
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+        use tracing::Subscriber;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+
+        #[derive(Clone, Default)]
+        struct Fields(Arc<Mutex<Vec<Vec<String>>>>);
+        struct Record(Vec<String>);
+        impl Visit for Record {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.push(format!("{}={value}", field.name()));
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.0.push(format!("{}={value}", field.name()));
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.push(format!("{}={value:?}", field.name()));
+            }
+        }
+        impl<S: Subscriber> Layer<S> for Fields {
+            fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+                let mut record = Record(vec![format!("level={}", event.metadata().level())]);
+                event.record(&mut record);
+                self.0.lock().unwrap().push(record.0);
+            }
+        }
+
+        let fields = Fields::default();
+        let subscriber = tracing_subscriber::registry().with(fields.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        async fn send(path: &str) -> (StatusCode, String) {
+            let app = axum::Router::new()
+                .route(
+                    "/plain",
+                    axum::routing::get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                )
+                .route(
+                    "/classified",
+                    axum::routing::get(|| async { super::ApiError::unavailable("push is off") }),
+                )
+                .layer(axum::middleware::from_fn(super::trace_request));
+            let response = app
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .expect("the response names its request")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            (status, request_id)
+        }
+
+        let (plain_status, plain_id) = send("/plain").await;
+        assert_eq!(plain_status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (classified_status, classified_id) = send("/classified").await;
+        assert_eq!(classified_status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let events = fields.0.lock().unwrap();
+        let errors: Vec<&Vec<String>> = events
+            .iter()
+            .filter(|record| record.iter().any(|field| field == "level=ERROR"))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            2,
+            "each 5xx logs exactly one error: {events:?}"
+        );
+        let find = |request_id: &str| {
+            errors
+                .iter()
+                .find(|record| {
+                    record
+                        .iter()
+                        .any(|field| field == &format!("request_id={request_id}"))
+                })
+                .unwrap_or_else(|| panic!("no error names {request_id}: {errors:?}"))
+        };
+        let plain = find(&plain_id);
+        assert!(plain.iter().any(|field| field == "event=http.failed"));
+        assert!(plain.iter().any(|field| field == "status=500"));
+        assert!(plain.iter().any(|field| field == "error_kind=internal"));
+        let classified = find(&classified_id);
+        assert!(classified.iter().any(|field| field == "event=http.failed"));
+        assert!(classified.iter().any(|field| field == "status=503"));
+        assert!(
+            classified
+                .iter()
+                .any(|field| field == "error_kind=unavailable")
+        );
     }
 }

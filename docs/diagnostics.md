@@ -59,6 +59,13 @@ A panic replaces the raw panic line with a `diag.panic` event and one human
 line that names the location; the panic payload is not copied. A backtrace
 follows only when `RUST_BACKTRACE` asks for one.
 
+Every HTTP response carries `x-request-id` and a W3C `traceparent`; a valid
+caller-supplied `x-request-id` is kept. Set
+`NEHA_LOG=debug` to see one `http.request` line per request; a 5xx answer
+records exactly one `http.failed` error with the matched route template, not
+the raw path. The same trace id follows one run into its
+Computer and MCP server calls, so `grep` for the id connects the lines.
+
 `eng/diagnostics.md` lists every event and field. Start with these:
 
 | Event | Meaning |

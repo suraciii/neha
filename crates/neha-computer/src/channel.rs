@@ -62,6 +62,10 @@ pub enum HostFrame {
         /// its short-lived Bot token here.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<(String, String)>,
+        /// The W3C trace context of the step that asked for this action.
+        /// Absent from an older Space; a newer Computer then starts a root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
     },
     /// Reads a file's bytes from the machine (a File take).
     Read {
@@ -265,6 +269,7 @@ mod tests {
                     working_dir: None,
                     access: super::AccessFrame::default(),
                     env: Vec::new(),
+                    traceparent: None,
                 },
                 json!({
                     "type": "action",
@@ -283,6 +288,7 @@ mod tests {
                     working_dir: None,
                     access: super::AccessFrame::default(),
                     env: Vec::new(),
+                    traceparent: None,
                 },
                 json!({
                     "type": "action",
@@ -302,6 +308,7 @@ mod tests {
                     working_dir: None,
                     access: super::AccessFrame::default(),
                     env: Vec::new(),
+                    traceparent: None,
                 },
                 json!({
                     "type": "action",
@@ -320,6 +327,7 @@ mod tests {
                     working_dir: None,
                     access: super::AccessFrame::default(),
                     env: Vec::new(),
+                    traceparent: None,
                 },
                 json!({
                     "type": "action",
@@ -340,6 +348,7 @@ mod tests {
                     working_dir: None,
                     access: super::AccessFrame::default(),
                     env: Vec::new(),
+                    traceparent: None,
                 },
                 json!({
                     "type": "action",
@@ -498,6 +507,25 @@ mod tests {
                 frame
             );
         }
+    }
+
+    #[test]
+    fn an_action_frame_round_trips_its_trace_context() {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let frame = HostFrame::Action {
+            id: 1,
+            bot: "bot-1".to_owned(),
+            action: WireAction::Shell {
+                command: "pwd".to_owned(),
+            },
+            working_dir: None,
+            access: super::AccessFrame::default(),
+            env: Vec::new(),
+            traceparent: Some(traceparent.to_owned()),
+        };
+        let json = serde_json::to_value(&frame).unwrap();
+        assert_eq!(json["traceparent"], traceparent);
+        assert_eq!(serde_json::from_value::<HostFrame>(json).unwrap(), frame);
     }
 
     #[test]
