@@ -157,16 +157,15 @@ fn migrate_legacy_hosted_workspaces(
             .into_owned();
     }
 
-    let legacy_root = home.root().join("computers");
-    // Only a real directory under the home is ours to move. A symlinked
-    // `computers` or `<computer>` directory could redirect the rename.
-    if std::fs::symlink_metadata(&legacy_root)
-        .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
-        .unwrap_or(true)
-    {
+    let home_root = std::fs::canonicalize(home.root())?;
+    let legacy_root = home_root.join("computers");
+    let workspaces_root = home_root.join("workspaces");
+    // The migration only touches the exact directories the old layout names.
+    // A symlink anywhere on the path would make that name resolve elsewhere,
+    // so every existing level must be a real directory under the home.
+    if !is_real_directory(&legacy_root) || !is_real_directory(&workspaces_root) {
         return Ok(());
     }
-    let home_root = std::fs::canonicalize(home.root())?;
     let computers: Vec<Id> = state
         .computers
         .values()
@@ -174,17 +173,12 @@ fn migrate_legacy_hosted_workspaces(
         .map(|computer| computer.id)
         .collect();
     for computer in computers {
-        let legacy = legacy_root.join(computer.to_string()).join("workspace");
-        let Ok(metadata) = std::fs::symlink_metadata(&legacy) else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        let source = legacy_root.join(computer.to_string());
+        if !is_real_directory(&source) {
             continue;
         }
-        let Ok(real_legacy) = std::fs::canonicalize(&legacy) else {
-            continue;
-        };
-        if !real_legacy.starts_with(&home_root) {
+        let legacy = source.join("workspace");
+        if !is_real_directory(&legacy) {
             continue;
         }
         let bots: Vec<Id> = state
@@ -198,26 +192,26 @@ fn migrate_legacy_hosted_workspaces(
         if bots.len() != 1 {
             continue;
         }
-        let target = home.bot_workspace_dir(computer, bots[0]);
+        let target_root = workspaces_root.join(computer.to_string());
+        match std::fs::symlink_metadata(&target_root) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The parent is a verified real directory, so this creates the
+                // exact Computer root, not an alias to another one.
+                std::fs::create_dir(&target_root)?;
+            }
+            Err(error) => return Err(ServerError::Io(error)),
+        }
+        let target = target_root.join(bots[0].to_string());
         if std::fs::symlink_metadata(&target).is_ok() {
             continue;
         }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-            let real_parent = std::fs::canonicalize(parent)?;
-            if !real_parent.starts_with(&home_root) {
-                continue;
-            }
-        }
         std::fs::rename(&legacy, &target)?;
-        if let Some(parent) = legacy.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+        let _ = std::fs::remove_dir(&source);
     }
 
-    if std::fs::symlink_metadata(&legacy_root)
-        .map(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
-        .unwrap_or(false)
+    if is_real_directory(&legacy_root)
         && std::fs::read_dir(&legacy_root)
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(false)
@@ -226,6 +220,13 @@ fn migrate_legacy_hosted_workspaces(
     }
 
     Ok(())
+}
+
+/// Returns whether `path` is a directory and not a symlink.
+fn is_real_directory(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+        .unwrap_or(false)
 }
 
 impl SpaceServer {
@@ -14924,6 +14925,119 @@ mod tests {
 
         // A second start has nothing to move.
         super::migrate_legacy_hosted_workspaces(&home, &mut state).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_migration_does_not_follow_an_in_home_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let (first_user, second_user) = (Id::new(), Id::new());
+        let (first, second) = (Id::new(), Id::new());
+        let (first_bot, second_bot) = (Id::new(), Id::new());
+        let first_legacy = home
+            .root()
+            .join("computers")
+            .join(first.to_string())
+            .join("workspace");
+        let second_legacy = home
+            .root()
+            .join("computers")
+            .join(second.to_string())
+            .join("workspace");
+        std::fs::create_dir_all(&first_legacy).unwrap();
+        std::fs::create_dir_all(&second_legacy).unwrap();
+        std::fs::write(first_legacy.join("sentinel-a"), "first owner").unwrap();
+        std::fs::write(second_legacy.join("sentinel-b"), "second owner").unwrap();
+        store
+            .append(AppendRequest::new(
+                Id::new(),
+                "legacy two owners",
+                vec![
+                    EventDraft::new(
+                        EventKind::UserJoined,
+                        Author::User(first_user),
+                        json!({"display_name": "Ada", "is_admin": true}),
+                    ),
+                    EventDraft::new(
+                        EventKind::UserJoined,
+                        Author::User(second_user),
+                        json!({"display_name": "Grace", "is_admin": false}),
+                    ),
+                    EventDraft::new(
+                        EventKind::ComputerCreated,
+                        Author::User(first_user),
+                        json!({
+                            "computer": first,
+                            "owner": first_user,
+                            "kind": "hosted",
+                            "workspace": first_legacy.to_string_lossy(),
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::BotCreated,
+                        Author::User(first_user),
+                        json!({
+                            "bot": first_bot,
+                            "owner": first_user,
+                            "name": "First",
+                            "computer": first,
+                            "chat": Id::new(),
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::ComputerCreated,
+                        Author::User(second_user),
+                        json!({
+                            "computer": second,
+                            "owner": second_user,
+                            "kind": "hosted",
+                            "workspace": second_legacy.to_string_lossy(),
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::BotCreated,
+                        Author::User(second_user),
+                        json!({
+                            "bot": second_bot,
+                            "owner": second_user,
+                            "name": "Second",
+                            "computer": second,
+                            "chat": Id::new(),
+                        }),
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+        let mut state = crate::state::State::default();
+        store.replay(&mut state).await.unwrap();
+        store.close().await.unwrap();
+
+        // An alias in the home points the first Computer's new root at the
+        // second's. The migration must leave both old files where they are
+        // rather than moving one owner's work into the other's Workspace.
+        let alias = home.workspace_dir(first);
+        std::os::unix::fs::symlink(home.workspace_dir(second), &alias).unwrap();
+        super::migrate_legacy_hosted_workspaces(&home, &mut state).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(first_legacy.join("sentinel-a")).unwrap(),
+            "first owner"
+        );
+        assert!(
+            !home
+                .bot_workspace_dir(second, first_bot)
+                .join("sentinel-a")
+                .exists(),
+            "the alias must not move the first owner's file into the second's Workspace"
+        );
+        let second_target = home.bot_workspace_dir(second, second_bot);
+        assert_eq!(
+            std::fs::read_to_string(second_target.join("sentinel-b")).unwrap(),
+            "second owner"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
