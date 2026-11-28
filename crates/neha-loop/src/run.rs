@@ -366,19 +366,29 @@ where
                     return Ok(final_reply(reply.content, usage));
                 }
                 let calls = step_calls(step, &reply.tool_calls)?;
+                // The assistant turn the Model sees must answer under the same
+                // tool-call identifiers the record keeps. A provider may send
+                // a blank identifier; the stable fallback replaces it, and a
+                // provider-native continuation that still holds the raw id
+                // cannot pair with the normalized turn, so it is dropped.
+                let normalized = calls
+                    .iter()
+                    .zip(&reply.tool_calls)
+                    .any(|(call, original)| call.recorded.call != original.id);
+                let reply_continuation = if normalized { None } else { reply.continuation };
                 recorder
                     .reply(
                         step,
                         reply.content.clone(),
                         calls.iter().map(|call| call.recorded.clone()).collect(),
                         reply.usage,
-                        reply.continuation.clone(),
+                        reply_continuation.clone(),
                     )
                     .await?;
-                continuation = reply.continuation;
+                continuation = reply_continuation;
                 messages.push(Message::assistant_with_calls(
                     reply.content,
-                    reply.tool_calls,
+                    model_calls(&calls),
                 ));
                 (calls, reply.usage, 0, None, false)
             }
@@ -1175,6 +1185,58 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].continuation, None);
         assert_eq!(requests[1].continuation, Some(continuation));
+    }
+
+    #[tokio::test]
+    async fn a_normalized_call_id_drops_the_native_continuation() {
+        let continuation = Continuation {
+            protocol: "openai_responses".to_owned(),
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            state: json!({"items": [{"type": "reasoning", "id": "rs_1"}]}),
+        };
+        let model = FakeModel::with(vec![
+            Ok(ModelReply {
+                content: Some("let me look".to_owned()),
+                tool_calls: vec![call("   ", "read_file", json!({"path": "a.txt"}))],
+                usage: Usage::default(),
+                continuation: Some(continuation),
+            }),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        // The record keeps the normalized id.
+        assert_eq!(recorder.replies[0].2[0].call, "call-1-0");
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].continuation, None,
+            "a normalized call id drops the native continuation that pairs the raw id"
+        );
+        // The live assistant turn and the tool result answer under one id.
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Assistant && !message.tool_calls.is_empty())
+            .expect("the assistant turn is in the next request");
+        assert_eq!(assistant.tool_calls[0].id, "call-1-0");
+        assert_eq!(
+            tool_messages(&requests[1]),
+            [("call-1-0".to_owned(), "42".to_owned())]
+        );
     }
 
     #[tokio::test]

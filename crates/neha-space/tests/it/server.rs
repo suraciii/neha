@@ -3710,6 +3710,85 @@ fn responses_write_file_reply() -> String {
     .concat()
 }
 
+/// The first OpenAI Responses reply with a whitespace tool-call id: a
+/// reasoning item and a `remember` call. Its native state pairs the raw id, so
+/// a normalized turn must not reuse it.
+fn responses_blank_call_id_reply() -> String {
+    let arguments = r#"{"kind":"note","scope":"owner","text":"A"}"#;
+    [
+        sse(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_blank", "summary": []},
+            }),
+        ),
+        sse(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_blank",
+                    "call_id": "   ",
+                    "name": "remember",
+                    "arguments": "",
+                },
+            }),
+        ),
+        sse(
+            "response.function_call_arguments.delta",
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_blank",
+                "output_index": 1,
+                "delta": arguments,
+            }),
+        ),
+        sse(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_blank",
+                    "call_id": "   ",
+                    "name": "remember",
+                    "arguments": arguments,
+                },
+            }),
+        ),
+        sse(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_blank",
+                    "status": "completed",
+                    "output": [
+                        {"type": "reasoning", "id": "rs_blank", "summary": []},
+                        {
+                            "type": "function_call",
+                            "id": "fc_blank",
+                            "call_id": "   ",
+                            "name": "remember",
+                            "arguments": arguments,
+                        },
+                    ],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                    },
+                },
+            }),
+        ),
+    ]
+    .concat()
+}
+
 /// The second OpenAI Responses reply: the final text.
 fn responses_text_reply() -> String {
     let message = json!({
@@ -6398,7 +6477,7 @@ async fn a_blank_tool_call_id_gets_a_stable_fallback_and_replays() {
     let (_dir, running, invite) = running().await;
     let (mut socket, token) = admin(&running, &invite).await;
     // A Provider that sends a whitespace tool-call identifier.
-    let (base, provider_task, _gates, _recorded) = gated_provider(vec![
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![
         tool_with_id(
             "   ",
             "remember",
@@ -6410,6 +6489,25 @@ async fn a_blank_tool_call_id_gets_a_stable_fallback_and_replays() {
     let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
     let first = send(&mut socket, chat, "remember A").await;
     assert_eq!(first["status"], "succeeded");
+
+    // The next request to the Provider pairs the assistant's tool call and
+    // the tool result under the one normalized identifier.
+    {
+        let requests = recorded.lock().unwrap();
+        let messages = requests[1]["messages"]
+            .as_array()
+            .expect("the next request");
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+            .expect("the live assistant turn is in the next request");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call-1-0");
+        let tool = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("the tool result is in the next request");
+        assert_eq!(tool["tool_call_id"], "call-1-0");
+    }
 
     // The record keeps the stable fallback identifier in the reply and in the
     // answer, so the projection accepts it and a replay lines them up.
@@ -6442,6 +6540,68 @@ async fn a_blank_tool_call_id_gets_a_stable_fallback_and_replays() {
 
     socket.close(None).await.unwrap();
     restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blank_call_id_drops_the_native_continuation_on_responses() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task, recorded) = gated_protocol_provider(
+        ProviderProtocol::OpenAiResponses,
+        vec![
+            (responses_blank_call_id_reply(), None),
+            (responses_text_reply(), None),
+        ],
+    )
+    .await;
+    let (_bot, chat, _computer) = tool_bot_on(
+        &mut socket,
+        base,
+        ProviderProtocol::OpenAiResponses,
+        false,
+        None,
+    )
+    .await;
+
+    let result = send(&mut socket, chat, "remember A").await;
+    assert_eq!(result["status"], "succeeded");
+
+    // The second request carries the normalized assistant call and its result
+    // under one id. It does not replay the Provider's native turn, which still
+    // pairs the raw blank id.
+    {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 2, "the next step asked the Model");
+        let input = requests[1]["input"].as_array().expect("the request input");
+        assert!(
+            input
+                .iter()
+                .any(|item| { item["type"] == "function_call" && item["call_id"] == "call-1-0" }),
+            "the assistant call uses the normalized id: {input:?}"
+        );
+        assert!(
+            input.iter().any(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "call-1-0"
+            }),
+            "the tool result uses the normalized id: {input:?}"
+        );
+        assert!(
+            !input
+                .iter()
+                .any(|item| item["call_id"].as_str() == Some("   ")),
+            "the raw blank id is not replayed: {input:?}"
+        );
+        assert!(
+            !input.iter().any(|item| {
+                item.get("id").and_then(serde_json::Value::as_str) == Some("rs_blank")
+            }),
+            "the native reasoning turn is dropped: {input:?}"
+        );
+    }
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
