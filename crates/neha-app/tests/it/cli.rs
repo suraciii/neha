@@ -1865,16 +1865,7 @@ async fn a_write_outside_the_grants_waits_for_the_owner() {
         &computer.credential,
         &["approval", "allow", &approval],
     );
-    assert_eq!(
-        run(
-            &computer.home,
-            &computer.credential,
-            &["run", "show", &run_id]
-        )
-        .lines()
-        .next(),
-        Some(format!("Run {run_id}: succeeded").as_str())
-    );
+    wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "first");
 
     // Always allow grants the folder; a later write runs without a card.
@@ -1897,16 +1888,7 @@ async fn a_write_outside_the_grants_waits_for_the_owner() {
         &computer.credential,
         &["approval", "allow", &approval, "--always"],
     );
-    assert_eq!(
-        run(
-            &computer.home,
-            &computer.credential,
-            &["run", "show", &run_id]
-        )
-        .lines()
-        .next(),
-        Some(format!("Run {run_id}: succeeded").as_str())
-    );
+    wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "second");
 
     script.call(
